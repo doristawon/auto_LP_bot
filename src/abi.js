@@ -15,6 +15,10 @@ export const HOOK_ABI = [
   `function withdraw(${POOL_KEY_TUPLE} key,int24 tickLower,int24 tickUpper,uint128 liquidity,address recipient,uint128 amount0Min,uint128 amount1Min,uint256 deadline)`
 ];
 
+export const V4_QUOTER_ABI = [
+  'function quoteExactInputSingle(((address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks) poolKey,bool zeroForOne,uint128 exactAmount,bytes hookData) params) returns(uint256 amountOut,uint256 gasEstimate)'
+];
+
 export const POOL_MANAGER_ABI = [
   'function extsload(bytes32,uint256) view returns(bytes32[])'
 ];

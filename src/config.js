@@ -41,6 +41,7 @@ export function loadConfig() {
     outOfRangeConfirmations: envInt('OUT_OF_RANGE_CONFIRMATIONS', 2),
     minRebalanceIntervalSec: envInt('MIN_REBALANCE_INTERVAL_SEC', 300),
     maxRebalancesPerHour: envInt('MAX_REBALANCES_PER_HOUR', 3),
+    swapSlippageBps: envInt('SWAP_SLIPPAGE_BPS', 50),
     claimBeforeWithdraw: envBool('CLAIM_BEFORE_WITHDRAW', true),
     allowZeroMinOut: envBool('ALLOW_ZERO_MIN_OUT', false),
     txDeadlineSec: envInt('TX_DEADLINE_SEC', 1200),
@@ -55,7 +56,10 @@ export function loadConfig() {
     actualPointsBaseline: envNum('ACTUAL_POINTS_BASELINE', 0),
     actualPointsBaselineAt: process.env.ACTUAL_POINTS_BASELINE_AT?.trim() || '',
     manualNetCashflowUsd: envNum('MANUAL_NET_CASHFLOW_USD', 0),
-    referenceDepositTx: process.env.REFERENCE_DEPOSIT_TX?.trim() || ''
+    portfolioSnapshotIntervalMs: envInt('PORTFOLIO_SNAPSHOT_INTERVAL_MS', 300_000),
+    referenceDepositTx: process.env.REFERENCE_DEPOSIT_TX?.trim() || '',
+    blockscoutApiKey: process.env.BLOCKSCOUT_API_KEY?.trim() || '',
+    blockscoutApiBase: process.env.BLOCKSCOUT_API_BASE?.trim() || 'https://api.blockscout.com/4663/api/v2'
   };
 }
 

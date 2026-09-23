@@ -1,6 +1,7 @@
 import { formatUnits } from 'ethers';
 import { rangeAmounts } from './liquidity.js';
 import { usdValue } from './prices.js';
+import { buildRebalanceInventoryPlan } from './rebalance-plan.js';
 
 export class PortfolioAnalytics {
   constructor(config, ledger, state) {
@@ -49,6 +50,24 @@ export class PortfolioAnalytics {
         const hodlUsd = valuePair(baseline.amount0, baseline.token0, baseline.amount1, baseline.token1, prices);
         const ilUsd = finitePair(principalUsd, hodlUsd) ? principalUsd - hodlUsd : null;
         const ilPct = Number.isFinite(ilUsd) && hodlUsd > 0 ? ilUsd / hodlUsd * 100 : null;
+        const price0Usd = prices.get(pool.token0.address.toLowerCase());
+        const price1Usd = prices.get(pool.token1.address.toLowerCase());
+        let rebalancePlan = null;
+        if (position.target && Number.isFinite(price0Usd) && Number.isFinite(price1Usd) && price0Usd > 0 && price1Usd > 0) {
+          try {
+            rebalancePlan = buildRebalanceInventoryPlan({
+              amount0: amounts.amount0 + owed0,
+              amount1: amounts.amount1 + owed1,
+              price0Usd,
+              price1Usd,
+              sqrtPriceX96: pool.state.sqrtPriceX96,
+              tickLower: position.target.tickLower,
+              tickUpper: position.target.tickUpper,
+              decimals0: pool.token0.decimals,
+              decimals1: pool.token1.decimals
+            });
+          } catch {}
+        }
 
         positionMetrics.push({
           id: position.id,
@@ -72,7 +91,10 @@ export class PortfolioAnalytics {
           ilPct,
           outside: Boolean(position.outside),
           confirmations: Number(position.confirmations || 0),
-          target: position.target || null
+          target: position.target || null,
+          rebalancePlan,
+          rebalanceQuote: null,
+          rebalanceQuoteError: null
         });
       }
     }

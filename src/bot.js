@@ -2,6 +2,7 @@ import { formatUnits } from 'ethers';
 import { createProviders, verifyProviders } from './rpc/providers.js';
 import { FablesAdapter, lifecycleEventType, lifecycleLiquidity } from './adapters/fables.js';
 import { RebalanceExecutor } from './adapters/executor.js';
+import { V4QuoterAdapter } from './adapters/quoter.js';
 import { buildUsdPriceMap } from './analytics/prices.js';
 import { PortfolioAnalytics } from './analytics/portfolio.js';
 import { PointsTracker } from './analytics/points-tracker.js';
@@ -18,6 +19,7 @@ export class AutoLpBot {
     this.state = new StateStore(config.stateFile);
     this.ledger = new LedgerStore(config.dataDir);
     this.fables = new FablesAdapter(this.providers.readProvider, config);
+    this.quoter = new V4QuoterAdapter(this.providers.readProvider);
     this.analytics = new PortfolioAnalytics(config, this.ledger, this.state);
     this.points = new PointsTracker(config, this.ledger, this.state);
     this.market = { refreshedAt: 0, pools: [], prices: new Map(), latestBlock: 0 };
@@ -99,19 +101,21 @@ export class AutoLpBot {
       const uniqueTokens = uniqueTargetTokens(targetPools);
       const walletBalances = await this.fables.readWalletBalances(uniqueTokens);
       const portfolio = this.analytics.build({ targetPools, walletBalances, prices: this.market.prices });
+      await this.attachRebalanceQuotes(targetPools, portfolio);
       const points = this.points.snapshot();
       const snapshot = {
         generatedAt: Date.now(),
         blockNumber: latestBlock,
         bot: {
-          version: '0.2.0',
+          version: '0.2.1',
           wallet: this.config.walletAddress,
           dryRun: this.config.dryRun,
           liveWrites: this.config.enableLiveWrites,
           autoRedeploy: this.config.enableAutoRedeploy,
           executionPaused: this.executionPaused,
           lastAction: this.state.getSetting('lastAction', null),
-          targetSymbols: this.config.targetSymbols
+          targetSymbols: this.config.targetSymbols,
+          swapSlippageBps: this.config.swapSlippageBps
         },
         rpcHealth: this.rpcHealth,
         portfolio,
@@ -122,6 +126,7 @@ export class AutoLpBot {
       };
       this.snapshot = snapshot;
       this.ledger.writeSnapshot(snapshot);
+      this.recordPortfolioSnapshot(snapshot);
 
       for (const pool of targetPools) {
         for (const position of pool.positions || []) {
@@ -133,6 +138,49 @@ export class AutoLpBot {
     } finally {
       this.cycleActive = false;
     }
+  }
+
+  async attachRebalanceQuotes(targetPools, portfolio) {
+    for (const metric of portfolio.positions || []) {
+      if (!metric.outside || !metric.rebalancePlan || metric.rebalancePlan.direction === 'none' || !(metric.rebalancePlan.amountIn > 0)) continue;
+      const pool = targetPools.find((x) => x.id === metric.poolId);
+      if (!pool) continue;
+      try {
+        const quote = await this.quoter.quoteExactInputSingle(
+          pool,
+          metric.rebalancePlan.tokenIn,
+          metric.rebalancePlan.amountIn,
+          this.config.swapSlippageBps
+        );
+        metric.rebalanceQuote = quote;
+        const position = (pool.positions || []).find((x) => x.id.toLowerCase() === metric.id.toLowerCase());
+        if (position) {
+          position.rebalancePlan = metric.rebalancePlan;
+          position.rebalanceQuote = quote;
+        }
+      } catch (error) {
+        metric.rebalanceQuoteError = error.message;
+        log('warn', 'rebalance.quote_failed', { positionId: metric.id, poolId: metric.poolId, error: error.message });
+      }
+    }
+  }
+
+  recordPortfolioSnapshot(snapshot) {
+    const now = snapshot.generatedAt;
+    const last = Number(this.state.getSetting('lastPortfolioSnapshotAt', 0) || 0);
+    if (last && now - last < this.config.portfolioSnapshotIntervalMs) return;
+    this.ledger.append('portfolio.snapshot', {
+      blockNumber: snapshot.blockNumber,
+      currentValueUsd: snapshot.portfolio.currentValueUsd,
+      hodlValueUsd: snapshot.portfolio.hodlValueUsd,
+      netPnlUsd: snapshot.portfolio.netPnlUsd,
+      excessVsHodlUsd: snapshot.portfolio.excessVsHodlUsd,
+      ilUsd: snapshot.portfolio.currentIlUsd,
+      feeUsd: snapshot.portfolio.trackedFeeUsd,
+      gasUsd: snapshot.portfolio.gasUsd,
+      estimatedPoints: snapshot.points.estimatedTotal
+    }, now);
+    this.state.setSetting('lastPortfolioSnapshotAt', now);
   }
 
   async decoratePosition(pool, position) {
@@ -218,7 +266,14 @@ export class AutoLpBot {
       this.ledger.append('rebalance.blocked', { positionId: position.id, reason: 'hourly rate limit' });
       return;
     }
-    const plan = { pool, position, currentTick: pool.state.tick, target: position.target };
+    const plan = {
+      pool,
+      position,
+      currentTick: pool.state.tick,
+      target: position.target,
+      inventoryPlan: position.rebalancePlan || null,
+      quote: position.rebalanceQuote || null
+    };
     this.state.setSetting('lastAction', `rebalance ${pool.token0.symbol}/${pool.token1.symbol} ${position.id.slice(0, 10)}…`);
     try {
       const result = await this.executor.execute(plan);
@@ -356,7 +411,8 @@ function snapshotPool(pool) {
     paused: pool.state?.paused ?? null,
     positions: (pool.positions || []).map((p) => ({
       id: p.id, shares: p.shares.toString(), tickLower: p.tickLower, tickUpper: p.tickUpper,
-      outside: p.outside, confirmations: p.confirmations, target: p.target
+      outside: p.outside, confirmations: p.confirmations, target: p.target,
+      rebalancePlan: p.rebalancePlan || null, rebalanceQuote: p.rebalanceQuote || null
     }))
   };
 }

@@ -1,6 +1,17 @@
 # Auto LP Bot — Fables.fi / Robinhood Chain
 
-> v0.2：API-less on-chain LP monitor + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
+> v0.2.1：API-less on-chain LP monitor + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
+
+## v0.2.1 新增
+
+- Tight 新 range 的資產比例計算：自動判斷 0→1 或 1→0 需要交換多少。
+- 直接呼叫 Robinhood Chain Uniswap v4 Quoter，對 Fables 的實際 PoolKey/hook 做 `eth_call` quote。
+- `SWAP_SLIPPAGE_BPS` 產生 minOut，Dashboard 顯示下一筆預估 swap。
+- 每 5 分鐘預設寫入一筆 `portfolio.snapshot`，保留 PnL / HODL / IL / fees / gas / Points 時序。
+- Reference tx inspector 可選配 Blockscout API：抓 transaction / logs / internal tx / raw trace / verified ABI，自動定位 Fables `Deposited` hook call 與 candidate selector。
+- 日常監控與 quote 仍然不依賴 Fables API；Blockscout 只用於歷史交易反解與 debug。
+
+> 安全狀態：swap **報價與配平計畫已完成**；swap broadcast 與 Fables new-range deposit 仍 fail-closed，直到 reference transaction 的實際 execution manifest 被驗證。
 
 ## v0.2 重點
 

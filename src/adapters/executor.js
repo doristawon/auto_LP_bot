@@ -46,7 +46,9 @@ export class RebalanceExecutor {
     this.ledger.append('rebalance.redeploy_gated', {
       withdrawalHash: withdrawal.hash,
       target: plan.target,
-      reason: 'Deposit/swap executor manifest is not verified yet'
+      inventoryPlan: plan.inventoryPlan || null,
+      quote: plan.quote || null,
+      reason: 'Deposit broadcast remains gated until the Fables deposit execution manifest is verified'
     });
     return { status: 'withdrawn-redeploy-gated', withdrawalHash: withdrawal.hash };
   }
@@ -141,6 +143,8 @@ function serializablePlan(plan) {
       tickUpper: plan.position.tickUpper,
       shares: plan.position.shares.toString()
     },
-    target: plan.target
+    target: plan.target,
+    inventoryPlan: plan.inventoryPlan || null,
+    quote: plan.quote || null
   };
 }
