@@ -1,0 +1,17 @@
+{
+  "name": "auto-lp-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Fables.fi concentrated-liquidity monitoring and rebalance bot for Robinhood Chain",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/index.js",
+    "once": "node src/index.js --once",
+    "test": "node --test",
+    "check": "node --check src/index.js && node --check src/bot.js && node --check src/adapters/fables.js && node --check src/adapters/executor.js && node --check src/strategy/tight-range.js"
+  },
+  "dependencies": {
+    "ethers": "^6.15.0"
+  }
+}
