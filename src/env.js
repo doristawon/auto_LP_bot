@@ -31,6 +31,14 @@ export function envInt(name, fallback) {
   return value;
 }
 
+export function envNum(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) throw new Error(`${name} must be a number`);
+  return value;
+}
+
 export function envList(name, fallback = []) {
   const raw = process.env[name];
   if (!raw) return fallback;

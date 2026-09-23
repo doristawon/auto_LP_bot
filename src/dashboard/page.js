@@ -1,0 +1,44 @@
+export function dashboardPage() {
+  return String.raw`<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Fables Auto LP Bot</title>
+<style>
+:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#e9edf5;background:#0c111b;color-scheme:dark}
+*{box-sizing:border-box}body{margin:0;background:#0c111b}main{max-width:1440px;margin:auto;padding:22px}.top{display:flex;gap:14px;align-items:center;justify-content:space-between;flex-wrap:wrap}.muted{color:#91a0b8}.pill{display:inline-flex;padding:5px 9px;border:1px solid #2b3a55;border-radius:999px;font-size:12px}.grid{display:grid;grid-template-columns:repeat(4,minmax(170px,1fr));gap:12px;margin:18px 0}.card{background:#111a29;border:1px solid #24324b;border-radius:14px;padding:14px}.label{font-size:12px;color:#91a0b8}.value{font-size:24px;font-weight:700;margin-top:5px}.small{font-size:12px}.good{color:#68d391}.bad{color:#fc8181}.warn{color:#f6c85f}.row{display:grid;grid-template-columns:1.15fr .85fr;gap:12px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:9px;border-bottom:1px solid #24324b;white-space:nowrap}th{color:#91a0b8;font-weight:600}h1,h2{margin:.2em 0}.controls{display:flex;gap:8px;flex-wrap:wrap}button,input{background:#172235;border:1px solid #354764;color:#eef3fb;border-radius:8px;padding:8px 10px}button{cursor:pointer}button:hover{background:#1d2d46}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.events{max-height:420px;overflow:auto}@media(max-width:1000px){.grid{grid-template-columns:repeat(2,1fr)}.row{grid-template-columns:1fr}}@media(max-width:560px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body><main>
+<div class="top"><div><h1>Fables Auto LP Bot</h1><div class="muted small">Robinhood Chain · local control center · <span id="updated">loading</span></div></div><div class="controls"><span class="pill" id="mode">--</span><button id="pause">Pause execution</button><button id="refresh">Refresh</button></div></div>
+<div class="grid">
+  <div class="card"><div class="label">Tracked value</div><div class="value" id="valueUsd">--</div><div class="small muted" id="hodl">--</div></div>
+  <div class="card"><div class="label">Net PnL</div><div class="value" id="netPnl">--</div><div class="small muted" id="excess">--</div></div>
+  <div class="card"><div class="label">Impermanent Loss</div><div class="value" id="il">--</div><div class="small muted">相對各 position 建立追蹤時的 HODL baseline</div></div>
+  <div class="card"><div class="label">LP fees / Gas</div><div class="value" id="fees">--</div><div class="small muted" id="gas">--</div></div>
+  <div class="card"><div class="label">Fables Points</div><div class="value" id="points">--</div><div class="small muted" id="pointsNote">估算值</div></div>
+  <div class="card"><div class="label">RPC health</div><div class="value" id="rpc">--</div><div class="small muted">多 RPC failover</div></div>
+  <div class="card"><div class="label">Execution</div><div class="value" id="execution">--</div><div class="small muted" id="lastAction">--</div></div>
+  <div class="card"><div class="label">Range exposure</div><div class="value" id="rangeCount">--</div><div class="small muted" id="oorCount">--</div></div>
+</div>
+<div class="row">
+  <section class="card"><h2>LP positions</h2><div class="table-wrap"><table><thead><tr><th>Pair</th><th>Status</th><th>Tick</th><th>Range</th><th>Value</th><th>Fees owed</th><th>IL</th></tr></thead><tbody id="positions"></tbody></table></div></section>
+  <section class="card"><h2>Points calibration</h2><p class="muted small">官方實際 Points 可定期填入作 baseline；baseline 後用 on-chain fee share 推估新增 Points，避免把估算值當官方值。</p><div class="controls"><input id="actualPoints" type="number" step="any" placeholder="Actual points"/><button id="savePoints">Set baseline</button></div><div style="height:12px"></div><h2>Cashflow adjustment</h2><p class="muted small">若你在 bot 外部手動存入/提領資產，可記一筆 USD cashflow，避免污染 PnL。</p><div class="controls"><input id="cashflow" type="number" step="any" placeholder="+deposit / -withdraw USD"/><input id="cashflowNote" placeholder="note"/><button id="addCashflow">Add</button></div></section>
+</div>
+<section class="card" style="margin-top:12px"><h2>Transaction / accounting ledger</h2><div class="events table-wrap"><table><thead><tr><th>Time</th><th>Type</th><th>Tx</th><th>Gas USD</th><th>Fee USD</th><th>Detail</th></tr></thead><tbody id="events"></tbody></table></div></section>
+<script>
+const $=id=>document.getElementById(id);let snapshot=null;const dashboardToken=new URLSearchParams(location.search).get('token')||'';
+const usd=v=>Number.isFinite(Number(v))?'$'+Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}):'--';
+const num=v=>Number.isFinite(Number(v))?Number(v).toLocaleString(undefined,{maximumFractionDigits:2}):'--';
+const pct=v=>Number.isFinite(Number(v))?Number(v).toFixed(2)+'%':'--';
+const cls=v=>Number(v)>0?'good':Number(v)<0?'bad':'';const short=v=>v?v.slice(0,8)+'…'+v.slice(-6):'';
+async function api(path,opts){opts=opts||{};opts.headers=Object.assign({},opts.headers||{},dashboardToken?{'x-dashboard-token':dashboardToken}:{});const r=await fetch(path,opts);if(!r.ok)throw new Error(await r.text());return r.json()}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function detail(e){return e.note||e.label||e.pair||e.reason||e.status||e.eventKey||''}
+function positionRow(x){return '<tr><td>'+esc(x.pair)+'</td><td class="'+(x.outside?'bad':'good')+'">'+(x.outside?'OUT':'IN')+'</td><td>'+esc(x.currentTick)+'</td><td>'+esc(x.tickLower)+' … '+esc(x.tickUpper)+'</td><td>'+usd(x.principalUsd)+'</td><td>'+usd(x.unclaimedFeeUsd)+'</td><td class="'+cls(x.ilUsd)+'">'+usd(x.ilUsd)+' / '+pct(x.ilPct)+'</td></tr>'}
+function eventRow(e){return '<tr><td>'+new Date(e.ts).toLocaleString()+'</td><td>'+esc(e.type)+'</td><td class="mono">'+(e.hash?esc(short(e.hash)):'')+'</td><td>'+(e.gasUsd!=null?usd(e.gasUsd):'')+'</td><td>'+(e.feeUsd!=null?usd(e.feeUsd):'')+'</td><td class="small">'+esc(detail(e))+'</td></tr>'}
+async function load(){const results=await Promise.all([api('/api/state'),api('/api/events?limit=200')]);const state=results[0],events=results[1];snapshot=state;$('updated').textContent=state.generatedAt?new Date(state.generatedAt).toLocaleString():'no snapshot';$('mode').textContent=(state.bot&&state.bot.dryRun?'DRY RUN':'LIVE')+' · '+(state.bot&&state.bot.executionPaused?'PAUSED':'RUNNING');const p=state.portfolio||{};$('valueUsd').textContent=usd(p.currentValueUsd);$('hodl').textContent='HODL baseline '+usd(p.hodlValueUsd);$('netPnl').textContent=usd(p.netPnlUsd);$('netPnl').className='value '+cls(p.netPnlUsd);$('excess').textContent='vs HODL '+usd(p.excessVsHodlUsd);$('il').textContent=usd(p.currentIlUsd);$('il').className='value '+cls(p.currentIlUsd);$('fees').textContent=usd(p.trackedFeeUsd);$('gas').textContent='Gas '+usd(p.gasUsd);const pt=state.points||{};$('points').textContent=num(pt.estimatedTotal);$('pointsNote').textContent='Actual baseline '+num(pt.actualBaseline)+' + estimated delta '+num(pt.estimatedDelta);const healthy=(state.rpcHealth||[]).filter(x=>x.ok).length;$('rpc').textContent=healthy+'/'+(state.rpcHealth||[]).length;$('execution').textContent=state.bot&&state.bot.executionPaused?'PAUSED':(state.bot&&state.bot.dryRun?'DRY RUN':'LIVE');$('lastAction').textContent=state.bot&&state.bot.lastAction||'--';const pos=p.positions||[];$('rangeCount').textContent=pos.length;const oor=pos.filter(x=>x.outside).length;$('oorCount').textContent=oor+' out of range';$('positions').innerHTML=pos.map(positionRow).join('')||'<tr><td colspan="7" class="muted">No tracked positions</td></tr>';$('events').innerHTML=(events.events||[]).map(eventRow).join('');$('pause').textContent=state.bot&&state.bot.executionPaused?'Resume execution':'Pause execution'}
+$('refresh').onclick=()=>load();$('pause').onclick=async()=>{await api('/api/control/'+(snapshot&&snapshot.bot&&snapshot.bot.executionPaused?'resume':'pause'),{method:'POST'});await load()};$('savePoints').onclick=async()=>{await api('/api/points/baseline',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({points:Number($('actualPoints').value)})});$('actualPoints').value='';await load()};$('addCashflow').onclick=async()=>{await api('/api/cashflow',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({usd:Number($('cashflow').value),note:$('cashflowNote').value})});$('cashflow').value='';$('cashflowNote').value='';await load()};load().catch(console.error);setInterval(()=>load().catch(console.error),10000);
+</script></main></body></html>`;
+}

@@ -1,6 +1,6 @@
 import { getAddress } from 'ethers';
-import { CHAIN_ID, DEFAULT_RPC_URL, FABLES_REGISTRY } from './constants.js';
-import { envBool, envInt, envList } from './env.js';
+import { CHAIN_ID, DEFAULT_RPC_URL, FABLES_REGISTRY, USDG } from './constants.js';
+import { envBool, envInt, envList, envNum } from './env.js';
 
 export function loadConfig() {
   const walletAddress = requiredAddress('WALLET_ADDRESS');
@@ -8,32 +8,34 @@ export function loadConfig() {
   const dryRun = envBool('DRY_RUN', true);
   const enableLiveWrites = envBool('ENABLE_LIVE_WRITES', false);
   const enableAutoRedeploy = envBool('ENABLE_AUTO_REDEPLOY', false);
+  const rpcUrls = envList('RPC_URLS', [DEFAULT_RPC_URL]);
 
-  if (!dryRun && enableLiveWrites && !privateKey) {
-    throw new Error('PRIVATE_KEY is required when live writes are enabled');
-  }
+  if (!rpcUrls.length) throw new Error('RPC_URLS must contain at least one endpoint');
+  if (!dryRun && enableLiveWrites && !privateKey) throw new Error('PRIVATE_KEY is required when live writes are enabled');
   if (!dryRun && enableAutoRedeploy) {
-    throw new Error('Live auto-redeploy is intentionally gated in v0.1 until the Fables deposit ABI is independently verified');
+    throw new Error('Live auto-redeploy is gated until Fables deposit and swap calldata are independently verified');
   }
-
-  const targetSymbols = envList('TARGET_SYMBOLS', ['CASHCAT', 'USDG']).map((x) => x.toUpperCase());
-  const positionIds = envList('POSITION_IDS', []);
 
   return {
     chainId: CHAIN_ID,
-    rpcUrl: process.env.RPC_URL?.trim() || DEFAULT_RPC_URL,
+    rpcUrls,
     registryAddress: getAddress(process.env.FABLES_REGISTRY?.trim() || FABLES_REGISTRY),
+    usdgAddress: getAddress(process.env.USDG_ADDRESS?.trim() || USDG),
     walletAddress,
     privateKey,
     dryRun,
     enableLiveWrites,
     enableAutoRedeploy,
-    targetSymbols,
+    targetSymbols: envList('TARGET_SYMBOLS', ['CASHCAT', 'USDG']).map((x) => x.toUpperCase()),
     targetPoolIds: envList('TARGET_POOL_IDS', []).map((x) => x.toLowerCase()),
-    positionIds: positionIds.map(normalizeBytes32),
+    positionIds: envList('POSITION_IDS', []).map(normalizeBytes32),
     pollIntervalMs: envInt('POLL_INTERVAL_MS', 15_000),
-    logChunkBlocks: envInt('LOG_CHUNK_BLOCKS', 1_000_000),
-    logFromBlock: envInt('LOG_FROM_BLOCK', 0),
+    logChunkBlocks: envInt('LOG_CHUNK_BLOCKS', 500_000),
+    minLogChunkBlocks: envInt('MIN_LOG_CHUNK_BLOCKS', 25_000),
+    logFromBlock: envInt('LOG_FROM_BLOCK', 44_000_000),
+    feeLogFromBlock: envInt('FEE_LOG_FROM_BLOCK', 0),
+    marketRefreshMs: envInt('MARKET_REFRESH_MS', 60_000),
+    reorgLookbackBlocks: envInt('REORG_LOOKBACK_BLOCKS', 64),
     tightWidthBps: envInt('TIGHT_WIDTH_BPS', 120),
     edgeBufferTicks: envInt('EDGE_BUFFER_TICKS', 0),
     outOfRangeConfirmations: envInt('OUT_OF_RANGE_CONFIRMATIONS', 2),
@@ -43,8 +45,17 @@ export function loadConfig() {
     allowZeroMinOut: envBool('ALLOW_ZERO_MIN_OUT', false),
     txDeadlineSec: envInt('TX_DEADLINE_SEC', 1200),
     confirmations: envInt('TX_CONFIRMATIONS', 1),
-    maxGasGwei: Number(process.env.MAX_GAS_GWEI || 1),
-    stateFile: process.env.STATE_FILE?.trim() || './state/bot-state.json'
+    maxGasGwei: envNum('MAX_GAS_GWEI', 1),
+    dashboardEnabled: envBool('DASHBOARD_ENABLED', true),
+    dashboardHost: process.env.DASHBOARD_HOST?.trim() || '127.0.0.1',
+    dashboardPort: envInt('DASHBOARD_PORT', 8787),
+    dashboardToken: process.env.DASHBOARD_TOKEN?.trim() || '',
+    dataDir: process.env.DATA_DIR?.trim() || './data',
+    stateFile: process.env.STATE_FILE?.trim() || './state/bot-state.json',
+    actualPointsBaseline: envNum('ACTUAL_POINTS_BASELINE', 0),
+    actualPointsBaselineAt: process.env.ACTUAL_POINTS_BASELINE_AT?.trim() || '',
+    manualNetCashflowUsd: envNum('MANUAL_NET_CASHFLOW_USD', 0),
+    referenceDepositTx: process.env.REFERENCE_DEPOSIT_TX?.trim() || ''
   };
 }
 

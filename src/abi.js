@@ -28,4 +28,5 @@ export const ERC20_ABI = [
 ];
 
 export const DEPOSITED_EVENT = 'Deposited(address,uint256,uint128)';
-export const TRANSFER_6909_EVENT = 'Transfer(address,address,address,uint256,uint256)';
+export const WITHDRAWN_EVENT = 'Withdrawn(address,uint256,uint128)';
+export const FEES_COLLECTED_EVENT = 'FeesCollected(uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint128,uint128,uint64,uint64)';

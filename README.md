@@ -1,73 +1,176 @@
 # Auto LP Bot — Fables.fi / Robinhood Chain
 
-> v0.1 Safe MVP：自動監控 Fables 集中流動性區間、偵測 Out-of-Range、計算新的 Tight range，並對已驗證的 Fables 寫入流程提供安全閘門。
+> v0.2：API-less on-chain LP monitor + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
 
-## 目標
+## v0.2 重點
 
-此專案用來常駐監控 Robinhood Chain 上的 Fables.fi LP，核心循環是：
+Fables 不提供可申請的交易 API 並不會阻擋這個 BOT。Fables 的 pool、range、fee 與交易結果都落在 Robinhood Chain，因此本專案把 **Robinhood JSON-RPC + Fables on-chain contracts/events** 當成 source of truth：
 
+```text
+Robinhood RPC / managed RPC
+        │
+        ├── FablesPoolRegistry.activePools()
+        ├── PoolManager state (tick / sqrtPrice / liquidity)
+        ├── Fables hook ERC-6909 range ledger
+        ├── Deposited / Withdrawn / FeesCollected logs
+        ├── wallet token balances
+        └── eth_sendRawTransaction / receipts
+                 │
+                 ▼
+           Auto LP Bot v0.2
+        ┌────────┼──────────┐
+        │        │          │
+     strategy  accounting  guarded executor
+        │        │          │
+        ▼        ▼          ▼
+     rebalance   JSONL     claim / withdraw
+       plan      ledger      (verified only)
+        │        │
+        └────┬───┘
+             ▼
+      Local Dashboard :8787
 ```
-發現 Fables pool
-  -> 讀取真實 PoolManager tick
-  -> 找出指定錢包的 ERC-6909 range shares
-  -> 判斷是否離開區間
-  -> 連續確認 / 防抖 / cooldown
-  -> 依 Tight preset 重新計算目標 ticks
-  -> dry-run / preflight
-  -> claim + withdraw
-  -> swap 配平
-  -> 重新 deposit 到新 range
-  -> 繼續監控
+
+不需要 Fables 私有 API、API key，也不需要讓 BOT 依賴 Fables 網頁 DOM。
+
+## 已完成
+
+### 鏈上監控
+
+- Robinhood Chain mainnet chain ID `4663`
+- 多 RPC endpoint + ethers `FallbackProvider`
+- FablesPoolRegistry 自動發現 active pools
+- 讀取每個 Fables hook 的 PoolManager
+- 直接讀 `sqrtPriceX96 / tick / liquidity`
+- Fables ERC-6909 `balanceOf / rangeKey / userPosition`
+- `Deposited / Withdrawn / FeesCollected` event indexer
+- adaptive `eth_getLogs` chunking + reorg lookback
+- public RPC 可用於開發，正式部署可改 managed/archive RPC
+
+### 自動 LP 策略
+
+- 預設 Tight 約 `±1.2%`
+- 自動 tickSpacing 對齊
+- 連續 Out-of-Range confirmation
+- position cooldown
+- 每小時 rebalance rate limit
+- 本地 Pause / Resume kill switch
+- dry-run 預設啟用
+
+### 本地中控台
+
+預設：`http://127.0.0.1:8787`
+
+Dashboard 顯示：
+
+- 目前 LP + 錢包相關資產總值
+- Net PnL
+- HODL baseline
+- vs HODL 損益
+- Impermanent Loss / 無常損失
+- LP fee 累積
+- 未領 fees
+- Gas fee（ETH / USD 估值）
+- Fables Points：actual baseline + estimated delta
+- 各 LP Range / current tick / In Range / Out of Range
+- RPC health
+- Execution / Dry-run / Pause 狀態
+- append-only transaction / accounting ledger
+- 手動 cashflow adjustment
+- 手動輸入官方 Points baseline 校準
+
+### 交易紀錄與會計
+
+`DATA_DIR=./data` 下會建立：
+
+```text
+data/
+├── events.jsonl              # append-only 事件/交易/會計 ledger
+├── latest-snapshot.json      # Dashboard 最新狀態
+├── portfolio-baseline.json   # HODL / PnL 起始基準
+└── reference-tx/             # reference tx inspect artifacts
 ```
 
-### v0.1 已完成
+重要事件類型：
 
-- Robinhood Chain mainnet，chain id `4663`
-- 從 FablesPoolRegistry `activePools()` 動態發現 pool，不硬編碼完整 pool 清單
-- 讀取 Fables hook 對應的 canonical Uniswap v4 PoolManager
-- 直接從 PoolManager state 取得 `sqrtPriceX96 / tick / liquidity`
-- 透過 `Deposited(address,uint256,uint128)` 找出錢包曾建立的 range id
-- 讀取 Fables ERC-6909 `balanceOf / rangeKey / userPosition`
-- Out-of-Range 自動判定
-- 預設連續 2 次 Out-of-Range 才觸發，降低瞬間穿價造成的重複搬倉
-- Tight preset 預設約 `±1.2%`，並自動對齊 pool `tickSpacing`
-- 每個 position cooldown
-- 每小時最大 rebalance 次數
-- JSON structured log
-- 本地 state persistence
-- RPC log 掃描首次回溯後只追新 block
-- 已驗證的 `claimFees()` / `withdraw()` calldata
-- transaction preflight、gas guard、wallet address/private key 一致性檢查
-- **預設 `DRY_RUN=true`，不會動用資金**
-- Node test / GitHub Actions CI / Dockerfile
+- `lp.deposit`
+- `lp.withdraw`
+- `pool.fee`
+- `fee.accrual`
+- `fee.realized`
+- `tx.sent`
+- `tx.confirmed`
+- `rebalance.dry_run`
+- `rebalance.failed`
+- `rebalance.redeploy_gated`
+- `cashflow.adjustment`
+- `points.actual_baseline`
+- `execution.control`
 
-### v0.1 刻意保留的安全閘門
+## PnL 與 IL 定義
 
-Fables 的 LP **不是標準 Uniswap v4 PositionManager NFT**。目前公開資料可交叉驗證的是 Fables hook 自己維護的 ERC-6909 range shares，以及 `claimFees()`、`withdraw()`；但 Fables 網頁建立新 range 的 deposit/zap 寫入 ABI 與 swap 配平 route 還需要用實際成功交易再做 selector / calldata / trace 驗證。
+### Portfolio Net PnL
 
-因此 v0.1：
+```text
+Tracked Assets
+= LP principal
++ unclaimed LP fees
++ target-token wallet balances
 
-- 可以完整監控與自動產生新 range 計畫。
-- 可以在明確開啟 live flags 後執行已驗證的 claim/withdraw。
-- **不會猜測未知 deposit selector。**
-- `ENABLE_AUTO_REDEPLOY=true` 目前會被程式阻擋，直到 deposit + swap executor 完成獨立驗證。
+Gross PnL
+= Current Tracked Assets
+- Initial Portfolio Baseline
+- Net External Cashflow
 
-這是刻意的資金安全設計，不是以標準 Uniswap PositionManager 假裝相容。
+Net PnL
+= Gross PnL - Gas Cost
+```
 
-## 已知 Fables / Robinhood Chain 基準
+如果 native ETH 本身就是 tracked target token，gas 已反映在 ETH balance 下降，因此不再重複扣一次。
 
-- Robinhood Chain RPC：`https://rpc.mainnet.chain.robinhood.com`
-- Chain ID：`4663`
-- FablesPoolRegistry：`0x159A113E012593D9B3cC63ad45E30F0467e13Ef3`
-- Canonical Uniswap v4 PoolManager：`0x8366a39cc670b4001a1121b8f6a443a643e40951`
-- USDG：`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`
-- CASHCAT/USDG FablesRamp hook：`0x08E52564Bad99E05a694b4809F397edcA417A080`
+### Impermanent Loss（無常損失）
 
-Registry 是 source of truth；新 pool 不需要靠 bot 發版才能被發現。
+每個 position 首次被 BOT 追蹤時記下當時兩種 token 數量：
+
+```text
+HODL Value(t)
+= initial token0 amount × price0(t)
++ initial token1 amount × price1(t)
+
+IL(t)
+= current LP principal value - HODL Value(t)
+```
+
+因此：
+
+- `IL < 0`：相對單純 HODL 有損失
+- `IL > 0`：相對 HODL position principal 較高
+- fees 另外列，不混入 LP principal IL
+
+Portfolio 層另外保留整體 HODL baseline，方便判斷「做 LP」相對「什麼都不做」是否真的有超額收益。
+
+## LP fees
+
+BOT 讀兩層：
+
+1. `userPosition().owed0 / owed1`：追蹤你個人的未領 fee 變化。
+2. `FeesCollected`：追蹤 Fables 全市場 pool fee，作 Points fee-share estimator 的 denominator。
+
+第一次啟動只建立 user fee baseline，不把既有 owed fees 假裝成 BOT 期間新賺到的 fee。
+
+## Fables Points
+
+Fables UI 說明 Points 跟 LP 實際賺到的 swap fees 相關。v0.2 將 Points 分成：
+
+- `actualBaseline`：你從 Fables leaderboard 看到的官方實際分數，可在 Dashboard 手動輸入。
+- `estimatedDelta`：baseline 之後依 `你的 tracked fee / Fables 全市場 tracked fee` 推估新增分數。
+- `estimatedTotal = actualBaseline + estimatedDelta`
+
+這是 **估算器，不冒充官方 leaderboard**。如果官方 Points 邏輯或活動權重改變，只需調整 estimator；鏈上 fee ledger 不會因此失效。
 
 ## 快速開始
 
-需求：Node.js 20+。
+Node.js 20+：
 
 ```bash
 npm install
@@ -76,91 +179,117 @@ npm run once
 npm start
 ```
 
-預設設定已放入目前研究使用的監控錢包：
+打開：
+
+```text
+http://127.0.0.1:8787
+```
+
+### 建議 production RPC
+
+`.env`：
 
 ```env
-WALLET_ADDRESS=0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF
-TARGET_SYMBOLS=CASHCAT,USDG
-DRY_RUN=true
-ENABLE_LIVE_WRITES=false
-ENABLE_AUTO_REDEPLOY=false
+RPC_URLS=https://YOUR-MANAGED-RPC,https://rpc.mainnet.chain.robinhood.com
 ```
 
-如果首次掃描的 block 數太大，建議把 `LOG_FROM_BLOCK` 設成首次建立該 Fables position 之前的 block，可大幅減少啟動時 RPC request。
+第一個 endpoint 同時作 write provider；其餘作 read failover。
 
-## Tight 策略
+Robinhood public RPC 適合開發/備援。常駐 BOT 建議至少放一個 managed provider；歷史 backfill 則使用 archive RPC。
 
-Fables UI 的 Tight preset 約為 `±1.2%`。v0.1 以目前 tick 為中心，先把價格寬度轉成 tick delta，再向外對齊 `tickSpacing`：
+## Reference deposit transaction inspector
 
+Fables 新建 range / redeploy 的 deposit/zap ABI 在 v0.2 **仍不猜測**。先以已知成功交易做 trace：
+
+```bash
+npm run inspect:tx
+# 或
+node src/tools/inspect-reference-tx.js 0x...
 ```
-rawDelta = ceil(log(1 + 0.012) / log(1.0001))
-lower = floor((currentTick - rawDelta) / tickSpacing) * tickSpacing
-upper = ceil((currentTick + rawDelta) / tickSpacing) * tickSpacing
+
+會輸出：
+
+```text
+data/reference-tx/<hash>.json
 ```
 
-所以實際上下界可能因 tickSpacing 略微不對稱，這是正常的。
+包含：
 
-## 重要環境變數
+- from / to
+- selector
+- raw calldata
+- receipt logs
+- gas
+- 若 RPC 支援 `debug_traceTransaction`：完整 call trace
+- 如果 top-level calldata 是已知 Fables hook ABI：直接 decode
 
-| 變數 | 預設 | 說明 |
-|---|---:|---|
-| `DRY_RUN` | `true` | 只監控與產生 rebalance plan |
-| `ENABLE_LIVE_WRITES` | `false` | 是否允許已驗證的鏈上寫入 |
-| `ENABLE_AUTO_REDEPLOY` | `false` | v0.1 強制 gated |
-| `TIGHT_WIDTH_BPS` | `120` | 單側 Tight 寬度，120 = 1.2% |
-| `OUT_OF_RANGE_CONFIRMATIONS` | `2` | 連續幾次才觸發 |
-| `POLL_INTERVAL_MS` | `15000` | 輪詢週期 |
-| `MIN_REBALANCE_INTERVAL_SEC` | `300` | position cooldown |
-| `MAX_REBALANCES_PER_HOUR` | `3` | churn guard |
-| `ALLOW_ZERO_MIN_OUT` | `false` | live withdraw 是否允許 amount min = 0 |
-| `MAX_GAS_GWEI` | `1` | gas guard |
-| `POSITION_IDS` | 空 | 可手動指定 range ids，避開歷史 log discovery |
-| `TARGET_POOL_IDS` | 空 | 可直接 pin pool id |
+目前研究 reference：
 
-## Live mode
+`0x4473378d0f20e03c647fe0d5b22a482b5700af7638578046d41396b5adf2dd30`
 
-不要把 private key 寫進 repo。正式部署前至少完成：
+只有完成 target contract、selector、call trace、allowance、swap/deposit params、minted ERC-6909 shares 的驗證後，才解除 `ENABLE_AUTO_REDEPLOY` safety gate。
 
-1. 使用專門的 LP hot wallet，不使用主要資產錢包。
-2. 先跑 `DRY_RUN=true` 至少跨過一次真實 Out-of-Range。
-3. 驗證 bot 找到的 range id、shares、tickLower/tickUpper 與 Fables UI 一致。
-4. 驗證 `claimFees` 與 `withdraw` preflight。
-5. 完成 Fables deposit/zap 成功交易的完整 trace 與 ABI 驗證後，才解除 auto-redeploy gate。
-6. 對 swap 設 maximum input / minimum output、deadline 與 token allowlist。
-7. 對單次搬倉金額、每小時搬倉次數與 gas 設硬上限。
+## Live mode 現況
 
-詳細內容見 `docs/LIVE_MODE_CHECKLIST.md`。
+目前可以安全開放的 write path：
+
+- `claimFees()`
+- `withdraw()`
+
+每筆 live transaction 都會先：
+
+1. wallet/private-key consistency check
+2. gas guard
+3. `eth_call` preflight
+4. gas estimate
+5. 送交易
+6. 等 receipt
+7. 記 gasUsed / gasPrice / gas ETH / gas USD
+8. 記 token balance delta
+
+### 重要
+
+`withdraw -> swap -> deposit new range` **尚未解除 safety gate**。原因不是缺 Fables API，而是我們還沒有可靠證據確認 Fables 前端目前使用的 deposit/zap calldata。這個限制是刻意避免拿未知 ABI 動真實資金。
+
+## Dashboard API
+
+預設只綁 localhost：
+
+- `GET /api/state`
+- `GET /api/events?limit=200`
+- `POST /api/control/pause`
+- `POST /api/control/resume`
+- `POST /api/control/scan`
+- `POST /api/points/baseline`
+- `POST /api/cashflow`
+
+若 `DASHBOARD_HOST` 不是 loopback，程式強制要求 `DASHBOARD_TOKEN`。
 
 ## 測試
 
 ```bash
-npm test
 npm run check
+npm test
 ```
 
-目前 v0.1 strategy tests：6/6 PASS。
+v0.2：12 個 pure unit tests。
 
-## 下一階段
+## 下一個 executor milestone
 
-v0.2 的優先順序：
+1. 用 managed/archive RPC 成功抓 reference deposit tx raw calldata。
+2. 用 `debug_traceTransaction` 找到 router / hook / PoolManager internal calls。
+3. decode Fables new-range deposit/zap ABI。
+4. 建立 token-ratio calculator。
+5. swap router allowlist + quote + minOut + deadline。
+6. deposit `eth_call` simulation。
+7. 小額 mainnet canary。
+8. ERC-6909 share mint assertion。
+9. 才允許 unattended full auto rebalance。
 
-1. 反解並驗證 Surf 規劃中的成功交易 `0x4473378d0f20e03c647fe0d5b22a482b5700af7638578046d41396b5adf2dd30`。
-2. 固化 Fables deposit/new-range ABI。
-3. 加入 withdrawal 後的 token ratio 計算。
-4. 導入可驗證的 Uniswap v4 / Fables swap executor 做資產配平。
-5. deposit 前做 `eth_call` simulation + allowance + slippage + balance assertions。
-6. 完成 `withdraw -> swap -> deposit` end-to-end fork / small-value live validation。
-7. 加 Telegram / Discord 告警與 Prometheus health metrics。
-8. 支援多個 target pool 與 `$INDEX` 等後續 Fables pool。
+## 資安
 
-## 參考
-
-- Fables： https://fables.fi/
-- Robinhood Chain docs： https://docs.robinhood.com/chain/
-- Fables registry / pool tracking 可參考 DefiLlama adapter
-- Fables hook metadata 可參考 Uniswap hooklist
-- vfat.tools 的 Fables range tracker 可交叉驗證 ERC-6909 range / withdraw 行為
-
----
-
-此專案直接管理鏈上資產。先以 dry-run 驗證，再逐步開放寫入權限；任何未經 ABI / trace 驗證的 calldata 都不應進入 live executor。
+- 不要提交 `.env` / private key。
+- BOT 使用獨立 hot wallet。
+- Dashboard 預設只開 loopback。
+- live executor 只允許已驗證 contract / calldata 路徑。
+- 所有 unknown selector 都 fail closed。

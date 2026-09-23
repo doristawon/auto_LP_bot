@@ -1,15 +1,19 @@
 {
   "name": "auto-lp-bot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Fables.fi concentrated-liquidity monitoring and rebalance bot for Robinhood Chain",
-  "engines": { "node": ">=20" },
+  "description": "Fables.fi LP monitor, accounting dashboard and guarded rebalance bot for Robinhood Chain",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node src/index.js",
     "once": "node src/index.js --once",
+    "dashboard": "node src/index.js --dashboard-only",
+    "inspect:tx": "node src/tools/inspect-reference-tx.js",
     "test": "node --test",
-    "check": "node --check src/index.js && node --check src/bot.js && node --check src/adapters/fables.js && node --check src/adapters/executor.js && node --check src/strategy/tight-range.js"
+    "check": "node --check src/index.js && node --check src/bot.js && node --check src/config.js && node --check src/adapters/fables.js && node --check src/adapters/executor.js && node --check src/analytics/portfolio.js && node --check src/analytics/points.js && node --check src/analytics/points-tracker.js && node --check src/dashboard/page.js && node --check src/dashboard/server.js && node --check src/rpc/providers.js && node --check src/tools/inspect-reference-tx.js"
   },
   "dependencies": {
     "ethers": "^6.15.0"
