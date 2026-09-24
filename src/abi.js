@@ -11,6 +11,7 @@ export const HOOK_ABI = [
   'function balanceOf(address,uint256) view returns(uint256)',
   'function userPosition(uint256,address) view returns(tuple(uint128 staked,uint128 owed0,uint128 owed1,uint256 checkpoint0X128,uint256 checkpoint1X128,uint256 stakedCheckpoint0X128,uint256 stakedCheckpoint1X128,uint256 forgone0,uint256 forgone1))',
   'function paused() view returns(bool)',
+  `function deposit(${POOL_KEY_TUPLE} key,int24 tickLower,int24 tickUpper,uint128 liquidity,uint128 amount0Max,uint128 amount1Max,uint256 deadline)`,
   `function claimFees(${POOL_KEY_TUPLE} key,int24 tickLower,int24 tickUpper,address recipient,uint16 walk)`,
   `function withdraw(${POOL_KEY_TUPLE} key,int24 tickLower,int24 tickUpper,uint128 liquidity,address recipient,uint128 amount0Min,uint128 amount1Min,uint256 deadline)`
 ];
