@@ -87,35 +87,14 @@ export class AutoLpBot {
       const targetPools = selection.pools;
       const accountingPools = selection.accountingPools || targetPools;
       if (!targetPools.length) {
-        const snapshot = {
-          generatedAt: Date.now(),
-          blockNumber: latestBlock,
-          bot: {
-            version: '0.3.3',
-            wallet: this.config.walletAddress,
-            dryRun: this.config.dryRun,
-            liveWrites: this.config.enableLiveWrites,
-            autoRedeploy: this.config.enableAutoRedeploy,
-            executionPaused: this.executionPaused,
-            targetMode: this.config.targetMode,
-            activePoolIds: [],
-            topologyCooldownUntil: this.state.getSetting('walletTopologyCooldownUntil', 0),
-            lastAction: this.state.getSetting('lastAction', null),
-            swapSlippageBps: this.config.swapSlippageBps,
-            rangePolicy: rangePolicySnapshot(this.config),
-            absoluteInRangeHold: true
-          },
-          rpcHealth: this.rpcHealth,
-          portfolio: this.snapshot?.portfolio || emptyPortfolio(),
-          points: this.points.snapshot(),
-          prices: Object.fromEntries(this.market.prices),
-          walletBalances: {},
-          pools: []
-        };
-        this.snapshot = snapshot;
-        this.ledger.writeSnapshot(snapshot);
-        log('warn', 'wallet_pool.none_active', { targetMode: this.config.targetMode, block: latestBlock });
-        return snapshot;
+        // No active LP is an execution state, not a reason to freeze accounting.
+        // Continue through the normal wallet-balance/portfolio path using known
+        // historical pools so a manual full withdrawal is reflected immediately.
+        log('warn', 'wallet_pool.none_active', {
+          targetMode: this.config.targetMode,
+          block: latestBlock,
+          accountingPools: accountingPools.map((pool) => pool.id)
+        });
       }
 
       for (const pool of targetPools) {
@@ -150,7 +129,7 @@ export class AutoLpBot {
         generatedAt: Date.now(),
         blockNumber: latestBlock,
         bot: {
-          version: '0.3.3',
+          version: '0.3.4',
           wallet: this.config.walletAddress,
           dryRun: this.config.dryRun,
           liveWrites: this.config.enableLiveWrites,
