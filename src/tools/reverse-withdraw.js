@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { Contract, Interface, id, zeroPadValue } from 'ethers';
+import { AbiCoder, Contract, Interface, id, keccak256, zeroPadValue } from 'ethers';
+import { getAmountsForLiquidity, getSqrtPriceAtTick } from '../math/v4-fixed.js';
 import { loadDotEnv } from '../env.js';
 import { loadConfig } from '../config.js';
 import { createProviders, verifyProviders } from '../rpc/providers.js';
@@ -34,6 +35,9 @@ const hashes = [
 
 const withdrawnTopic=id(WITHDRAWN_EVENT).toLowerCase();
 const iface=new Interface(HOOK_ABI);
+const stateViewIface = new Interface(['function getSlot0(bytes32) view returns(uint160 sqrtPriceX96,int24 tick,uint24 protocolFee,uint24 lpFee)']);
+const stateView = '0xF3334192D15450CdD385c8B70e03f9A6bD9E673b';
+const coder = AbiCoder.defaultAbiCoder();
 const candidateSignatures = [
   'withdraw((address,address,uint24,int24,address),int24,int24,uint128,address,uint128,uint128,uint256,uint16)',
   'withdraw((address,address,uint24,int24,address),int24,int24,uint128,address,uint128,uint128,uint256,uint24)',
@@ -71,6 +75,42 @@ for (const hash of hashes) {
     const addr='0x'+hex.slice(-40);
     words.push({index:i/64,hex,uint:u.toString(),signed:signed.toString(),int24,address:addr});
   }
+  const decoded = iface.decodeFunctionData('withdrawAndClaim', tx.data);
+  let historical = null;
+  try {
+    const poolId = keccak256(coder.encode(
+      ['tuple(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks)'],
+      [[range.key.currency0, range.key.currency1, range.key.fee, range.key.tickSpacing, range.key.hooks]]
+    ));
+    const slotData = stateViewIface.encodeFunctionData('getSlot0', [poolId]);
+    const slotRaw = await readProvider.send('eth_call', [
+      { to: stateView, data: slotData },
+      '0x' + Math.max(0, receipt.blockNumber - 1).toString(16)
+    ]);
+    const [sqrtPriceX96, historicalTick] = stateViewIface.decodeFunctionResult('getSlot0', slotRaw);
+    const amounts = getAmountsForLiquidity(
+      BigInt(sqrtPriceX96),
+      getSqrtPriceAtTick(Number(range.tickLower)),
+      getSqrtPriceAtTick(Number(range.tickUpper)),
+      liquidity,
+      false
+    );
+    const realMin0 = BigInt(decoded[5]);
+    const realMin1 = BigInt(decoded[6]);
+    historical = {
+      sqrtPriceX96: BigInt(sqrtPriceX96).toString(),
+      tick: Number(historicalTick),
+      expected0: amounts.amount0.toString(),
+      expected1: amounts.amount1.toString(),
+      realMin0: realMin0.toString(),
+      realMin1: realMin1.toString(),
+      inferredDiscountBps0: inferDiscountBps(amounts.amount0, realMin0),
+      inferredDiscountBps1: inferDiscountBps(amounts.amount1, realMin1)
+    };
+  } catch (error) {
+    historical = { error: error.message };
+  }
+
   rows.push({
     hash,
     blockNumber:receipt.blockNumber,
@@ -78,10 +118,12 @@ for (const hash of hashes) {
     from:tx.from,
     to:tx.to,
     selector:tx.data.slice(0,10),
+    data:tx.data,
     calldataBytes:(tx.data.length-2)/2,
     value:tx.value.toString(),
     rangeId,
     eventLiquidity:liquidity.toString(),
+    historical,
     range:{
       currency0:String(range.key.currency0),
       currency1:String(range.key.currency1),
@@ -127,3 +169,10 @@ console.log(JSON.stringify({
   wordCount:summary.wordCount,
   sample:rows.slice(0,3)
 },null,2));
+
+function inferDiscountBps(expected, minimum) {
+  expected = BigInt(expected);
+  minimum = BigInt(minimum);
+  if (expected <= 0n) return null;
+  return Number((expected - minimum) * 10000n / expected);
+}
