@@ -11,6 +11,7 @@ export function loadConfig() {
   const rpcUrls = envList('RPC_URLS', [DEFAULT_RPC_URL]);
   const targetMode = (process.env.TARGET_MODE?.trim() || 'wallet-active').toLowerCase();
   const logFromBlock = envInt('LOG_FROM_BLOCK', 44_000_000);
+  const oorMaxWaitMin = envInt('OOR_MAX_WAIT_MIN', 90);
 
   if (!rpcUrls.length) throw new Error('RPC_URLS must contain at least one endpoint');
   if (!['wallet-active', 'allowlist', 'symbols'].includes(targetMode)) {
@@ -46,7 +47,11 @@ export function loadConfig() {
     reorgLookbackBlocks: envInt('REORG_LOOKBACK_BLOCKS', 64),
     tightWidthBps: envInt('TIGHT_WIDTH_BPS', 120),
     edgeBufferTicks: envInt('EDGE_BUFFER_TICKS', 0),
-    outOfRangeConfirmations: envInt('OUT_OF_RANGE_CONFIRMATIONS', 2),
+    rangeCheckIntervalMs: envInt('RANGE_CHECK_INTERVAL_MS', 15 * 60 * 1000),
+    oorShallowThresholdPct: envNum('OOR_SHALLOW_THRESHOLD_PCT', 0.5),
+    oorMaxWaitMin,
+    oorMaxWaitMs: oorMaxWaitMin * 60 * 1000,
+    oorDeepConfirmations: envInt('OOR_DEEP_CONFIRMATIONS', envInt('OUT_OF_RANGE_CONFIRMATIONS', 2)),
     minRebalanceIntervalSec: envInt('MIN_REBALANCE_INTERVAL_SEC', 300),
     maxRebalancesPerHour: envInt('MAX_REBALANCES_PER_HOUR', 3),
     swapSlippageBps: envInt('SWAP_SLIPPAGE_BPS', 50),

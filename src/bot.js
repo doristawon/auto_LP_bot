@@ -90,7 +90,7 @@ export class AutoLpBot {
           generatedAt: Date.now(),
           blockNumber: latestBlock,
           bot: {
-            version: '0.3.0',
+            version: '0.3.2',
             wallet: this.config.walletAddress,
             dryRun: this.config.dryRun,
             liveWrites: this.config.enableLiveWrites,
@@ -100,7 +100,9 @@ export class AutoLpBot {
             activePoolIds: [],
             topologyCooldownUntil: this.state.getSetting('walletTopologyCooldownUntil', 0),
             lastAction: this.state.getSetting('lastAction', null),
-            swapSlippageBps: this.config.swapSlippageBps
+            swapSlippageBps: this.config.swapSlippageBps,
+          rangePolicy: rangePolicySnapshot(this.config),
+            rangePolicy: rangePolicySnapshot(this.config)
           },
           rpcHealth: this.rpcHealth,
           portfolio: this.snapshot?.portfolio || emptyPortfolio(),
@@ -147,7 +149,7 @@ export class AutoLpBot {
         generatedAt: Date.now(),
         blockNumber: latestBlock,
         bot: {
-          version: '0.3.0',
+          version: '0.3.2',
           wallet: this.config.walletAddress,
           dryRun: this.config.dryRun,
           liveWrites: this.config.enableLiveWrites,
@@ -366,27 +368,46 @@ export class AutoLpBot {
   async decoratePosition(pool, position) {
     const stateKey = positionStateKey(pool, position);
     const stored = this.state.getPosition(stateKey);
+    const nowMs = Date.now();
     const evaluation = evaluatePosition({
       currentTick: pool.state.tick,
       tickSpacing: pool.key.tickSpacing,
       position,
       widthBps: this.config.tightWidthBps,
       edgeBufferTicks: this.config.edgeBufferTicks,
-      confirmationsSeen: stored.outOfRangeConfirmations || 0,
-      confirmationsRequired: this.config.outOfRangeConfirmations,
-      cooldownUntil: stored.cooldownUntil || 0
+      lastEvaluationAt: Number(stored.lastRangeEvaluationAt || 0),
+      outOfRangeSince: Number(stored.outOfRangeSince || 0),
+      deepConfirmationsSeen: Number(stored.deepOutOfRangeConfirmations || stored.outOfRangeConfirmations || 0),
+      checkIntervalMs: this.config.rangeCheckIntervalMs,
+      shallowThresholdPct: this.config.oorShallowThresholdPct,
+      maxWaitMs: this.config.oorMaxWaitMs,
+      deepConfirmationsRequired: this.config.oorDeepConfirmations,
+      cooldownUntil: stored.cooldownUntil || 0,
+      nowMs
     });
     Object.assign(position, {
       outside: evaluation.outside,
-      confirmations: evaluation.nextConfirmations,
+      excursionPct: evaluation.excursionPct,
+      confirmations: evaluation.deepConfirmations,
+      deepConfirmations: evaluation.deepConfirmations,
+      outOfRangeSince: evaluation.outOfRangeSince,
+      outOfRangeElapsedMin: evaluation.outOfRangeElapsedMs / 60000,
+      evaluationDue: evaluation.evaluationDue,
+      lastRangeEvaluationAt: evaluation.evaluatedAt,
+      nextRangeEvaluationAt: evaluation.nextEvaluationAt,
       cooldownActive: evaluation.cooldownActive,
       shouldRebalance: evaluation.shouldRebalance,
+      rebalanceReason: evaluation.rebalanceReason,
       target: evaluation.target
     });
     this.state.setPosition(stateKey, {
-      outOfRangeConfirmations: evaluation.nextConfirmations,
+      outOfRangeConfirmations: evaluation.deepConfirmations,
+      deepOutOfRangeConfirmations: evaluation.deepConfirmations,
+      outOfRangeSince: evaluation.outOfRangeSince,
+      lastRangeEvaluationAt: evaluation.evaluatedAt,
+      lastExcursionPct: evaluation.excursionPct,
       lastTick: pool.state.tick,
-      lastSeenAt: Date.now(),
+      lastSeenAt: nowMs,
       lastRange: [position.tickLower, position.tickUpper]
     });
     log(evaluation.outside ? 'warn' : 'info', 'position.status', {
@@ -395,7 +416,12 @@ export class AutoLpBot {
       tick: pool.state.tick,
       range: [position.tickLower, position.tickUpper],
       outside: evaluation.outside,
-      confirmations: evaluation.nextConfirmations,
+      excursionPct: evaluation.excursionPct,
+      outOfRangeElapsedMin: evaluation.outOfRangeElapsedMs / 60000,
+      deepConfirmations: evaluation.deepConfirmations,
+      evaluationDue: evaluation.evaluationDue,
+      shouldRebalance: evaluation.shouldRebalance,
+      rebalanceReason: evaluation.rebalanceReason,
       target: evaluation.target
     });
   }
@@ -470,7 +496,13 @@ export class AutoLpBot {
     try {
       const result = await this.executor.execute(plan);
       const cooldownUntil = Date.now() + this.config.minRebalanceIntervalSec * 1000;
-      this.state.setPosition(positionStateKey(pool, position), { cooldownUntil, outOfRangeConfirmations: 0 });
+      this.state.setPosition(positionStateKey(pool, position), {
+        cooldownUntil,
+        outOfRangeConfirmations: 0,
+        deepOutOfRangeConfirmations: 0,
+        outOfRangeSince: 0,
+        lastRangeEvaluationAt: 0
+      });
       this.state.recordRebalance({
         ts: Date.now(), positionId: position.id, poolId: pool.id, result: result.status,
         currentTick: pool.state.tick, target: position.target
@@ -621,7 +653,11 @@ function snapshotPool(pool) {
     paused: pool.state?.paused ?? null,
     positions: (pool.positions || []).map((p) => ({
       id: p.id, shares: p.shares.toString(), tickLower: p.tickLower, tickUpper: p.tickUpper,
-      outside: p.outside, confirmations: p.confirmations, target: p.target,
+      outside: p.outside, excursionPct: p.excursionPct, confirmations: p.confirmations,
+      deepConfirmations: p.deepConfirmations, outOfRangeSince: p.outOfRangeSince,
+      outOfRangeElapsedMin: p.outOfRangeElapsedMin, evaluationDue: p.evaluationDue,
+      lastRangeEvaluationAt: p.lastRangeEvaluationAt, nextRangeEvaluationAt: p.nextRangeEvaluationAt,
+      shouldRebalance: p.shouldRebalance, rebalanceReason: p.rebalanceReason, target: p.target,
       rebalancePlan: p.rebalancePlan || null, rebalanceQuote: p.rebalanceQuote || null,
       depositPlan: p.depositPlan || null
     }))
@@ -633,6 +669,16 @@ function positionStateKey(pool, position) {
 function sameStringArray(a, b) {
   return a.length === b.length && a.every((value, index) => value === b[index]);
 }
+function rangePolicySnapshot(config) {
+  return {
+    evaluationIntervalMs: config.rangeCheckIntervalMs,
+    shallowThresholdPct: config.oorShallowThresholdPct,
+    maxWaitMin: config.oorMaxWaitMin,
+    deepConfirmationsRequired: config.oorDeepConfirmations,
+    monitorPollIntervalMs: config.pollIntervalMs
+  };
+}
+
 function emptyPortfolio() {
   return {
     baseline: null,

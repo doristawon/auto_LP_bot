@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildCenteredRange, isOutsideRange, priceWidthBpsToTickDelta } from '../src/math/ticks.js';
-import { evaluatePosition } from '../src/strategy.js';
+import { evaluatePosition, outOfRangeExcursionPct } from '../src/strategy.js';
+
+const M15 = 15 * 60 * 1000;
 
 test('Tight 120 bps is about 120 ticks before spacing snap', () => {
   const delta = priceWidthBpsToTickDelta(120);
@@ -21,16 +23,157 @@ test('range boundary counts as out-of-range', () => {
   assert.equal(isOutsideRange(200, 100, 200), true);
 });
 
-test('rebalance needs confirmations', () => {
-  const base = { currentTick: 220, tickSpacing: 10, position: { tickLower: 100, tickUpper: 200 }, widthBps: 120, confirmationsRequired: 2, cooldownUntil: 0 };
-  const first = evaluatePosition({ ...base, confirmationsSeen: 0, nowMs: 1000 });
-  assert.equal(first.shouldRebalance, false);
-  const second = evaluatePosition({ ...base, confirmationsSeen: first.nextConfirmations, nowMs: 2000 });
-  assert.equal(second.shouldRebalance, true);
+test('50 ticks outside is about 0.5 percent', () => {
+  const pct = outOfRangeExcursionPct(1050, 900, 1000);
+  assert.ok(pct > 0.50 && pct < 0.51);
 });
 
-test('cooldown blocks churn', () => {
-  const x = evaluatePosition({ currentTick: 220, tickSpacing: 10, position: { tickLower: 100, tickUpper: 200 }, widthBps: 120, confirmationsSeen: 3, confirmationsRequired: 2, cooldownUntil: 10000, nowMs: 5000 });
+test('shallow OOR waits until 90 minutes', () => {
+  const base = {
+    currentTick: 1007,
+    tickSpacing: 10,
+    position: { tickLower: 900, tickUpper: 1000 },
+    widthBps: 120,
+    checkIntervalMs: M15,
+    shallowThresholdPct: 0.5,
+    maxWaitMs: 90 * 60 * 1000,
+    deepConfirmationsRequired: 2,
+    cooldownUntil: 0
+  };
+  const t0 = 1_000_000;
+  const first = evaluatePosition({ ...base, nowMs: t0 });
+  assert.equal(first.shouldRebalance, false);
+  assert.ok(first.excursionPct < 0.5);
+
+  const t75 = evaluatePosition({
+    ...base,
+    nowMs: t0 + 75 * 60 * 1000,
+    lastEvaluationAt: t0 + 60 * 60 * 1000,
+    outOfRangeSince: first.outOfRangeSince
+  });
+  assert.equal(t75.shouldRebalance, false);
+
+  const t90 = evaluatePosition({
+    ...base,
+    nowMs: t0 + 90 * 60 * 1000,
+    lastEvaluationAt: t0 + 75 * 60 * 1000,
+    outOfRangeSince: first.outOfRangeSince
+  });
+  assert.equal(t90.shouldRebalance, true);
+  assert.equal(t90.rebalanceReason, 'oor_max_wait_expired');
+});
+
+test('deep OOR requires two consecutive 15-minute evaluations', () => {
+  const base = {
+    currentTick: 1051,
+    tickSpacing: 10,
+    position: { tickLower: 900, tickUpper: 1000 },
+    widthBps: 120,
+    checkIntervalMs: M15,
+    shallowThresholdPct: 0.5,
+    maxWaitMs: 90 * 60 * 1000,
+    deepConfirmationsRequired: 2,
+    cooldownUntil: 0
+  };
+  const t0 = 2_000_000;
+  const first = evaluatePosition({ ...base, nowMs: t0 });
+  assert.equal(first.deepConfirmations, 1);
+  assert.equal(first.shouldRebalance, false);
+
+  const second = evaluatePosition({
+    ...base,
+    nowMs: t0 + M15,
+    lastEvaluationAt: first.evaluatedAt,
+    outOfRangeSince: first.outOfRangeSince,
+    deepConfirmationsSeen: first.deepConfirmations
+  });
+  assert.equal(second.deepConfirmations, 2);
+  assert.equal(second.shouldRebalance, true);
+  assert.equal(second.rebalanceReason, 'deep_oor_confirmed');
+});
+
+test('single deep spike that becomes shallow resets deep confirmations but keeps OOR timer', () => {
+  const common = {
+    tickSpacing: 10,
+    position: { tickLower: 900, tickUpper: 1000 },
+    widthBps: 120,
+    checkIntervalMs: M15,
+    shallowThresholdPct: 0.5,
+    maxWaitMs: 90 * 60 * 1000,
+    deepConfirmationsRequired: 2,
+    cooldownUntil: 0
+  };
+  const t0 = 3_000_000;
+  const deep = evaluatePosition({ ...common, currentTick: 1051, nowMs: t0 });
+  const shallow = evaluatePosition({
+    ...common,
+    currentTick: 1007,
+    nowMs: t0 + M15,
+    lastEvaluationAt: deep.evaluatedAt,
+    outOfRangeSince: deep.outOfRangeSince,
+    deepConfirmationsSeen: deep.deepConfirmations
+  });
+  assert.equal(shallow.deepConfirmations, 0);
+  assert.equal(shallow.outOfRangeSince, t0);
+  assert.equal(shallow.shouldRebalance, false);
+});
+
+test('checks inside the 15-minute policy window do not advance confirmations', () => {
+  const t0 = 4_000_000;
+  const x = evaluatePosition({
+    currentTick: 1051,
+    tickSpacing: 10,
+    position: { tickLower: 900, tickUpper: 1000 },
+    widthBps: 120,
+    lastEvaluationAt: t0,
+    outOfRangeSince: t0,
+    deepConfirmationsSeen: 1,
+    checkIntervalMs: M15,
+    shallowThresholdPct: 0.5,
+    maxWaitMs: 90 * 60 * 1000,
+    deepConfirmationsRequired: 2,
+    nowMs: t0 + 5 * 60 * 1000
+  });
+  assert.equal(x.evaluationDue, false);
+  assert.equal(x.deepConfirmations, 1);
+  assert.equal(x.shouldRebalance, false);
+});
+
+test('re-entry on a due evaluation clears the OOR timer', () => {
+  const t0 = 5_000_000;
+  const x = evaluatePosition({
+    currentTick: 950,
+    tickSpacing: 10,
+    position: { tickLower: 900, tickUpper: 1000 },
+    widthBps: 120,
+    lastEvaluationAt: t0,
+    outOfRangeSince: t0 - 60 * 60 * 1000,
+    deepConfirmationsSeen: 1,
+    checkIntervalMs: M15,
+    nowMs: t0 + M15
+  });
+  assert.equal(x.outside, false);
+  assert.equal(x.outOfRangeSince, 0);
+  assert.equal(x.deepConfirmations, 0);
+});
+
+test('cooldown blocks an otherwise eligible rebalance', () => {
+  const t0 = 6_000_000;
+  const x = evaluatePosition({
+    currentTick: 1051,
+    tickSpacing: 10,
+    position: { tickLower: 900, tickUpper: 1000 },
+    widthBps: 120,
+    outOfRangeSince: t0 - 90 * 60 * 1000,
+    lastEvaluationAt: t0 - M15,
+    deepConfirmationsSeen: 1,
+    checkIntervalMs: M15,
+    shallowThresholdPct: 0.5,
+    maxWaitMs: 90 * 60 * 1000,
+    deepConfirmationsRequired: 2,
+    cooldownUntil: t0 + M15,
+    nowMs: t0
+  });
   assert.equal(x.cooldownActive, true);
   assert.equal(x.shouldRebalance, false);
 });

@@ -1,6 +1,18 @@
 # Auto LP Bot — Fables.fi / Robinhood Chain
 
-> v0.3.0：API-less on-chain LP monitor + dynamic wallet-active topology + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
+> v0.3.2：API-less on-chain LP monitor + dynamic wallet-active topology + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
+
+## v0.3.2 — 15 分鐘 OOR hysteresis（真實 Swap tick 回放校準）
+
+2026-09-24 以錢包真實 Fables LP range，對 Robinhood Chain Uniswap v4 PoolManager `Swap` 事件的歷史 tick 回放：
+
+- 回放 pools：CASHCAT/USDG 712 筆 Swap、USDG/ZZZ 115 筆、USDG/MOO 274 筆。
+- 5 個真實 LP epoch 中，以 15 分鐘採樣共出現 4 次 OOR episode。
+- 唯一自然回區間的 episode 是 MOO：最大只越界約 0.07%，15 分鐘後自行回區間。
+- 舊 ZZZ / MOO 的明顯 breakout 最大越界約 3.87% / 9.88%，退出後 180 分鐘內也未觀察到回到舊 range。
+- 目前採用：**每 15 分鐘才推進一次 OOR 決策狀態**；≤0.5% 最多等待 90 分鐘；>0.5% 必須連續兩次 15 分鐘採樣都成立才觸發 rebalance；任何時候回區間即清除 OOR timer。
+- BOT 底層仍可每 15 秒刷新 topology/dashboard；因此快速監控與慢速策略採樣互不綁死。
+- 回放工具：`npm run analyze:range-policy`，CI artifact 會產出完整 policy matrix。
 
 ## v0.3.0 — 動態 meme pair 接管 + 真實 TX 驗證
 
