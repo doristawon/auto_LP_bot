@@ -114,6 +114,11 @@ try {
   rows.push(...await mapLimit(extra, 8, loadTx));
 } catch (error) {
   console.warn('[audit-v2] token-transfer index failed:', error.message);
+  const tokenTransferHashes = await discoverTokenActivityHashesFromRpc(firstFablesBlock, latestBlock);
+  const existing = new Set(rows.map((r) => r.hash));
+  const extra = tokenTransferHashes.filter((hash) => !existing.has(hash));
+  console.log('[audit-v2] RPC token-transfer fallback extra txs', extra.length);
+  rows.push(...await mapLimit(extra, 8, loadTx));
 }
 
 const lifecycleHashes = new Set(lifecycle.map((x) => x.txHash));
@@ -322,6 +327,28 @@ async function discoverAddressTokenTransferHashes() {
   return transfers
     .map((x) => String(x.transaction_hash || x.tx_hash || x.hash || '').toLowerCase())
     .filter(isHash);
+}
+
+async function discoverTokenActivityHashesFromRpc(fromBlock, toBlock) {
+  const hashes = new Set();
+  for (const token of tokens) {
+    if (token.address.toLowerCase() === ZERO_ADDRESS) continue;
+    const outgoing = await fables.getLogsAdaptive(
+      { address: token.address, topics: [transferTopic, walletTopic] },
+      fromBlock,
+      toBlock
+    );
+    const incoming = await fables.getLogsAdaptive(
+      { address: token.address, topics: [transferTopic, null, walletTopic] },
+      fromBlock,
+      toBlock
+    );
+    for (const log of [...outgoing, ...incoming]) {
+      const hash = String(log.transactionHash || '').toLowerCase();
+      if (isHash(hash)) hashes.add(hash);
+    }
+  }
+  return [...hashes];
 }
 
 async function fetchBlockscoutPages(pathname) {
