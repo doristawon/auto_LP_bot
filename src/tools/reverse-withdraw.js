@@ -36,6 +36,7 @@ const hashes = [
 const withdrawnTopic=id(WITHDRAWN_EVENT).toLowerCase();
 const iface=new Interface(HOOK_ABI);
 const stateViewIface = new Interface(['function getSlot0(bytes32) view returns(uint160 sqrtPriceX96,int24 tick,uint24 protocolFee,uint24 lpFee)']);
+const poolManagerIface = new Interface(['function extsload(bytes32,uint256) view returns(bytes32[])']);
 const stateView = '0xF3334192D15450CdD385c8B70e03f9A6bD9E673b';
 const coder = AbiCoder.defaultAbiCoder();
 const candidateSignatures = [
@@ -82,14 +83,9 @@ for (const hash of hashes) {
       ['tuple(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks)'],
       [[range.key.currency0, range.key.currency1, range.key.fee, range.key.tickSpacing, range.key.hooks]]
     ));
-    const slotData = stateViewIface.encodeFunctionData('getSlot0', [poolId]);
-    const slotRaw = await readProvider.send('eth_call', [
-      { to: stateView, data: slotData },
-      '0x' + Math.max(0, receipt.blockNumber - 1).toString(16)
-    ]);
-    const [sqrtPriceX96, historicalTick] = stateViewIface.decodeFunctionResult('getSlot0', slotRaw);
+    const historicalState = await readHistoricalPoolState(poolId, hook, receipt.blockNumber - 1);
     const amounts = getAmountsForLiquidity(
-      BigInt(sqrtPriceX96),
+      historicalState.sqrtPriceX96,
       getSqrtPriceAtTick(Number(range.tickLower)),
       getSqrtPriceAtTick(Number(range.tickUpper)),
       liquidity,
@@ -98,8 +94,9 @@ for (const hash of hashes) {
     const realMin0 = BigInt(decoded[5]);
     const realMin1 = BigInt(decoded[6]);
     historical = {
-      sqrtPriceX96: BigInt(sqrtPriceX96).toString(),
-      tick: Number(historicalTick),
+      source: historicalState.source,
+      sqrtPriceX96: historicalState.sqrtPriceX96.toString(),
+      tick: historicalState.tick,
       expected0: amounts.amount0.toString(),
       expected1: amounts.amount1.toString(),
       realMin0: realMin0.toString(),
@@ -175,4 +172,26 @@ function inferDiscountBps(expected, minimum) {
   minimum = BigInt(minimum);
   if (expected <= 0n) return null;
   return Number((expected - minimum) * 10000n / expected);
+}
+
+async function readHistoricalPoolState(poolId, hook, blockNumber) {
+  const tag = '0x' + Math.max(0, Number(blockNumber)).toString(16);
+  try {
+    const data = stateViewIface.encodeFunctionData('getSlot0', [poolId]);
+    const raw = await readProvider.send('eth_call', [{ to: stateView, data }, tag]);
+    const [sqrtPriceX96, tick] = stateViewIface.decodeFunctionResult('getSlot0', raw);
+    return { source: 'StateView', sqrtPriceX96: BigInt(sqrtPriceX96), tick: Number(tick) };
+  } catch {}
+
+  const managerAddress = await hook.poolManager();
+  const poolsSlot = 6n;
+  const storageSlot = keccak256(coder.encode(['bytes32', 'uint256'], [poolId, poolsSlot]));
+  const data = poolManagerIface.encodeFunctionData('extsload', [storageSlot, 4]);
+  const raw = await readProvider.send('eth_call', [{ to: managerAddress, data }, tag]);
+  const [words] = poolManagerIface.decodeFunctionResult('extsload', raw);
+  const packed = BigInt(words[0]);
+  const sqrtPriceX96 = packed & ((1n << 160n) - 1n);
+  let tick = Number((packed >> 160n) & 0xffffffn);
+  if (tick >= 2 ** 23) tick -= 2 ** 24;
+  return { source: 'PoolManager.extsload', sqrtPriceX96, tick };
 }
