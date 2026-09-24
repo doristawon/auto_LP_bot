@@ -1,0 +1,106 @@
+name: Real OOR Rebalance Smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".oor-smoke-trigger"
+      - ".github/workflows/real-oor-rebalance-smoke.yml"
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Seed current active topology without cooldown
+        run: |
+          mkdir -p state data
+          cat > state/oor-smoke-state.json <<'JSON'
+          {
+            "positions": {},
+            "rebalanceHistory": [],
+            "cursors": {
+              "walletPoolDiscovery": 71280085
+            },
+            "settings": {
+              "walletRangeCandidates": [
+                "0x08e52564bad99e05a694b4809f397edca417a080|0x0886b49f36cd984af8045717bbbd1d8c26eedb1cee360963420ad0e9f5b8bf72",
+                "0x08e52564bad99e05a694b4809f397edca417a080|0x4d1f90648524cfac7f2e2ae3591372a405450478fdab4515bcbc192ff48d239e"
+              ],
+              "activeWalletPoolIds": [
+                "0x6b187fad6ca2dcb913f2451c5d5e24d3d77b9d09ce272c2c99f64dac672bc485",
+                "0x4e2a7c0057cec67170ee71641d23d0e835afb6f1deb6b4c6a182b4c16ec8f594"
+              ],
+              "activeWalletRangeKeys": [
+                "0x08e52564bad99e05a694b4809f397edca417a080|0x0886b49f36cd984af8045717bbbd1d8c26eedb1cee360963420ad0e9f5b8bf72",
+                "0x08e52564bad99e05a694b4809f397edca417a080|0x4d1f90648524cfac7f2e2ae3591372a405450478fdab4515bcbc192ff48d239e"
+              ],
+              "walletTopologyCooldownUntil": 0
+            }
+          }
+          JSON
+      - name: First real OOR observation
+        env: &env
+          RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
+          WALLET_ADDRESS: "0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF"
+          TARGET_MODE: "wallet-active"
+          DRY_RUN: "true"
+          ENABLE_LIVE_WRITES: "false"
+          ENABLE_AUTO_REDEPLOY: "false"
+          LOG_FROM_BLOCK: "44000000"
+          WALLET_POOL_DISCOVERY_FROM_BLOCK: "71280084"
+          REORG_LOOKBACK_BLOCKS: "64"
+          OUT_OF_RANGE_CONFIRMATIONS: "2"
+          MANUAL_TOPOLOGY_COOLDOWN_SEC: "120"
+          FEE_LOG_FROM_BLOCK: "999999999"
+          SWAP_SLIPPAGE_BPS: "50"
+          DEPOSIT_SLIPPAGE_BPS: "50"
+          DATA_DIR: "./data"
+          STATE_FILE: "./state/oor-smoke-state.json"
+        run: npm run once
+      - name: Second real OOR observation
+        env: *env
+        run: npm run once
+      - name: Assert confirmed OOR produces dry-run plan when still outside
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const state = JSON.parse(fs.readFileSync('state/oor-smoke-state.json', 'utf8'));
+          const snapshot = JSON.parse(fs.readFileSync('data/latest-snapshot.json', 'utf8'));
+          const events = fs.readFileSync('data/events.jsonl', 'utf8').trim().split(/\r?\n/).filter(Boolean).map(JSON.parse);
+          const mooPool = '0x6b187fad6ca2dcb913f2451c5d5e24d3d77b9d09ce272c2c99f64dac672bc485';
+          const moo = (snapshot.portfolio.positions || []).find((p) => p.poolId === mooPool);
+          if (!moo) throw new Error('MOO position missing');
+          const result = {
+            currentTick: moo.currentTick,
+            range: [moo.tickLower, moo.tickUpper],
+            outside: moo.outside,
+            confirmations: moo.confirmations,
+            target: moo.target,
+            quote: moo.rebalanceQuote,
+            depositPlan: moo.depositPlan,
+            dryRuns: events.filter((e) => e.type === 'rebalance.dry_run')
+          };
+          console.log(JSON.stringify(result, null, 2));
+          if (moo.outside) {
+            if (moo.confirmations < 2) throw new Error('OOR confirmation did not accumulate');
+            const dry = result.dryRuns.find((e) => e.poolId === mooPool);
+            if (!dry) throw new Error('confirmed OOR did not produce rebalance.dry_run');
+            if (!moo.target || !moo.depositPlan) throw new Error('target/deposit plan missing');
+          }
+          NODE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: real-oor-rebalance-smoke
+          path: |
+            state/oor-smoke-state.json
+            data/latest-snapshot.json
+            data/events.jsonl
+          if-no-files-found: warn
