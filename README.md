@@ -1,6 +1,23 @@
 # Auto LP Bot — Fables.fi / Robinhood Chain
 
-> v0.2.1：API-less on-chain LP monitor + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
+> v0.3.0：API-less on-chain LP monitor + dynamic wallet-active topology + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
+
+## v0.3.0 — 動態 meme pair 接管 + 真實 TX 驗證
+
+- 預設 `TARGET_MODE=wallet-active`：不再需要每次換 meme LP 都手動改 `TARGET_POOL_IDS`。
+- 從錢包的 Fables `Deposited/Withdrawn` 事件建立 range candidates，再用 `rangeKey()` 完整 PoolKey 回配 registry pool。
+- 只把 `ERC-6909 balanceOf(wallet, rangeId) > 0` 的 pool 放進 execution target；已退出的 pair 自動退役。
+- execution pool 與 accounting pool 分離：舊 pair 的 wallet dust / 歷史資產仍保留在 PnL 帳本。
+- 同一 pool 手動換 range、或跨 pool 換 meme 標的，都視為 topology handoff；預設 120 秒只監控、不自動交易。
+- position / IL / fee state 全部改成 `poolId + rangeId` scope，避免多 pair 共用 hook 時互相污染。
+- Fables shared hook fee event 若無法唯一還原 PoolKey，禁止猜測 pair 歸屬與重複計算；個人 fee 仍以 `userPosition.owed` / claim receipt 為準。
+- 2026-09-24 真實錢包 TX integration smoke 已驗證：CASHCAT/USDG 退出後，BOT 自動移除 CASHCAT，並自動接管新 USDG/ZZZ 與既有 USDG/MOO。
+- 真實 deposit TX 已驗證 Fables selector `0x36a9ca1a` 對應：
+  `deposit((address,address,uint24,int24,address),int24,int24,uint128,uint128,uint128,uint256)`
+- 三筆實際 deposit calldata 固定為 regression fixtures；deposit liquidity / amount caps 已納入 dry-run plan。
+- Live rebalance fail-closed：完整 redeploy 未解鎖前，禁止先 withdraw 再停在半套狀態。
+
+> 目前安全狀態：監控、動態換標的接管、withdraw/claim ABI、v4 quote、deposit ABI 與 deposit dry-run plan 已驗證；**swap broadcast + 完整 redeploy transaction chain 仍未解除 live gate**。
 
 ## v0.2.1 新增
 
@@ -165,7 +182,8 @@ Portfolio 層另外保留整體 HODL baseline，方便判斷「做 LP」相對�
 BOT 讀兩層：
 
 1. `userPosition().owed0 / owed1`：追蹤你個人的未領 fee 變化。
-2. `FeesCollected`：追蹤 Fables 全市場 pool fee，作 Points fee-share estimator 的 denominator。
+2. `claimFees` receipt / wallet token deltas：確認實際已領 fee。
+3. `FeesCollected`：只有在事件可以安全歸屬到唯一 PoolKey 時才可作 pool-level denominator。多個 pool 共用同一 hook 時，v0.3 會 fail-closed 標記為 unattributed，避免重複計算與錯灌 Points。
 
 第一次啟動只建立 user fee baseline，不把既有 owed fees 假裝成 BOT 期間新賺到的 fee。
 
@@ -210,7 +228,7 @@ Robinhood public RPC 適合開發/備援。常駐 BOT 建議至少放一個 mana
 
 ## Reference deposit transaction inspector
 
-Fables 新建 range / redeploy 的 deposit/zap ABI 在 v0.2 **仍不猜測**。先以已知成功交易做 trace：
+Fables 新建 range 的 deposit ABI 已由 2026-09-24 三筆真實成功交易驗證；inspector 仍用來持續檢查 Fables 是否更換 selector / calldata：
 
 ```bash
 npm run inspect:tx
