@@ -35,7 +35,7 @@ interface IFablesWithdrawHook {
 ///      Direct calls to the implementation cannot withdraw user positions.
 contract Fables7702Guard {
     address private immutable IMPLEMENTATION = address(this);
-    address internal constant STATE_VIEW = 0xf3334192d15450cdd385c8b70e03f9a6bd9e673b;
+    address internal constant STATE_VIEW = 0xF3334192D15450CdD385c8B70e03f9A6bD9E673b;
     uint256 internal constant ROBINHOOD_CHAIN_ID = 4663;
 
     error DirectImplementationCall();
