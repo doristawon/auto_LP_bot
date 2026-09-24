@@ -34,6 +34,17 @@ const hashes = [
 
 const withdrawnTopic=id(WITHDRAWN_EVENT).toLowerCase();
 const iface=new Interface(HOOK_ABI);
+const candidateSignatures = [
+  'withdraw((address,address,uint24,int24,address),int24,int24,uint128,address,uint128,uint128,uint256,uint16)',
+  'withdraw((address,address,uint24,int24,address),int24,int24,uint128,address,uint128,uint128,uint256,uint24)',
+  'withdraw((address,address,uint24,int24,address),int24,int24,uint128,address,uint128,uint128,uint256,uint32)',
+  'withdraw((address,address,uint24,int24,address),int24,int24,uint128,address,uint128,uint128,uint256,uint64)',
+  'withdraw((address,address,uint24,int24,address),int24,int24,uint128,address,uint128,uint128,uint256,uint128)',
+  'withdraw((address,address,uint24,int24,address),int24,int24,uint128,address,uint128,uint128,uint256,uint256)',
+  'withdraw((address,address,uint24,int24,address),int24,int24,uint256,address,uint256,uint256,uint256,uint16)',
+  'withdraw((address,address,uint24,int24,address),int24,int24,uint128,address,uint256,uint256,uint256,uint16)'
+];
+const candidateSelectors = Object.fromEntries(candidateSignatures.map((sig)=>[sig,id(sig).slice(0,10)]));
 const rows=[];
 
 for (const hash of hashes) {
@@ -87,6 +98,8 @@ for (const hash of hashes) {
 
 const summary={
   selectors:[...new Set(rows.map(x=>x.selector))],
+  candidateSelectors,
+  selectorMatches:Object.entries(candidateSelectors).filter(([,selector])=>rows.some(x=>x.selector===selector)).map(([signature,selector])=>({signature,selector})),
   calldataBytes:[...new Set(rows.map(x=>x.calldataBytes))],
   wordCount:[...new Set(rows.map(x=>x.words.length))],
   rows
@@ -96,6 +109,8 @@ fs.mkdirSync(dir,{recursive:true});
 fs.writeFileSync(path.join(dir,'fixtures.json'),JSON.stringify(summary,null,2));
 console.log(JSON.stringify({
   selectors:summary.selectors,
+  selectorMatches:summary.selectorMatches,
+  candidateSelectors:summary.candidateSelectors,
   calldataBytes:summary.calldataBytes,
   wordCount:summary.wordCount,
   sample:rows.slice(0,3)
