@@ -1,10 +1,13 @@
-name: Real OOR Rebalance Smoke
+name: Real OOR Policy Smoke
 
 on:
   push:
     branches: [main]
     paths:
       - ".oor-smoke-trigger"
+      - "src/strategy.js"
+      - "src/bot.js"
+      - "src/adapters/executor.js"
       - ".github/workflows/real-oor-rebalance-smoke.yml"
   workflow_dispatch:
 
@@ -18,34 +21,7 @@ jobs:
         with:
           node-version: 22
       - run: npm install
-      - name: Seed current active topology without cooldown
-        run: |
-          mkdir -p state data
-          cat > state/oor-smoke-state.json <<'JSON'
-          {
-            "positions": {},
-            "rebalanceHistory": [],
-            "cursors": {
-              "walletPoolDiscovery": 71280085
-            },
-            "settings": {
-              "walletRangeCandidates": [
-                "0x08e52564bad99e05a694b4809f397edca417a080|0x0886b49f36cd984af8045717bbbd1d8c26eedb1cee360963420ad0e9f5b8bf72",
-                "0x08e52564bad99e05a694b4809f397edca417a080|0x4d1f90648524cfac7f2e2ae3591372a405450478fdab4515bcbc192ff48d239e"
-              ],
-              "activeWalletPoolIds": [
-                "0x6b187fad6ca2dcb913f2451c5d5e24d3d77b9d09ce272c2c99f64dac672bc485",
-                "0x4e2a7c0057cec67170ee71641d23d0e835afb6f1deb6b4c6a182b4c16ec8f594"
-              ],
-              "activeWalletRangeKeys": [
-                "0x08e52564bad99e05a694b4809f397edca417a080|0x0886b49f36cd984af8045717bbbd1d8c26eedb1cee360963420ad0e9f5b8bf72",
-                "0x08e52564bad99e05a694b4809f397edca417a080|0x4d1f90648524cfac7f2e2ae3591372a405450478fdab4515bcbc192ff48d239e"
-              ],
-              "walletTopologyCooldownUntil": 0
-            }
-          }
-          JSON
-      - name: First real OOR observation
+      - name: First observation against current real wallet topology
         env: &env
           RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
           WALLET_ADDRESS: "0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF"
@@ -54,51 +30,85 @@ jobs:
           ENABLE_LIVE_WRITES: "false"
           ENABLE_AUTO_REDEPLOY: "false"
           LOG_FROM_BLOCK: "44000000"
-          WALLET_POOL_DISCOVERY_FROM_BLOCK: "71280084"
+          WALLET_POOL_DISCOVERY_FROM_BLOCK: "71121689"
           REORG_LOOKBACK_BLOCKS: "64"
-          OUT_OF_RANGE_CONFIRMATIONS: "2"
-          MANUAL_TOPOLOGY_COOLDOWN_SEC: "120"
+          RANGE_CHECK_INTERVAL_MS: "900000"
+          OOR_SHALLOW_THRESHOLD_PCT: "0.5"
+          OOR_MAX_WAIT_MIN: "90"
+          OOR_DEEP_CONFIRMATIONS: "2"
+          MANUAL_TOPOLOGY_COOLDOWN_SEC: "0"
           FEE_LOG_FROM_BLOCK: "999999999"
           SWAP_SLIPPAGE_BPS: "50"
           DEPOSIT_SLIPPAGE_BPS: "50"
           DATA_DIR: "./data"
           STATE_FILE: "./state/oor-smoke-state.json"
         run: npm run once
-      - name: Second real OOR observation
+      - name: Advance policy clock by one 15-minute sample without changing chain state
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const file = 'state/oor-smoke-state.json';
+          const state = JSON.parse(fs.readFileSync(file, 'utf8'));
+          const M15 = 15 * 60 * 1000;
+          for (const position of Object.values(state.positions || {})) {
+            if (position.lastRangeEvaluationAt) position.lastRangeEvaluationAt -= M15;
+            if (position.outOfRangeSince) position.outOfRangeSince -= M15;
+          }
+          fs.writeFileSync(file, JSON.stringify(state, null, 2));
+          NODE
+      - name: Second policy observation against latest real tick
         env: *env
         run: npm run once
-      - name: Assert confirmed OOR produces dry-run plan when still outside
+      - name: Assert 15-minute hysteresis, absolute in-range hold, and dry-run isolation
         run: |
           node --input-type=module <<'NODE'
           import fs from 'node:fs';
           const state = JSON.parse(fs.readFileSync('state/oor-smoke-state.json', 'utf8'));
           const snapshot = JSON.parse(fs.readFileSync('data/latest-snapshot.json', 'utf8'));
-          const events = fs.readFileSync('data/events.jsonl', 'utf8').trim().split(/\r?\n/).filter(Boolean).map(JSON.parse);
-          const mooPool = '0x6b187fad6ca2dcb913f2451c5d5e24d3d77b9d09ce272c2c99f64dac672bc485';
-          const moo = (snapshot.portfolio.positions || []).find((p) => p.poolId === mooPool);
-          if (!moo) throw new Error('MOO position missing');
-          const result = {
-            currentTick: moo.currentTick,
-            range: [moo.tickLower, moo.tickUpper],
-            outside: moo.outside,
-            confirmations: moo.confirmations,
-            target: moo.target,
-            quote: moo.rebalanceQuote,
-            depositPlan: moo.depositPlan,
-            dryRuns: events.filter((e) => e.type === 'rebalance.dry_run')
-          };
-          console.log(JSON.stringify(result, null, 2));
-          if (moo.outside) {
-            if (moo.confirmations < 2) throw new Error('OOR confirmation did not accumulate');
-            const dry = result.dryRuns.find((e) => e.poolId === mooPool);
-            if (!dry) throw new Error('confirmed OOR did not produce rebalance.dry_run');
-            if (!moo.target || !moo.depositPlan) throw new Error('target/deposit plan missing');
+          const text = fs.existsSync('data/events.jsonl') ? fs.readFileSync('data/events.jsonl', 'utf8').trim() : '';
+          const events = text ? text.split(/\r?\n/).filter(Boolean).map(JSON.parse) : [];
+          const positions = snapshot.portfolio?.positions || [];
+          const dryRuns = events.filter((e) => e.type === 'rebalance.dry_run');
+
+          const summary = positions.map((p) => ({
+            pair: p.pair,
+            currentTick: p.currentTick,
+            range: [p.tickLower, p.tickUpper],
+            outside: p.outside,
+            excursionPct: p.excursionPct,
+            deepConfirmations: p.deepConfirmations,
+            elapsedMin: p.outOfRangeElapsedMin,
+            shouldRebalance: p.shouldRebalance,
+            hasPlan: Boolean(p.rebalancePlan),
+            dryRun: dryRuns.some((e) => e.poolId === p.poolId && e.position?.id === p.id)
+          }));
+          console.log(JSON.stringify({ summary, dryRunCount: dryRuns.length }, null, 2));
+
+          for (const p of positions) {
+            const dry = dryRuns.some((e) => e.poolId === p.poolId && e.position?.id === p.id);
+            if (!p.outside) {
+              if (p.shouldRebalance) throw new Error('IN-RANGE position became rebalance-eligible: ' + p.pair);
+              if (p.rebalancePlan) throw new Error('IN-RANGE position has an auto rebalance plan: ' + p.pair);
+              if (dry) throw new Error('IN-RANGE position produced a dry-run: ' + p.pair);
+            }
+            if (p.outside && Number(p.excursionPct) > 0.5 && Number(p.deepConfirmations) >= 2) {
+              if (!p.shouldRebalance) throw new Error('Deep OOR position was not eligible after simulated second 15m sample: ' + p.pair);
+              if (!dry) throw new Error('Eligible OOR position did not produce dry-run: ' + p.pair);
+            }
+            if (p.outside && Number(p.excursionPct) <= 0.5 && Number(p.outOfRangeElapsedMin) < 90) {
+              if (p.shouldRebalance || dry) throw new Error('Shallow OOR position moved before 90m: ' + p.pair);
+            }
+          }
+
+          // Dry-run must not be committed as a real rebalance.
+          if ((state.rebalanceHistory || []).length !== 0) {
+            throw new Error('dry-run polluted rebalanceHistory');
           }
           NODE
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: real-oor-rebalance-smoke
+          name: real-oor-policy-smoke
           path: |
             state/oor-smoke-state.json
             data/latest-snapshot.json
