@@ -55,8 +55,11 @@ test('real CASHCAT/USDG deposit caps match 50 bps price bounds with reversed dec
   const tickUpper = -294840;
   const amount0 = 6594.881132947995;
   const amount1 = 938.770877;
-  const sb = Math.pow(1.0001, tickUpper / 2);
-  const sp = 1 / ((amount0 * 1e18) / liquidity + 1 / sb);
+  // Use the exact 6-decimal USDG receipt delta to reconstruct spot.
+  // Reconstructing from the 18-decimal CASHCAT human Number loses raw-token
+  // precision before the formula is even evaluated.
+  const sa = Math.pow(1.0001, tickLower / 2);
+  const sp = (amount1 * 1e6) / liquidity + sa;
   const sqrtPriceX96 = BigInt(Math.round(sp * (2 ** 96)));
   const plan = buildDepositPlan({
     amount0,
