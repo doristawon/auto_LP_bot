@@ -50,6 +50,8 @@ export function loadConfig() {
     minRebalanceIntervalSec: envInt('MIN_REBALANCE_INTERVAL_SEC', 300),
     maxRebalancesPerHour: envInt('MAX_REBALANCES_PER_HOUR', 3),
     swapSlippageBps: envInt('SWAP_SLIPPAGE_BPS', 50),
+    depositSlippageBps: envInt('DEPOSIT_SLIPPAGE_BPS', 50),
+    depositLiquidityReserveBps: envInt('DEPOSIT_LIQUIDITY_RESERVE_BPS', 10),
     claimBeforeWithdraw: envBool('CLAIM_BEFORE_WITHDRAW', true),
     allowZeroMinOut: envBool('ALLOW_ZERO_MIN_OUT', false),
     txDeadlineSec: envInt('TX_DEADLINE_SEC', 1200),
