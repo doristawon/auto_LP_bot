@@ -35,3 +35,13 @@ export const ERC20_ABI = [
 export const DEPOSITED_EVENT = 'Deposited(address,uint256,uint128)';
 export const WITHDRAWN_EVENT = 'Withdrawn(address,uint256,uint128)';
 export const FEES_COLLECTED_EVENT = 'FeesCollected(uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint128,uint128,uint64,uint64)';
+
+
+export const UNIVERSAL_ROUTER_ABI = [
+  'function execute(bytes commands,bytes[] inputs,uint256 deadline) payable'
+];
+
+export const PERMIT2_ABI = [
+  'function allowance(address user,address token,address spender) view returns(uint160 amount,uint48 expiration,uint48 nonce)',
+  'function approve(address token,address spender,uint160 amount,uint48 expiration)'
+];
