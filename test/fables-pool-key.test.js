@@ -46,12 +46,11 @@ test('wallet-active mode follows discovered active pool ids and ignores stale st
 });
 
 test('allowlist mode never auto-adopts another matching meme pool', () => {
-  const adapterLike = {
-    config: {
-      targetMode: 'allowlist',
-      targetPoolIds: ['0xlocked'],
-      targetSymbols: []
-    }
+  const adapterLike = Object.create(FablesAdapter.prototype);
+  adapterLike.config = {
+    targetMode: 'allowlist',
+    targetPoolIds: ['0xlocked'],
+    targetSymbols: []
   };
   const locked = { id: '0xlocked', token0: { symbol: 'A' }, token1: { symbol: 'USDG' } };
   const other = { id: '0xother', token0: { symbol: 'B' }, token1: { symbol: 'USDG' } };
