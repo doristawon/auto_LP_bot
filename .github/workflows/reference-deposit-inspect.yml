@@ -1,0 +1,54 @@
+name: Reference Deposit Inspect
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".inspect-trigger"
+      - ".github/workflows/reference-deposit-inspect.yml"
+      - "src/tools/inspect-reference-tx.js"
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        tx:
+          - "0xa3c92e8d82e5ed03e25278c6ccdb2baf87fa46cd4929ba31b916d810840c0c21"
+          - "0x0abd5b7488628345c800cf458fd1e3b0239ef98ff48bf9f13ce540a0fe599a3d"
+          - "0x00d6f587dbe3537fcb4b8b1030a2da4fd5f3d8f1db63baf10025ad6803f952de"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Inspect real manual deposit
+        env:
+          RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
+          WALLET_ADDRESS: "0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF"
+          DRY_RUN: "true"
+          ENABLE_LIVE_WRITES: "false"
+          DATA_DIR: "./data"
+        run: node src/tools/inspect-reference-tx.js "${{ matrix.tx }}"
+      - name: Show decoded artifact summary
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const files = fs.readdirSync('data/reference-tx').filter((x) => x.endsWith('.json'));
+          for (const file of files) {
+            const x = JSON.parse(fs.readFileSync('data/reference-tx/' + file, 'utf8'));
+            console.log(JSON.stringify({
+              hash:x.hash,
+              transaction:x.transaction,
+              analysis:x.analysis
+            }, null, 2));
+          }
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reference-deposit-${{ strategy.job-index }}
+          path: data/reference-tx/
