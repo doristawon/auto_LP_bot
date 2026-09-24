@@ -7,7 +7,7 @@ import { buildUsdPriceMap } from './analytics/prices.js';
 import { PortfolioAnalytics } from './analytics/portfolio.js';
 import { PointsTracker } from './analytics/points-tracker.js';
 import { buildDepositPlan } from './analytics/rebalance-plan.js';
-import { evaluatePosition } from './strategy.js';
+import { evaluatePosition, outOfRangeExcursionPct } from './strategy.js';
 import { LedgerStore } from './ledger.js';
 import { StateStore } from './state.js';
 import { ZERO_ADDRESS } from './constants.js';
@@ -559,7 +559,41 @@ export class AutoLpBot {
       return false;
     }
 
-    if (outside) return true;
+    if (outside) {
+      const excursionPct = outOfRangeExcursionPct(
+        latestState.tick,
+        position.tickLower,
+        position.tickUpper
+      );
+      if (
+        position.rebalanceReason === 'deep_oor_confirmed'
+        && excursionPct <= this.config.oorShallowThresholdPct
+      ) {
+        const stateKey = positionStateKey(pool, position);
+        this.state.setPosition(stateKey, {
+          outOfRangeConfirmations: 0,
+          deepOutOfRangeConfirmations: 0,
+          lastExcursionPct: excursionPct,
+          lastTick: latestState.tick
+        });
+        this.ledger.append('rebalance.blocked', {
+          positionId: position.id,
+          poolId: pool.id,
+          reason: 'deep OOR faded below threshold before execution',
+          latestTick: latestState.tick,
+          excursionPct,
+          thresholdPct: this.config.oorShallowThresholdPct
+        });
+        log('info', 'rebalance.deep_oor_faded', {
+          pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+          positionId: position.id,
+          latestTick: latestState.tick,
+          excursionPct
+        });
+        return false;
+      }
+      return true;
+    }
 
     const stateKey = positionStateKey(pool, position);
     this.state.setPosition(stateKey, {
