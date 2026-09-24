@@ -36,18 +36,22 @@ export function evaluatePosition({
   const cooldownActive = nowMs < cooldownUntil;
   const evaluationDue = !lastEvaluationAt || nowMs - lastEvaluationAt >= checkIntervalMs;
 
-  if (!evaluationDue) {
-    const elapsedMs = outside && outOfRangeSince ? Math.max(0, nowMs - outOfRangeSince) : 0;
+  // Re-entry is an asynchronous safety reset, not a 15-minute policy sample.
+  // Any fast monitor observation back inside the original LP range breaks the OOR
+  // episode immediately, so a later breakout can never inherit an old 90m timer
+  // or deep-confirmation count.
+  if (!outside) {
+    const evaluatedAt = evaluationDue ? nowMs : lastEvaluationAt;
     return {
-      outside,
+      outside: false,
       nearEdge,
-      excursionPct,
-      evaluationDue: false,
-      evaluatedAt: lastEvaluationAt,
-      nextEvaluationAt: lastEvaluationAt + checkIntervalMs,
-      outOfRangeSince,
-      outOfRangeElapsedMs: elapsedMs,
-      deepConfirmations: deepConfirmationsSeen,
+      excursionPct: 0,
+      evaluationDue,
+      evaluatedAt,
+      nextEvaluationAt: evaluatedAt + checkIntervalMs,
+      outOfRangeSince: 0,
+      outOfRangeElapsedMs: 0,
+      deepConfirmations: 0,
       cooldownActive,
       shouldRebalance: false,
       rebalanceReason: null,
@@ -55,17 +59,18 @@ export function evaluatePosition({
     };
   }
 
-  if (!outside) {
+  if (!evaluationDue) {
+    const elapsedMs = outOfRangeSince ? Math.max(0, nowMs - outOfRangeSince) : 0;
     return {
-      outside: false,
-      nearEdge,
-      excursionPct: 0,
-      evaluationDue: true,
-      evaluatedAt: nowMs,
-      nextEvaluationAt: nowMs + checkIntervalMs,
-      outOfRangeSince: 0,
-      outOfRangeElapsedMs: 0,
-      deepConfirmations: 0,
+      outside: true,
+      nearEdge: false,
+      excursionPct,
+      evaluationDue: false,
+      evaluatedAt: lastEvaluationAt,
+      nextEvaluationAt: lastEvaluationAt + checkIntervalMs,
+      outOfRangeSince,
+      outOfRangeElapsedMs: elapsedMs,
+      deepConfirmations: deepConfirmationsSeen,
       cooldownActive,
       shouldRebalance: false,
       rebalanceReason: null,
