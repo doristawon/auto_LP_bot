@@ -1,6 +1,16 @@
 # Auto LP Bot — Fables.fi / Robinhood Chain
 
-> v0.3.0：API-less on-chain LP monitor + dynamic wallet-active topology + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
+> v0.3.1：API-less on-chain LP monitor + dynamic wallet-active topology + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
+
+## v0.3.1 — 真實 meme pair 換標的與 topology race hardening
+
+- 2026-09-24 晚間以同一真實錢包連續手動切換 Fables LP 驗證：
+  - 約 20:13 鏈上 active 為新的 USDG/MOO range，BOT 能辨識新 range 並依 current tick 計算 OOR plan。
+  - 約 20:16 錢包又切到 USDG/ZZZ；獨立 verifier 在 block 71362736 驗證 BOT 的 active pool / active range 與鏈上 ERC-6909 shares 完全一致。
+- Wallet Active Smoke 不再寫死 CASHCAT / MOO / ZZZ；改用獨立 RPC verifier 掃所有 Fables hooks 的 Deposited/Withdrawn，再讀 rangeKey + balanceOf 做 ground-truth 對照。
+- 新增 pre-execution topology revalidation：若 BOT cycle 計算期間使用者又手動換 pair / 換 range，送交易前再次重掃 topology；任何 pool/range 差異都取消該 cycle，並由 topology cooldown 接手。
+- Audit 新增 snapshot consistency 標記：若長時間掃描期間又出現新的 Fables deposit/withdraw，報告會標示 topologyChangedDuringScan，不再把瞬間過時的 active-position snapshot 當成目前狀態。
+- 新增 regression test：mid-cycle active pool/range 變更必須產生 rebalance.blocked，不能繼續執行舊 plan。
 
 ## v0.3.0 — 動態 meme pair 接管 + 真實 TX 驗證
 
