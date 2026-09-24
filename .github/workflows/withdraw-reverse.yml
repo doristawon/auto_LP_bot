@@ -1,0 +1,33 @@
+name: Withdraw Reverse
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".withdraw-reverse-trigger"
+      - "src/tools/reverse-withdraw.js"
+      - ".github/workflows/withdraw-reverse.yml"
+  workflow_dispatch:
+
+jobs:
+  reverse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Reverse real Fables withdraw transactions
+        env:
+          RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
+          WALLET_ADDRESS: "0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF"
+          TARGET_MODE: "wallet-active"
+          DATA_DIR: "./data"
+          STATE_FILE: "./state/reverse-state.json"
+        run: node src/tools/reverse-withdraw.js
+      - uses: actions/upload-artifact@v4
+        with:
+          name: withdraw-reverse
+          path: data/withdraw-reverse/
