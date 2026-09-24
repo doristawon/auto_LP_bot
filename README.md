@@ -1,8 +1,95 @@
 # Auto LP Bot — Fables.fi / Robinhood Chain
 
-> v0.3.4：API-less on-chain LP monitor + dynamic wallet-active topology + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
+> v0.4.0：API-less on-chain LP monitor + dynamic wallet-active topology + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
 
 > Review correction: **dry-run 不得改變策略 state**。v0.3.4 起，`rebalance.dry_run` 只寫 ledger，不再重設 OOR timer、cooldown 或 rebalanceHistory；只有 executor 回報完整 `completed` 才能 commit strategy state。另將 pre-withdraw inventory / deposit plan 明確標為 provisional，live 執行前必須在 withdraw/swap receipt 後重算。
+
+## v0.4.0 — Full receipt-reconciled executor + exact BigInt math + atomic OOR guard
+
+三個原本的 full-live blockers 已全部實作：
+
+1. **Fables withdraw ABI 已反解並驗證**
+   - 真實 selector：`0x289a2a15`
+   - verified signature：
+     `withdrawAndClaim((address,address,uint24,int24,address),int24,int24,uint128,address,uint128,uint128,uint256,uint16)`
+   - 18 筆錢包真實成功 withdraw TX 均為 420-byte / 13 static words；`walk=1000`。
+   - regression test 會把 encoder 與真實 calldata 做 byte-for-byte 比對。
+
+2. **Receipt-reconciled withdraw → swap → deposit state machine**
+   - withdraw 前只使用 exact BigInt principal math 產生 min-out。
+   - withdraw receipt 後讀 **actual raw wallet delta**，才重新計算 swap direction / amount。
+   - Direct V4 route 重新 quote + allowance check + `eth_call` simulation。
+   - swap receipt 後再次讀 actual balances / current tick。
+   - deposit liquidity / caps 只使用 post-swap raw strategy inventory。
+   - deposit receipt 後驗證 `Deposited` event、新 ERC-6909 shares > 0、舊 shares 已清空。
+   - 只有完整走到 `completed` 才 commit strategy cooldown/history。
+   - withdraw 後任何 failure 會進 `rebalance.recovery_required`，保存 tx hashes/raw balances，並全域鎖住新的自動 rebalance；可用 `npm run inspect:recovery` 查明狀態。
+
+3. **BigInt fixed-point + Atomic In-Range Hold**
+   - `src/math/v4-fixed.js` port Uniswap TickMath / LiquidityAmounts 核心公式；live math 不使用 JS `Number`。
+   - atomic guard：`contracts/Fables7702Guard.sol`。
+   - guard 透過 EIP-7702 在 EOA address context 執行，Fables hook 看到的 `msg.sender` 仍是原 wallet，因此能操作原本 ERC-6909 LP ownership。
+   - 同一筆 withdraw transaction 先讀官方 StateView current tick；只要 `tick >= tickLower && tick < tickUpper`，整筆 revert。
+   - Robinhood Chain mainnet 已在 block `71628862` 實際觀察到 type-4/EIP-7702 transaction，chain capability 已確認。
+
+### 一次性 atomic guard 啟用流程
+
+安全預設仍是：
+```env
+DRY_RUN=true
+ENABLE_LIVE_WRITES=false
+ENABLE_AUTO_REDEPLOY=false
+EIP7702_GUARD_VERIFIED=false
+```
+
+先在獨立 canary wallet 驗證，再碰主錢包：
+
+```bash
+npm install
+npm run compile:guard
+
+# 明確允許部署
+DEPLOY_EIP7702_GUARD=true \
+GUARD_RPC_URL=https://rpc.mainnet.chain.robinhood.com \
+GUARD_DEPLOYER_PRIVATE_KEY=... \
+npm run deploy:guard
+```
+
+把輸出的 implementation address 放入：
+```env
+EIP7702_GUARD_ADDRESS=0x...
+```
+
+再做 wallet delegation：
+```bash
+npm run setup:guard
+```
+
+這是一筆 EIP-7702 type-4 transaction。委派後必須先跑：
+
+```bash
+npm run verify:guard
+```
+
+`verify:guard` 會使用目前真實 In-Range LP 做 **eth_call-only** canary；預期結果一定是 `in-range-withdrawal-blocked`。只有 delegation、guardVersion、In-Range block canary 全部通過後，才可人工設定：
+
+```env
+EIP7702_GUARD_VERIFIED=true
+DRY_RUN=false
+ENABLE_LIVE_WRITES=true
+ENABLE_AUTO_REDEPLOY=true
+```
+
+撤銷 delegation：
+```bash
+npm run setup:guard -- --revoke
+```
+
+> Guard 尚未部署/委派/驗證時，live auto-redeploy 會 fail closed；程式不會因為只有 private key 就自行改變 EOA code。
+
+### Swap route 範圍
+
+Production executor 已能完整執行並驗證 **direct Fables V4 pool route**。這條路徑已用 Robinhood Chain Quoter / Universal Router 2.1.2 做雙向 simulation。它是 deterministic、安全 fallback，**不是保證全球最佳路徑**；未來可再加入 V3↔V4 route competition，但不影響目前 receipt-reconciled state machine 的正確性。
 
 ### Swap path review
 
@@ -10,11 +97,11 @@
 - 反向 MOO/ZZZ→USDG 在 withdraw **之前**若 free wallet balance 不足，模擬可能回 `TRANSFER_FROM_FAILED`，因 meme token principal 仍鎖在 LP；最終 swap simulation 必須放在 withdraw receipt 後，以實際 wallet delta 作 amountIn。Simulation workflow 會同時檢查 free balance + ERC20→Permit2 + Permit2→Router allowance，只有「allowance 足夠但 principal 尚鎖在 LP」才標記為 expected pre-withdraw failure，不再誤報 route 壞掉。
 - 真實手動 ZZZ→USDG 成功 TX 顯示前端可能使用 Permit2 + 多段 V4 + V3/WETH 的複合路徑；因此 direct Fables-pool route 是有效 fallback，**不是已證明的最佳 route**。正式 live 應比較可執行 routes 的實際 quote / gas / slippage。
 - Swap sizing 使用該 LP 自己的 `sqrtPriceX96` relative price，不再使用可能被其他 pool 污染的 global USD graph。
-- Production executor 尚未呼叫 Universal Router；目前只做到 quote / encoding / simulation tooling，所有 live rebalance writes 仍 hard-block。
+- v0.4 production executor 已接入 Universal Router direct V4 route，且只在 withdraw receipt 後用 actual raw balance 重新 quote / simulate / broadcast。
 
-### Full-live review blockers
+### v0.3.x historical full-live blockers（v0.4 已完成）
 
-目前監控、OOR hysteresis、PoolKey/range tracking、V4 quote 與 Universal Router calldata 已驗證；但正式 unattended live rebalance 仍需完成以下條件：
+以下為 v0.3.x review 當時的 blocker；v0.4 已逐項實作並納入 CI / regression：
 
 1. withdraw 必須有非零 principal min-out，不能使用 `amount0Min=0 / amount1Min=0`。
 2. withdraw receipt 後以**實際 wallet delta**重算 swap amount；禁止沿用 withdraw 前估算值。
@@ -72,7 +159,7 @@ Code review 發現舊 executor 在 `ENABLE_AUTO_REDEPLOY=true` 時會先 withdra
 - 三筆實際 deposit calldata 固定為 regression fixtures；deposit liquidity / amount caps 已納入 dry-run plan。
 - Live rebalance fail-closed：完整 redeploy 未解鎖前，禁止先 withdraw 再停在半套狀態。
 
-> 目前安全狀態：監控、動態換標的接管、v4 quote、deposit ABI 與 deposit dry-run plan 已驗證；**withdraw ABI 仍未解出（真實 selector 0x289a2a15），swap broadcast + 完整 redeploy transaction chain 仍未解除 live gate**。
+> 歷史註記：此段描述的是 v0.3.0 當時狀態；withdraw ABI / receipt state machine / exact fixed-point math 已於 v0.4.0 完成。
 
 ## v0.2.1 新增
 
