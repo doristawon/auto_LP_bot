@@ -34,6 +34,14 @@ jobs:
           ENABLE_LIVE_WRITES: "false"
           DATA_DIR: "./data"
         run: node src/tools/inspect-reference-tx.js "${{ matrix.tx }}"
+      - name: Lookup selector / verified contract ABI
+        run: |
+          echo "=== 4byte ==="
+          curl -fsSL --max-time 15 "https://www.4byte.directory/api/v1/signatures/?hex_signature=0x289a2a15" || true
+          echo
+          echo "=== Blockscout smart contract ==="
+          curl -fsSL --max-time 15 -H "accept: application/json" -H "user-agent: auto-LP-bot-review"             "https://robinhoodchain.blockscout.com/api/v2/smart-contracts/0x08E52564Bad99E05a694b4809F397edcA417A080" || true
+          echo
       - name: Print direct decode
         run: |
           node --input-type=module <<'NODE'
