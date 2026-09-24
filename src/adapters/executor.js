@@ -20,6 +20,9 @@ export class RebalanceExecutor {
       log('info', 'rebalance.dry_run', serializablePlan(plan));
       return { status: 'dry-run' };
     }
+    if (!this.config.enableAutoRedeploy) {
+      throw new Error('Live rebalance blocked: ENABLE_AUTO_REDEPLOY is false; refusing to withdraw without a complete redeploy path');
+    }
     this.assertLiveWallet();
     await this.assertGasGuard();
     if (!this.config.allowZeroMinOut) {
@@ -48,6 +51,7 @@ export class RebalanceExecutor {
       target: plan.target,
       inventoryPlan: plan.inventoryPlan || null,
       quote: plan.quote || null,
+      depositPlan: plan.depositPlan || null,
       reason: 'Deposit broadcast remains gated until the Fables deposit execution manifest is verified'
     });
     return { status: 'withdrawn-redeploy-gated', withdrawalHash: withdrawal.hash };
