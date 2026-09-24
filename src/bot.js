@@ -413,8 +413,26 @@ export class AutoLpBot {
   }
 
   async scanGlobalPoolFees(pools, latestBlock) {
+    const poolsPerHook = new Map();
+    for (const pool of pools) {
+      const hook = pool.key.hooks.toLowerCase();
+      poolsPerHook.set(hook, (poolsPerHook.get(hook) || 0) + 1);
+    }
     for (const pool of pools) {
       if (!pool.state || pool.token0.decimals == null || pool.token1.decimals == null) continue;
+      const hook = pool.key.hooks.toLowerCase();
+      if ((poolsPerHook.get(hook) || 0) > 1) {
+        this.ledger.appendUnique(
+          `shared-hook-fee-unattributed:${hook}`,
+          'pool.fee_unattributed',
+          {
+            hook: pool.key.hooks,
+            poolCount: poolsPerHook.get(hook),
+            reason: 'FeesCollected has no verified PoolKey attribution for shared hooks; skip pair-level totals to avoid double counting'
+          }
+        );
+        continue;
+      }
       const cursorKey = `poolFees:${pool.id}`;
       const storedCursor = this.state.getCursor(cursorKey, 0);
       const initial = this.config.feeLogFromBlock > 0 ? this.config.feeLogFromBlock : latestBlock;
