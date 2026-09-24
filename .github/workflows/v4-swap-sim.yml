@@ -1,0 +1,38 @@
+name: V4 Swap Simulation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".v4-sim-trigger"
+      - "src/adapters/universal-router.js"
+      - "src/tools/simulate-v4-swap.js"
+      - ".github/workflows/v4-swap-sim.yml"
+  workflow_dispatch:
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        pair: ["USDG/MOO", "USDG/ZZZ"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Simulate minimal V4 exact-in route
+        env:
+          RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
+          WALLET_ADDRESS: "0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF"
+          TARGET_MODE: "wallet-active"
+          DRY_RUN: "true"
+          ENABLE_LIVE_WRITES: "false"
+          SIM_PAIR: "${{ matrix.pair }}"
+          SIM_TOKEN_IN: "USDG"
+          SIM_AMOUNT_IN: "1"
+          SWAP_SLIPPAGE_BPS: "50"
+        run: node src/tools/simulate-v4-swap.js
