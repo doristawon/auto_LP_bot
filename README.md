@@ -4,6 +4,14 @@
 
 > Review correction: **dry-run 不得改變策略 state**。v0.3.4 起，`rebalance.dry_run` 只寫 ledger，不再重設 OOR timer、cooldown 或 rebalanceHistory；只有 executor 回報完整 `completed` 才能 commit strategy state。另將 pre-withdraw inventory / deposit plan 明確標為 provisional，live 執行前必須在 withdraw/swap receipt 後重算。
 
+### Swap path review
+
+- Bot 的 minimal direct V4 path 使用 Universal Router `V4_SWAP (0x10)` + `SWAP_EXACT_IN_SINGLE (0x06) / SETTLE_ALL (0x0c) / TAKE_ALL (0x0f)`；USDG→MOO、USDG→ZZZ 已用真實 wallet allowance 做 `eth_call` 成功。
+- 反向 MOO/ZZZ→USDG 在 withdraw **之前**模擬會回 `TRANSFER_FROM_FAILED`，因 meme token principal 仍鎖在 LP；最終 swap simulation 必須放在 withdraw receipt 後，以實際 wallet delta 作 amountIn。
+- 真實手動 ZZZ→USDG 成功 TX 顯示前端可能使用 Permit2 + 多段 V4 + V3/WETH 的複合路徑；因此 direct Fables-pool route 是有效 fallback，**不是已證明的最佳 route**。正式 live 應比較可執行 routes 的實際 quote / gas / slippage。
+- Swap sizing 使用該 LP 自己的 `sqrtPriceX96` relative price，不再使用可能被其他 pool 污染的 global USD graph。
+- Production executor 尚未呼叫 Universal Router；目前只做到 quote / encoding / simulation tooling，所有 live rebalance writes 仍 hard-block。
+
 ### Full-live review blockers
 
 目前監控、OOR hysteresis、PoolKey/range tracking、V4 quote 與 Universal Router calldata 已驗證；但正式 unattended live rebalance 仍需完成以下條件：
@@ -34,7 +42,7 @@ Code review 發現舊 executor 在 `ENABLE_AUTO_REDEPLOY=true` 時會先 withdra
 - 策略層：In Range 強制 `shouldRebalance=false`，並清除 OOR timer / deep confirmations。
 - 排程層：pending rebalance 必須同時滿足 `outside===true && shouldRebalance===true`。
 - BOT 執行前：重新從鏈上讀最新 tick；若已回到舊 range，記錄 `rebalance.blocked: absolute in-range hold` 並取消整輪。
-- Executor 再做 fail-closed 檢查：入口、claim 前、withdraw 前皆重新確認 OOR。
+- Executor 邊界再次讀取最新 PoolManager tick 並 fail closed；目前 live withdraw/swap/deposit 全部 hard-block，因此沒有單步 write 可繞過此 guard。
 - 因鏈上價格可能在 RPC 檢查後、交易被打包前再次變動，正式 unattended live 啟用前仍需 atomic on-chain OOR guard 才能達到交易打包瞬間的絕對保證；目前 live auto-redeploy gate 維持關閉。
 
 ## v0.3.2 — 15 分鐘 OOR hysteresis（真實 Swap tick 回放校準）
