@@ -1,1 +1,2 @@
-requested=2026-09-24T22:38:00+08:00\nreason=evaluate-15m-0.5pct-90m-policy\n
+requested=2026-09-24T22:45:00+08:00
+reason=rerun-after-package-json-fix
