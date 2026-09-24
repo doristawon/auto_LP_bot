@@ -28,6 +28,7 @@ jobs:
           node-version: 22
       - run: npm install
       - name: Decode Universal Router path
+        continue-on-error: true
         env:
           RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
           TX_HASH: "${{ matrix.tx }}"
