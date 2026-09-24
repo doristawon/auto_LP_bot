@@ -64,7 +64,7 @@ Code review 發現舊 executor 在 `ENABLE_AUTO_REDEPLOY=true` 時會先 withdra
 - 三筆實際 deposit calldata 固定為 regression fixtures；deposit liquidity / amount caps 已納入 dry-run plan。
 - Live rebalance fail-closed：完整 redeploy 未解鎖前，禁止先 withdraw 再停在半套狀態。
 
-> 目前安全狀態：監控、動態換標的接管、withdraw/claim ABI、v4 quote、deposit ABI 與 deposit dry-run plan 已驗證；**swap broadcast + 完整 redeploy transaction chain 仍未解除 live gate**。
+> 目前安全狀態：監控、動態換標的接管、v4 quote、deposit ABI 與 deposit dry-run plan 已驗證；**withdraw ABI 仍未解出（真實 selector 0x289a2a15），swap broadcast + 完整 redeploy transaction chain 仍未解除 live gate**。
 
 ## v0.2.1 新增
 
@@ -307,10 +307,9 @@ data/reference-tx/<hash>.json
 
 ## Live mode 現況
 
-目前可以安全開放的 write path：
+目前 rebalance write path 全部保持關閉。尤其 `withdraw()` 先前假設的 ABI 已被真實 TX 否決；三筆手動 withdraw 都使用 selector `0x289a2a15`，在 exact signature 解出前 encoder 會直接 fail closed。
 
-- `claimFees()`
-- `withdraw()`
+`claimFees()` 也不會由目前的 rebalance executor 自動送出；完整 state machine 驗證前不將任何單步 write 視為 unattended-safe。
 
 每筆 live transaction 都會先：
 

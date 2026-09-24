@@ -332,11 +332,13 @@ export class FablesAdapter {
     ]);
   }
 
-  encodeWithdraw(pool, position, deadline) {
-    return hookInterface.encodeFunctionData('withdraw', [
-      poolKeyArgs(pool), position.tickLower, position.tickUpper, position.shares,
-      this.config.walletAddress, 0n, 0n, deadline
-    ]);
+  encodeWithdraw(_pool, _position, _deadline) {
+    // Fail closed: three real wallet withdraw transactions use selector 0x289a2a15,
+    // which does not match the previously assumed ABI. Do not generate calldata
+    // until the exact Fables signature and slippage fields are independently verified.
+    throw new Error(
+      'Fables withdraw ABI is unverified: real selector 0x289a2a15 does not match the assumed signature'
+    );
   }
 }
 
