@@ -1,0 +1,81 @@
+name: Wallet Active Smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".smoke-trigger"
+      - "src/bot.js"
+      - "src/adapters/fables.js"
+      - "src/config.js"
+      - ".github/workflows/wallet-active-smoke.yml"
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Seed last verified wallet topology checkpoint
+        run: |
+          mkdir -p state data
+          cat > state/smoke-state.json <<'JSON'
+          {
+            "positions": {},
+            "rebalanceHistory": [],
+            "cursors": {
+              "walletPoolDiscovery": 71121690
+            },
+            "settings": {
+              "walletRangeCandidates": [
+                "0x08e52564bad99e05a694b4809f397edca417a080|0x0886b49f36cd984af8045717bbbd1d8c26eedb1cee360963420ad0e9f5b8bf72",
+                "0x08e52564bad99e05a694b4809f397edca417a080|0x250d40538dca9aea1f90cbf9cdbd883203c028274d591b0246a6df7af2961b26"
+              ],
+              "activeWalletPoolIds": [
+                "0x31608601d541e868706aa557558a4d4f99c57e6dd13bd3362edcf05d00a16212",
+                "0x6b187fad6ca2dcb913f2451c5d5e24d3d77b9d09ce272c2c99f64dac672bc485"
+              ]
+            }
+          }
+          JSON
+      - name: Run production bot once against real wallet TX
+        env:
+          RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
+          WALLET_ADDRESS: "0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF"
+          TARGET_MODE: "wallet-active"
+          TARGET_SYMBOLS: ""
+          TARGET_POOL_IDS: ""
+          DRY_RUN: "true"
+          ENABLE_LIVE_WRITES: "false"
+          ENABLE_AUTO_REDEPLOY: "false"
+          LOG_FROM_BLOCK: "44000000"
+          WALLET_POOL_DISCOVERY_FROM_BLOCK: "71121689"
+          REORG_LOOKBACK_BLOCKS: "64"
+          MANUAL_TOPOLOGY_COOLDOWN_SEC: "120"
+          FEE_LOG_FROM_BLOCK: "999999999"
+          DATA_DIR: "./data"
+          STATE_FILE: "./state/smoke-state.json"
+        run: npm run once
+      - name: Show dynamic topology result
+        if: always()
+        run: |
+          echo "=== STATE ==="
+          cat state/smoke-state.json || true
+          echo "=== SNAPSHOT ==="
+          cat data/latest-snapshot.json || true
+          echo "=== EVENTS ==="
+          tail -n 100 data/events.jsonl || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wallet-active-smoke
+          path: |
+            state/smoke-state.json
+            data/latest-snapshot.json
+            data/events.jsonl
+          if-no-files-found: warn
