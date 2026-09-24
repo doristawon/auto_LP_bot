@@ -65,7 +65,8 @@ export class AutoLpBot {
       block: latestBlock,
       pools: pools.length,
       pricedAssets: prices.size,
-      targetPools: this.fables.targetPools(pools).length
+      targetMode: this.config.targetMode,
+      targetPools: this.config.targetMode === 'wallet-active' ? null : this.fables.targetPools(pools).length
     });
     return this.market;
   }
@@ -80,8 +81,37 @@ export class AutoLpBot {
       await this.refreshMarket(false);
       const latestBlock = await this.providers.readProvider.getBlockNumber();
       this.market.latestBlock = latestBlock;
-      const targetPools = this.fables.targetPools(this.market.pools);
-      if (!targetPools.length) throw new Error('No target Fables pools matched configured TARGET_SYMBOLS/TARGET_POOL_IDS');
+      const selection = await this.resolveTargetPools(latestBlock);
+      const targetPools = selection.pools;
+      if (!targetPools.length) {
+        const snapshot = {
+          generatedAt: Date.now(),
+          blockNumber: latestBlock,
+          bot: {
+            version: '0.3.0',
+            wallet: this.config.walletAddress,
+            dryRun: this.config.dryRun,
+            liveWrites: this.config.enableLiveWrites,
+            autoRedeploy: this.config.enableAutoRedeploy,
+            executionPaused: this.executionPaused,
+            targetMode: this.config.targetMode,
+            activePoolIds: [],
+            topologyCooldownUntil: this.state.getSetting('walletTopologyCooldownUntil', 0),
+            lastAction: this.state.getSetting('lastAction', null),
+            swapSlippageBps: this.config.swapSlippageBps
+          },
+          rpcHealth: this.rpcHealth,
+          portfolio: this.snapshot?.portfolio || emptyPortfolio(),
+          points: this.points.snapshot(),
+          prices: Object.fromEntries(this.market.prices),
+          walletBalances: {},
+          pools: []
+        };
+        this.snapshot = snapshot;
+        this.ledger.writeSnapshot(snapshot);
+        log('warn', 'wallet_pool.none_active', { targetMode: this.config.targetMode, block: latestBlock });
+        return snapshot;
+      }
 
       for (const pool of targetPools) {
         pool.state = await this.fables.readPoolState(pool);
@@ -107,13 +137,16 @@ export class AutoLpBot {
         generatedAt: Date.now(),
         blockNumber: latestBlock,
         bot: {
-          version: '0.2.1',
+          version: '0.3.0',
           wallet: this.config.walletAddress,
           dryRun: this.config.dryRun,
           liveWrites: this.config.enableLiveWrites,
           autoRedeploy: this.config.enableAutoRedeploy,
           executionPaused: this.executionPaused,
           lastAction: this.state.getSetting('lastAction', null),
+          targetMode: this.config.targetMode,
+          activePoolIds: targetPools.map((pool) => pool.id),
+          topologyCooldownUntil: this.state.getSetting('walletTopologyCooldownUntil', 0),
           targetSymbols: this.config.targetSymbols,
           swapSlippageBps: this.config.swapSlippageBps
         },
@@ -138,6 +171,56 @@ export class AutoLpBot {
     } finally {
       this.cycleActive = false;
     }
+  }
+
+  async resolveTargetPools(latestBlock) {
+    if (this.config.targetMode !== 'wallet-active') {
+      return { pools: this.fables.targetPools(this.market.pools), discovery: null };
+    }
+
+    const cursorKey = 'walletPoolDiscovery';
+    const previousCursor = this.state.getCursor(cursorKey, this.config.walletPoolDiscoveryFromBlock);
+    const fromBlock = Math.max(
+      this.config.walletPoolDiscoveryFromBlock,
+      previousCursor - this.config.reorgLookbackBlocks
+    );
+    const knownRangeKeys = this.state.getSetting('walletRangeCandidates', []);
+    const result = await this.fables.discoverWalletActivePools(
+      this.market.pools,
+      fromBlock,
+      latestBlock,
+      knownRangeKeys
+    );
+
+    this.state.setCursor(cursorKey, latestBlock + 1);
+    this.state.setSetting('walletRangeCandidates', result.knownRangeKeys);
+
+    const previousIds = (this.state.getSetting('activeWalletPoolIds', []) || []).map((x) => String(x).toLowerCase()).sort();
+    const currentIds = result.activePoolIds.map((x) => String(x).toLowerCase()).sort();
+    if (!sameStringArray(previousIds, currentIds)) {
+      const previousSet = new Set(previousIds);
+      const currentSet = new Set(currentIds);
+      const added = currentIds.filter((id) => !previousSet.has(id));
+      const removed = previousIds.filter((id) => !currentSet.has(id));
+      const cooldownUntil = Date.now() + this.config.manualTopologyCooldownSec * 1000;
+      this.state.setSetting('activeWalletPoolIds', currentIds);
+      this.state.setSetting('walletTopologyCooldownUntil', cooldownUntil);
+      this.ledger.append('wallet.pool_topology_changed', {
+        added,
+        removed,
+        activePoolIds: currentIds,
+        cooldownUntil,
+        cooldownSec: this.config.manualTopologyCooldownSec
+      });
+      log('warn', 'wallet.pool_topology_changed', {
+        added,
+        removed,
+        activePoolIds: currentIds,
+        cooldownUntil
+      });
+    }
+
+    return { pools: result.activePools, discovery: result };
   }
 
   async attachRebalanceQuotes(targetPools, portfolio) {
@@ -184,7 +267,8 @@ export class AutoLpBot {
   }
 
   async decoratePosition(pool, position) {
-    const stored = this.state.getPosition(position.id);
+    const stateKey = positionStateKey(pool, position);
+    const stored = this.state.getPosition(stateKey);
     const evaluation = evaluatePosition({
       currentTick: pool.state.tick,
       tickSpacing: pool.key.tickSpacing,
@@ -202,7 +286,7 @@ export class AutoLpBot {
       shouldRebalance: evaluation.shouldRebalance,
       target: evaluation.target
     });
-    this.state.setPosition(position.id, {
+    this.state.setPosition(stateKey, {
       outOfRangeConfirmations: evaluation.nextConfirmations,
       lastTick: pool.state.tick,
       lastSeenAt: Date.now(),
@@ -220,7 +304,7 @@ export class AutoLpBot {
   }
 
   trackFeeAccrual(pool, position) {
-    const key = `feeState:${position.id.toLowerCase()}`;
+    const key = `feeState:${positionStateKey(pool, position)}`;
     const previous = this.state.getSetting(key, null);
     const current = { owed0: position.owed0.toString(), owed1: position.owed1.toString(), shares: position.shares.toString(), at: Date.now() };
     this.state.setSetting(key, current);
@@ -258,6 +342,16 @@ export class AutoLpBot {
   }
 
   async maybeRebalance(pool, position) {
+    const topologyCooldownUntil = Number(this.state.getSetting('walletTopologyCooldownUntil', 0) || 0);
+    if (Date.now() < topologyCooldownUntil) {
+      this.ledger.append('rebalance.blocked', {
+        positionId: position.id,
+        poolId: pool.id,
+        reason: 'wallet topology cooldown',
+        cooldownUntil: topologyCooldownUntil
+      });
+      return;
+    }
     if (this.executionPaused) {
       this.ledger.append('rebalance.blocked', { positionId: position.id, reason: 'execution paused' });
       return;
@@ -278,7 +372,7 @@ export class AutoLpBot {
     try {
       const result = await this.executor.execute(plan);
       const cooldownUntil = Date.now() + this.config.minRebalanceIntervalSec * 1000;
-      this.state.setPosition(position.id, { cooldownUntil, outOfRangeConfirmations: 0 });
+      this.state.setPosition(positionStateKey(pool, position), { cooldownUntil, outOfRangeConfirmations: 0 });
       this.state.recordRebalance({
         ts: Date.now(), positionId: position.id, poolId: pool.id, result: result.status,
         currentTick: pool.state.tick, target: position.target
@@ -414,6 +508,28 @@ function snapshotPool(pool) {
       outside: p.outside, confirmations: p.confirmations, target: p.target,
       rebalancePlan: p.rebalancePlan || null, rebalanceQuote: p.rebalanceQuote || null
     }))
+  };
+}
+function positionStateKey(pool, position) {
+  return `${pool.id.toLowerCase()}:${position.id.toLowerCase()}`;
+}
+function sameStringArray(a, b) {
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+function emptyPortfolio() {
+  return {
+    baseline: null,
+    inventory: {},
+    currentValueUsd: 0,
+    hodlValueUsd: 0,
+    grossPnlUsd: 0,
+    netPnlUsd: 0,
+    excessVsHodlUsd: 0,
+    currentIlUsd: 0,
+    gasUsd: 0,
+    trackedFeeUsd: 0,
+    netCashflowUsd: 0,
+    positions: []
   };
 }
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
