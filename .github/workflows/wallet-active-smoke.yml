@@ -39,6 +39,10 @@ jobs:
               "activeWalletPoolIds": [
                 "0x31608601d541e868706aa557558a4d4f99c57e6dd13bd3362edcf05d00a16212",
                 "0x6b187fad6ca2dcb913f2451c5d5e24d3d77b9d09ce272c2c99f64dac672bc485"
+              ],
+              "activeWalletRangeKeys": [
+                "0x08e52564bad99e05a694b4809f397edca417a080|0x0886b49f36cd984af8045717bbbd1d8c26eedb1cee360963420ad0e9f5b8bf72",
+                "0x08e52564bad99e05a694b4809f397edca417a080|0x250d40538dca9aea1f90cbf9cdbd883203c028274d591b0246a6df7af2961b26"
               ]
             }
           }
@@ -61,6 +65,29 @@ jobs:
           DATA_DIR: "./data"
           STATE_FILE: "./state/smoke-state.json"
         run: npm run once
+      - name: Assert real-wallet topology handoff
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const snapshot = JSON.parse(fs.readFileSync('data/latest-snapshot.json', 'utf8'));
+          const state = JSON.parse(fs.readFileSync('state/smoke-state.json', 'utf8'));
+          const events = fs.readFileSync('data/events.jsonl', 'utf8').trim().split(/\r?\n/).filter(Boolean).map(JSON.parse);
+          const cashcat = '0x31608601d541e868706aa557558a4d4f99c57e6dd13bd3362edcf05d00a16212';
+          const moo = '0x6b187fad6ca2dcb913f2451c5d5e24d3d77b9d09ce272c2c99f64dac672bc485';
+          const zzz = '0x4e2a7c0057cec67170ee71641d23d0e835afb6f1deb6b4c6a182b4c16ec8f594';
+          const oldCashcatRange = '0x08e52564bad99e05a694b4809f397edca417a080|0x250d40538dca9aea1f90cbf9cdbd883203c028274d591b0246a6df7af2961b26';
+          const zzzRange = '0x08e52564bad99e05a694b4809f397edca417a080|0x4d1f90648524cfac7f2e2ae3591372a405450478fdab4515bcbc192ff48d239e';
+          const active = new Set(snapshot.bot.activePoolIds || []);
+          const accounting = new Set(snapshot.bot.accountingPoolIds || []);
+          if (!active.has(moo) || !active.has(zzz) || active.has(cashcat)) throw new Error('active pool topology mismatch');
+          if (!accounting.has(cashcat) || !accounting.has(moo) || !accounting.has(zzz)) throw new Error('accounting pool retention mismatch');
+          const topology = events.find((e) => e.type === 'wallet.lp_topology_changed');
+          if (!topology?.poolsChanged || !topology?.rangesChanged) throw new Error('topology change flags missing');
+          if (!topology.added?.includes(zzz) || !topology.removed?.includes(cashcat)) throw new Error('pool add/remove mismatch');
+          if (!topology.addedRanges?.includes(zzzRange) || !topology.removedRanges?.includes(oldCashcatRange)) throw new Error('range add/remove mismatch');
+          if (!(Number(state.settings.walletTopologyCooldownUntil) > Date.now())) throw new Error('topology cooldown missing');
+          console.log(JSON.stringify({ ok: true, active: [...active], accounting: [...accounting], topology }, null, 2));
+          NODE
       - name: Show dynamic topology result
         if: always()
         run: |
