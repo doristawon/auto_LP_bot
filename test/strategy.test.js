@@ -196,3 +196,25 @@ test('cooldown blocks an otherwise eligible rebalance', () => {
   assert.equal(x.cooldownActive, true);
   assert.equal(x.shouldRebalance, false);
 });
+
+
+test('re-entry between 15-minute samples immediately resets the OOR episode', () => {
+  const t0 = 7_000_000;
+  const x = evaluatePosition({
+    currentTick: 950,
+    tickSpacing: 10,
+    position: { tickLower: 900, tickUpper: 1000 },
+    widthBps: 120,
+    lastEvaluationAt: t0,
+    outOfRangeSince: t0 - 45 * 60 * 1000,
+    deepConfirmationsSeen: 1,
+    checkIntervalMs: M15,
+    nowMs: t0 + 5 * 60 * 1000
+  });
+  assert.equal(x.evaluationDue, false);
+  assert.equal(x.outside, false);
+  assert.equal(x.outOfRangeSince, 0);
+  assert.equal(x.deepConfirmations, 0);
+  assert.equal(x.shouldRebalance, false);
+  assert.equal(x.evaluatedAt, t0);
+});
