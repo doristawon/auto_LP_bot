@@ -79,5 +79,10 @@ const result = {
     result: simulation.simulationResult
   } : router.buildV4ExactInputSingle({ pool, quote, deadline })
 };
-console.log(JSON.stringify(result, null, 2));
+console.log(JSON.stringify(result, bigintReplacer, 2));
 if (!simulation) process.exitCode = 2;
+
+
+function bigintReplacer(_key, value) {
+  return typeof value === 'bigint' ? value.toString() : value;
+}
