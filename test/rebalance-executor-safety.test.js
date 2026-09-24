@@ -45,7 +45,7 @@ test('dry-run rebalance never commits cooldown/history or resets OOR state', asy
   assert.ok(calls.settings.some(([k, v]) => k === 'lastAction' && String(v).startsWith('dry-run ')));
 });
 
-test('live executor fails closed before any rebalance write while full state machine is incomplete', async () => {
+test('live executor fails closed unless auto-redeploy and atomic guard are explicitly enabled', async () => {
   const writes = [];
   const executor = new RebalanceExecutor(
     null,
@@ -60,7 +60,7 @@ test('live executor fails closed before any rebalance write while full state mac
 
   await assert.rejects(
     executor.execute({ pool: { ...pool }, position: { ...position }, currentTick: 1200 }),
-    /full withdraw -> swap -> deposit state machine is not implemented/
+    /ENABLE_AUTO_REDEPLOY is not enabled/
   );
   assert.equal(writes.some((x) => x.type === 'tx.sent'), false);
 });

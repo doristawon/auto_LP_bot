@@ -10,7 +10,7 @@ const BASE = {
 };
 
 function withEnv(extra, fn) {
-  const keys = new Set([...Object.keys(BASE), ...Object.keys(extra), 'TARGET_POOL_IDS', 'TARGET_SYMBOLS', 'TARGET_MODE', 'SWAP_SLIPPAGE_BPS']);
+  const keys = new Set([...Object.keys(BASE), ...Object.keys(extra), 'TARGET_POOL_IDS', 'TARGET_SYMBOLS', 'TARGET_MODE', 'SWAP_SLIPPAGE_BPS', 'PRIVATE_KEY', 'EIP7702_GUARD_ADDRESS', 'EIP7702_GUARD_VERIFIED']);
   const previous = Object.fromEntries([...keys].map((k) => [k, process.env[k]]));
   try {
     for (const key of keys) delete process.env[key];
@@ -49,5 +49,18 @@ test('invalid swap slippage fails closed', () => {
   assert.throws(
     () => withEnv({ TARGET_MODE: 'wallet-active', SWAP_SLIPPAGE_BPS: '10000' }, () => loadConfig()),
     /SWAP_SLIPPAGE_BPS/
+  );
+});
+
+test('live auto-redeploy requires the atomic guard to be configured and canary-verified', () => {
+  assert.throws(
+    () => withEnv({
+      TARGET_MODE: 'wallet-active',
+      DRY_RUN: 'false',
+      ENABLE_LIVE_WRITES: 'true',
+      ENABLE_AUTO_REDEPLOY: 'true',
+      PRIVATE_KEY: '0x' + '11'.repeat(32)
+    }, () => loadConfig()),
+    /EIP-7702 atomic OOR guard/
   );
 });
