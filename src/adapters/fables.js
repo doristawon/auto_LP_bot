@@ -314,6 +314,18 @@ export class FablesAdapter {
     return all;
   }
 
+  encodeDeposit(pool, target, liquidity, amount0Max, amount1Max, deadline) {
+    return hookInterface.encodeFunctionData('deposit', [
+      poolKeyArgs(pool),
+      target.tickLower,
+      target.tickUpper,
+      BigInt(liquidity),
+      BigInt(amount0Max),
+      BigInt(amount1Max),
+      deadline
+    ]);
+  }
+
   encodeClaimFees(pool, position) {
     return hookInterface.encodeFunctionData('claimFees', [
       poolKeyArgs(pool), position.tickLower, position.tickUpper, this.config.walletAddress, 0
