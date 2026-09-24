@@ -85,3 +85,16 @@ test('executor refuses even dry-run when price has returned in range', async () 
   assert.ok(events.some((x) => x.type === 'rebalance.blocked'));
   assert.equal(events.some((x) => x.type === 'rebalance.dry_run'), false);
 });
+
+test('unfinished capital-moving journal blocks another automatic rebalance', () => {
+  const executor = Object.create(RebalanceExecutor.prototype);
+  executor.state = {
+    getSetting() {
+      return { id: 'exec-1', phase: 'recovery_required' };
+    }
+  };
+  assert.throws(
+    () => executor.assertNoUnfinishedExecution(),
+    /Unfinished rebalance execution requires recovery/
+  );
+});
