@@ -9,8 +9,13 @@ export function loadConfig() {
   const enableLiveWrites = envBool('ENABLE_LIVE_WRITES', false);
   const enableAutoRedeploy = envBool('ENABLE_AUTO_REDEPLOY', false);
   const rpcUrls = envList('RPC_URLS', [DEFAULT_RPC_URL]);
+  const targetMode = (process.env.TARGET_MODE?.trim() || 'wallet-active').toLowerCase();
+  const logFromBlock = envInt('LOG_FROM_BLOCK', 44_000_000);
 
   if (!rpcUrls.length) throw new Error('RPC_URLS must contain at least one endpoint');
+  if (!['wallet-active', 'allowlist', 'symbols'].includes(targetMode)) {
+    throw new Error('TARGET_MODE must be wallet-active, allowlist, or symbols');
+  }
   if (!dryRun && enableLiveWrites && !privateKey) throw new Error('PRIVATE_KEY is required when live writes are enabled');
   if (!dryRun && enableAutoRedeploy) {
     throw new Error('Live auto-redeploy is gated until Fables deposit and swap calldata are independently verified');
@@ -26,13 +31,16 @@ export function loadConfig() {
     dryRun,
     enableLiveWrites,
     enableAutoRedeploy,
-    targetSymbols: envList('TARGET_SYMBOLS', ['CASHCAT', 'USDG']).map((x) => x.toUpperCase()),
+    targetMode,
+    targetSymbols: envList('TARGET_SYMBOLS', []).map((x) => x.toUpperCase()),
     targetPoolIds: envList('TARGET_POOL_IDS', []).map((x) => x.toLowerCase()),
     positionIds: envList('POSITION_IDS', []).map(normalizeBytes32),
     pollIntervalMs: envInt('POLL_INTERVAL_MS', 15_000),
     logChunkBlocks: envInt('LOG_CHUNK_BLOCKS', 500_000),
     minLogChunkBlocks: envInt('MIN_LOG_CHUNK_BLOCKS', 25_000),
-    logFromBlock: envInt('LOG_FROM_BLOCK', 44_000_000),
+    logFromBlock,
+    walletPoolDiscoveryFromBlock: envInt('WALLET_POOL_DISCOVERY_FROM_BLOCK', logFromBlock),
+    manualTopologyCooldownSec: envInt('MANUAL_TOPOLOGY_COOLDOWN_SEC', 120),
     feeLogFromBlock: envInt('FEE_LOG_FROM_BLOCK', 0),
     marketRefreshMs: envInt('MARKET_REFRESH_MS', 60_000),
     reorgLookbackBlocks: envInt('REORG_LOOKBACK_BLOCKS', 64),
