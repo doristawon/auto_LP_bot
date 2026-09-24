@@ -60,14 +60,22 @@ const prices = buildUsdPriceMap(allPools, config.usdgAddress);
 const targetPools = fables.targetPools(allPools).filter((p) => p.state);
 if (!targetPools.length) throw new Error('No configured target Fables pool found');
 
-const lifecycleLogs = [];
-for (const pool of targetPools) {
-  const logs = await fables.getLogsAdaptive(
-    { address: pool.key.hooks, topics: [[depositedTopic, withdrawnTopic], walletTopic] },
-    config.logFromBlock,
-    latestBlock
-  );
-  for (const log of logs) lifecycleLogs.push({ ...log, poolId: pool.id, hook: pool.key.hooks });
+let lifecycleLogs = [];
+try {
+  lifecycleLogs = await discoverLifecycleFromBlockscout();
+} catch (error) {
+  console.warn('[audit] Blockscout fast discovery failed, falling back to RPC logs:', error.message);
+}
+if (!lifecycleLogs.length) {
+  console.log('[audit] scanning lifecycle logs from RPC fallback...');
+  for (const pool of targetPools) {
+    const logs = await fables.getLogsAdaptive(
+      { address: pool.key.hooks, topics: [[depositedTopic, withdrawnTopic], walletTopic] },
+      config.logFromBlock,
+      latestBlock
+    );
+    for (const log of logs) lifecycleLogs.push({ ...log, poolId: pool.id, hook: pool.key.hooks });
+  }
 }
 lifecycleLogs.sort((a, b) => a.blockNumber - b.blockNumber || Number(a.index || 0) - Number(b.index || 0));
 if (!lifecycleLogs.length) {
@@ -415,6 +423,55 @@ function primaryPool() {
     [p.token0.symbol.toUpperCase(), p.token1.symbol.toUpperCase()].includes('USDG')
   );
   return direct || targetPools[0];
+}
+
+async function discoverLifecycleFromBlockscout() {
+  const base = 'https://robinhoodchain.blockscout.com/api/v2/addresses/' + config.walletAddress + '/transactions';
+  const hashes = [];
+  let params = {};
+  for (let page = 0; page < 40; page += 1) {
+    const url = new URL(base);
+    for (const [key, value] of Object.entries(params)) url.searchParams.set(key, String(value));
+    const response = await fetch(url, {
+      headers: {
+        accept: 'application/json',
+        'user-agent': 'auto-LP-bot/0.2.1 wallet-audit'
+      }
+    });
+    if (!response.ok) throw new Error('Blockscout ' + response.status + ' ' + response.statusText);
+    const body = await response.json();
+    const items = Array.isArray(body.items) ? body.items : [];
+    for (const item of items) {
+      const block = Number(item.block || item.block_number || 0);
+      if (block && block < config.logFromBlock) continue;
+      const hash = String(item.hash || '').toLowerCase();
+      if (/^0x[0-9a-f]{64}$/.test(hash)) hashes.push(hash);
+    }
+    if (!body.next_page_params) break;
+    params = body.next_page_params;
+  }
+  console.log('[audit] Blockscout address transactions:', hashes.length);
+  const rows = await mapLimit([...new Set(hashes)], 8, async (hash) => loadTx(hash));
+  const hookMap = new Map(targetPools.map((pool) => [pool.key.hooks.toLowerCase(), pool]));
+  const found = [];
+  for (const row of rows) {
+    for (const log of row.receipt?.logs || []) {
+      const pool = hookMap.get(String(log.address).toLowerCase());
+      if (!pool) continue;
+      const t0 = String(log.topics?.[0] || '').toLowerCase();
+      if (t0 !== depositedTopic.toLowerCase() && t0 !== withdrawnTopic.toLowerCase()) continue;
+      if (topicAddress(log.topics?.[1]) !== wallet) continue;
+      found.push({
+        ...log,
+        blockNumber: row.blockNumber,
+        transactionHash: row.hash,
+        poolId: pool.id,
+        hook: pool.key.hooks
+      });
+    }
+  }
+  console.log('[audit] Fables lifecycle events discovered from receipts:', found.length);
+  return found;
 }
 
 function pairName(pool) { return `${pool.token0.symbol}/${pool.token1.symbol}`; }
