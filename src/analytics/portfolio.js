@@ -34,7 +34,7 @@ export class PortfolioAnalytics {
 
         const principalUsd = valuePair(amounts.amount0, pool.token0.address, amounts.amount1, pool.token1.address, prices);
         const unclaimedFeeUsd = valuePair(owed0, pool.token0.address, owed1, pool.token1.address, prices);
-        const baselineKey = `positionBaseline:${position.id.toLowerCase()}`;
+        const baselineKey = `positionBaseline:${pool.id.toLowerCase()}:${position.id.toLowerCase()}`;
         let baseline = this.state.getSetting(baselineKey, null);
         if (!baseline || String(baseline.shares || '') !== position.shares.toString()) {
           baseline = {
