@@ -382,8 +382,9 @@ export class AutoLpBot {
       lastRangeEvaluationAt: evaluation.evaluatedAt,
       nextRangeEvaluationAt: evaluation.nextEvaluationAt,
       cooldownActive: evaluation.cooldownActive,
-      shouldRebalance: evaluation.shouldRebalance,
-      rebalanceReason: evaluation.rebalanceReason,
+      shouldRebalance: !pool.state.paused && evaluation.shouldRebalance,
+      rebalanceReason: !pool.state.paused ? evaluation.rebalanceReason : null,
+      executionBlockedReason: pool.state.paused ? 'fables pool paused' : null,
       target: evaluation.target
     });
     this.state.setPosition(stateKey, {
@@ -406,8 +407,9 @@ export class AutoLpBot {
       outOfRangeElapsedMin: evaluation.outOfRangeElapsedMs / 60000,
       deepConfirmations: evaluation.deepConfirmations,
       evaluationDue: evaluation.evaluationDue,
-      shouldRebalance: evaluation.shouldRebalance,
-      rebalanceReason: evaluation.rebalanceReason,
+      shouldRebalance: !pool.state.paused && evaluation.shouldRebalance,
+      rebalanceReason: !pool.state.paused ? evaluation.rebalanceReason : null,
+      executionBlockedReason: pool.state.paused ? 'fables pool paused' : null,
       target: evaluation.target
     });
   }
@@ -541,6 +543,21 @@ export class AutoLpBot {
     const latestState = await this.fables.readPoolState(pool);
     const outside = isLpOutOfRange(latestState.tick, position.tickLower, position.tickUpper);
     pool.state = latestState;
+
+    if (latestState.paused) {
+      this.ledger.append('rebalance.blocked', {
+        positionId: position.id,
+        poolId: pool.id,
+        reason: 'fables pool paused',
+        latestTick: latestState.tick
+      });
+      log('warn', 'rebalance.pool_paused', {
+        pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+        positionId: position.id,
+        latestTick: latestState.tick
+      });
+      return false;
+    }
 
     if (outside) return true;
 
@@ -713,7 +730,8 @@ function snapshotPool(pool) {
       deepConfirmations: p.deepConfirmations, outOfRangeSince: p.outOfRangeSince,
       outOfRangeElapsedMin: p.outOfRangeElapsedMin, evaluationDue: p.evaluationDue,
       lastRangeEvaluationAt: p.lastRangeEvaluationAt, nextRangeEvaluationAt: p.nextRangeEvaluationAt,
-      shouldRebalance: p.shouldRebalance, rebalanceReason: p.rebalanceReason, target: p.target,
+      shouldRebalance: p.shouldRebalance, rebalanceReason: p.rebalanceReason,
+      executionBlockedReason: p.executionBlockedReason || null, target: p.target,
       rebalancePlan: p.rebalancePlan || null, rebalanceQuote: p.rebalanceQuote || null,
       depositPlan: p.depositPlan || null
     }))
