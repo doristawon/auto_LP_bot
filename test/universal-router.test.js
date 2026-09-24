@@ -66,3 +66,37 @@ test('minimal V4 Universal Router plan encodes verified command/action structure
   assert.equal(takeCurrency.toLowerCase(), pool.token1.address.toLowerCase());
   assert.equal(BigInt(takeMin), 37824535896871557739n);
 });
+
+
+test('minimal V4 Universal Router plan encodes reverse 1_to_0 direction', () => {
+  const adapter = new UniversalRouterAdapter(null, { walletAddress: '0x0000000000000000000000000000000000000001' });
+  const reverseQuote = {
+    tokenIn: pool.token1.address,
+    tokenOut: pool.token0.address,
+    rawAmountIn: '1000000000000000000',
+    minRawAmountOut: '23000',
+    zeroForOne: false
+  };
+  const plan = adapter.buildV4ExactInputSingle({ pool, quote: reverseQuote, deadline: 1790249999 });
+  assert.equal(plan.zeroForOne, false);
+  assert.equal(plan.tokenIn.toLowerCase(), pool.token1.address.toLowerCase());
+  assert.equal(plan.tokenOut.toLowerCase(), pool.token0.address.toLowerCase());
+
+  const router = new Interface(UNIVERSAL_ROUTER_ABI);
+  const decoded = router.decodeFunctionData('execute', plan.data);
+  const coder = AbiCoder.defaultAbiCoder();
+  const [actions, params] = coder.decode(['bytes', 'bytes[]'], decoded[1][0]);
+  assert.equal(actions, '0x060c0f');
+
+  const [swap] = coder.decode([
+    'tuple(tuple(address,address,uint24,int24,address),bool,uint128,uint128,uint256,bytes)'
+  ], params[0]);
+  assert.equal(swap[1], false);
+  assert.equal(BigInt(swap[2]), 1000000000000000000n);
+  assert.equal(BigInt(swap[3]), 23000n);
+
+  const [settleCurrency] = coder.decode(['address', 'uint256'], params[1]);
+  const [takeCurrency] = coder.decode(['address', 'uint256'], params[2]);
+  assert.equal(settleCurrency.toLowerCase(), pool.token1.address.toLowerCase());
+  assert.equal(takeCurrency.toLowerCase(), pool.token0.address.toLowerCase());
+});

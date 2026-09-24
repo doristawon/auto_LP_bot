@@ -19,7 +19,7 @@ export function loadConfig() {
   }
   if (!dryRun && enableLiveWrites && !privateKey) throw new Error('PRIVATE_KEY is required when live writes are enabled');
   if (!dryRun && enableAutoRedeploy) {
-    throw new Error('Live auto-redeploy is gated until Fables deposit and swap calldata are independently verified');
+    throw new Error('Live auto-redeploy is gated until the full receipt-reconciled withdraw -> swap -> deposit state machine and exact fixed-point deposit math are implemented');
   }
 
   return {

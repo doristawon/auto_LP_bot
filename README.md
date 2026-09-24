@@ -1,8 +1,21 @@
 # Auto LP Bot — Fables.fi / Robinhood Chain
 
-> v0.3.3：API-less on-chain LP monitor + dynamic wallet-active topology + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
+> v0.3.4：API-less on-chain LP monitor + dynamic wallet-active topology + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
 
 > Review correction: **dry-run 不得改變策略 state**。v0.3.4 起，`rebalance.dry_run` 只寫 ledger，不再重設 OOR timer、cooldown 或 rebalanceHistory；只有 executor 回報完整 `completed` 才能 commit strategy state。另將 pre-withdraw inventory / deposit plan 明確標為 provisional，live 執行前必須在 withdraw/swap receipt 後重算。
+
+### Full-live review blockers
+
+目前監控、OOR hysteresis、PoolKey/range tracking、V4 quote 與 Universal Router calldata 已驗證；但正式 unattended live rebalance 仍需完成以下條件：
+
+1. withdraw 必須有非零 principal min-out，不能使用 `amount0Min=0 / amount1Min=0`。
+2. withdraw receipt 後以**實際 wallet delta**重算 swap amount；禁止沿用 withdraw 前估算值。
+3. 每個新 meme token 必須檢查/建立 ERC20→Permit2 與 Permit2→UniversalRouter allowance。
+4. swap 必須在 withdraw 後重新 quote + `eth_call` simulation，receipt 後再次讀實際 balance/tick。
+5. deposit range/liquidity/amount caps 必須在 post-swap tick 上重算。
+6. 現有 deposit planner 使用 JS `Number` 浮點近似；live calldata 前必須改成 **BigInt / fixed-point** 的 TickMath/LiquidityAmounts。
+7. deposit 前檢查 token→Fables hook allowance，並 `eth_call` 模擬；成功 receipt 後驗證新 ERC-6909 shares。
+8. 要真正滿足「In Range 絕不撤 LP」，最終 live executor 應由 atomic on-chain guard 在同一交易內檢查 OOR，消除 RPC 檢查到上鏈之間的 race。
 
 ## v0.3.4 — Executor fail-closed review
 
