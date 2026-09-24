@@ -1,6 +1,6 @@
 {
   "name": "auto-lp-bot",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Fables.fi LP monitor, accounting dashboard and guarded rebalance bot for Robinhood Chain",
