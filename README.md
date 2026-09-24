@@ -2,6 +2,14 @@
 
 > v0.3.3：API-less on-chain LP monitor + dynamic wallet-active topology + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
 
+## v0.3.4 — Executor fail-closed review
+
+Code review 發現舊 executor 在 `ENABLE_AUTO_REDEPLOY=true` 時會先 withdraw，之後才停在 redeploy gate。這會留下「LP 已拆、swap/deposit 尚未完成」的 partial execution 風險。
+
+- v0.3.4 起：只要完整 `withdraw -> receipt reconciliation -> swap -> receipt reconciliation -> deposit -> minted-share verification` state machine 尚未完成，**所有 live rebalance writes 一律 fail closed**。
+- `DRY_RUN` 仍可產生完整 rebalance/quote/deposit plan，不受影響。
+- V4 swap simulation workflow 改成雙向覆蓋：USDG↔MOO、USDG↔ZZZ，避免只驗證 USDG 買 meme、卻沒驗證 meme 賣回 USDG。
+
 ## v0.3.3 — 絕對 In-Range Hold
 
 **不可覆寫的核心規則：只要 LP 仍在原 range 內，BOT 絕不自動撤出 LP。** 自動 withdraw → swap → 窄區間 redeposit 只有在真實鏈上 tick 已 Out of Range 時才有資格啟動。

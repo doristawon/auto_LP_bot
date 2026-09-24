@@ -24,9 +24,16 @@ export class RebalanceExecutor {
       log('info', 'rebalance.dry_run', serializablePlan(plan));
       return { status: 'dry-run' };
     }
-    if (!this.config.enableAutoRedeploy) {
-      throw new Error('Live rebalance blocked: ENABLE_AUTO_REDEPLOY is false; refusing to withdraw without a complete redeploy path');
-    }
+    // CRITICAL FAIL-CLOSED RULE:
+    // The current production executor does not yet implement the complete atomic
+    // withdraw -> receipt reconciliation -> swap -> receipt reconciliation ->
+    // deposit chain. Never allow a live rebalance to perform only the destructive
+    // first half, even if ENABLE_AUTO_REDEPLOY is accidentally set true.
+    throw new Error(
+      'Live rebalance blocked: full withdraw -> swap -> deposit state machine is not implemented; refusing all rebalance writes'
+    );
+
+    // Unreachable until the full state machine is implemented and reviewed.
     this.assertLiveWallet();
     await this.assertGasGuard();
     if (!this.config.allowZeroMinOut) {
