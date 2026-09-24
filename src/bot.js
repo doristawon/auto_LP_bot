@@ -172,11 +172,17 @@ export class AutoLpBot {
       this.ledger.writeSnapshot(snapshot);
       this.recordPortfolioSnapshot(snapshot);
 
-      for (const pool of targetPools) {
-        for (const position of pool.positions || []) {
-          if (!position.shouldRebalance) continue;
-          await this.maybeRebalance(pool, position);
-        }
+      const pendingRebalances = targetPools.flatMap((pool) =>
+        (pool.positions || [])
+          .filter((position) => position.shouldRebalance)
+          .map((position) => ({ pool, position }))
+      );
+      if (pendingRebalances.length && this.config.targetMode === 'wallet-active') {
+        const stable = await this.revalidateTopologyBeforeExecution(latestBlock, pendingRebalances);
+        if (!stable) return snapshot;
+      }
+      for (const { pool, position } of pendingRebalances) {
+        await this.maybeRebalance(pool, position);
       }
       return snapshot;
     } finally {
@@ -251,6 +257,49 @@ export class AutoLpBot {
     }
 
     return { pools: result.activePools, accountingPools: result.knownPools || result.activePools, discovery: result };
+  }
+
+  async revalidateTopologyBeforeExecution(snapshotBlock, pendingRebalances = []) {
+    const beforePoolIds = (this.state.getSetting('activeWalletPoolIds', []) || [])
+      .map((x) => String(x).toLowerCase()).sort();
+    const beforeRangeKeys = (this.state.getSetting('activeWalletRangeKeys', []) || [])
+      .map((x) => String(x).toLowerCase()).sort();
+    const latest = await this.providers.readProvider.getBlockNumber();
+    if (latest <= snapshotBlock) return true;
+
+    const verification = await this.resolveTargetPools(latest);
+    const afterPoolIds = (verification.discovery?.activePoolIds || [])
+      .map((x) => String(x).toLowerCase()).sort();
+    const afterRangeKeys = (verification.discovery?.activeRangeKeys || [])
+      .map((x) => String(x).toLowerCase()).sort();
+    const stable = sameStringArray(beforePoolIds, afterPoolIds)
+      && sameStringArray(beforeRangeKeys, afterRangeKeys);
+
+    if (!stable) {
+      for (const { pool, position } of pendingRebalances) {
+        this.ledger.append('rebalance.blocked', {
+          positionId: position.id,
+          poolId: pool.id,
+          reason: 'wallet topology changed during cycle',
+          snapshotBlock,
+          verificationBlock: latest,
+          beforePoolIds,
+          afterPoolIds,
+          beforeRangeKeys,
+          afterRangeKeys
+        });
+      }
+      log('warn', 'rebalance.topology_race_blocked', {
+        snapshotBlock,
+        verificationBlock: latest,
+        beforePoolIds,
+        afterPoolIds,
+        beforeRangeKeys,
+        afterRangeKeys
+      });
+      return false;
+    }
+    return true;
   }
 
   async attachRebalanceQuotes(targetPools, portfolio) {
