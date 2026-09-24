@@ -2,6 +2,8 @@
 
 > v0.3.3：API-less on-chain LP monitor + dynamic wallet-active topology + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
 
+> Review correction: **dry-run 不得改變策略 state**。v0.3.4 起，`rebalance.dry_run` 只寫 ledger，不再重設 OOR timer、cooldown 或 rebalanceHistory；只有 executor 回報完整 `completed` 才能 commit strategy state。另將 pre-withdraw inventory / deposit plan 明確標為 provisional，live 執行前必須在 withdraw/swap receipt 後重算。
+
 ## v0.3.4 — Executor fail-closed review
 
 Code review 發現舊 executor 在 `ENABLE_AUTO_REDEPLOY=true` 時會先 withdraw，之後才停在 redeploy gate。這會留下「LP 已拆、swap/deposit 尚未完成」的 partial execution 風險。
