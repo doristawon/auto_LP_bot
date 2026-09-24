@@ -34,6 +34,18 @@ export function buildCenteredRange(currentTick, tickSpacing, widthBps) {
   return { tickLower, tickUpper, tickDelta: delta };
 }
 
+// Canonical Uniswap concentrated-liquidity membership rule:
+// lower tick is active/in-range, upper tick is exclusive.
+export function isLpOutOfRange(currentTick, tickLower, tickUpper) {
+  return currentTick < tickLower || currentTick >= tickUpper;
+}
+
+export function isLpInRange(currentTick, tickLower, tickUpper) {
+  return !isLpOutOfRange(currentTick, tickLower, tickUpper);
+}
+
+// Monitoring-only helper. A positive edge buffer may flag "near edge" while the LP
+// is still truly in-range. It must never be used as authorization to withdraw.
 export function isOutsideRange(currentTick, tickLower, tickUpper, edgeBufferTicks = 0) {
   return currentTick <= tickLower + edgeBufferTicks || currentTick >= tickUpper - edgeBufferTicks;
 }

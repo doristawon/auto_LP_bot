@@ -1,6 +1,18 @@
 # Auto LP Bot — Fables.fi / Robinhood Chain
 
-> v0.3.2：API-less on-chain LP monitor + dynamic wallet-active topology + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
+> v0.3.3：API-less on-chain LP monitor + dynamic wallet-active topology + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
+
+## v0.3.3 — 絕對 In-Range Hold
+
+**不可覆寫的核心規則：只要 LP 仍在原 range 內，BOT 絕不自動撤出 LP。** 自動 withdraw → swap → 窄區間 redeposit 只有在真實鏈上 tick 已 Out of Range 時才有資格啟動。
+
+- 真實 LP membership 採 concentrated-liquidity 語義：`tick >= tickLower && tick < tickUpper` 為 In Range。
+- `EDGE_BUFFER_TICKS` 只允許作 near-edge 監控提示，永遠不能授權撤 LP。
+- 策略層：In Range 強制 `shouldRebalance=false`，並清除 OOR timer / deep confirmations。
+- 排程層：pending rebalance 必須同時滿足 `outside===true && shouldRebalance===true`。
+- BOT 執行前：重新從鏈上讀最新 tick；若已回到舊 range，記錄 `rebalance.blocked: absolute in-range hold` 並取消整輪。
+- Executor 再做 fail-closed 檢查：入口、claim 前、withdraw 前皆重新確認 OOR。
+- 因鏈上價格可能在 RPC 檢查後、交易被打包前再次變動，正式 unattended live 啟用前仍需 atomic on-chain OOR guard 才能達到交易打包瞬間的絕對保證；目前 live auto-redeploy gate 維持關閉。
 
 ## v0.3.2 — 15 分鐘 OOR hysteresis（真實 Swap tick 回放校準）
 

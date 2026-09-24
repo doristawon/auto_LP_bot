@@ -11,6 +11,7 @@ import { evaluatePosition } from './strategy.js';
 import { LedgerStore } from './ledger.js';
 import { StateStore } from './state.js';
 import { ZERO_ADDRESS } from './constants.js';
+import { isLpOutOfRange } from './math/ticks.js';
 import { log } from './logger.js';
 
 export class AutoLpBot {
@@ -90,7 +91,7 @@ export class AutoLpBot {
           generatedAt: Date.now(),
           blockNumber: latestBlock,
           bot: {
-            version: '0.3.2',
+            version: '0.3.3',
             wallet: this.config.walletAddress,
             dryRun: this.config.dryRun,
             liveWrites: this.config.enableLiveWrites,
@@ -101,8 +102,8 @@ export class AutoLpBot {
             topologyCooldownUntil: this.state.getSetting('walletTopologyCooldownUntil', 0),
             lastAction: this.state.getSetting('lastAction', null),
             swapSlippageBps: this.config.swapSlippageBps,
-          rangePolicy: rangePolicySnapshot(this.config),
-            rangePolicy: rangePolicySnapshot(this.config)
+            rangePolicy: rangePolicySnapshot(this.config),
+            absoluteInRangeHold: true
           },
           rpcHealth: this.rpcHealth,
           portfolio: this.snapshot?.portfolio || emptyPortfolio(),
@@ -149,7 +150,7 @@ export class AutoLpBot {
         generatedAt: Date.now(),
         blockNumber: latestBlock,
         bot: {
-          version: '0.3.2',
+          version: '0.3.3',
           wallet: this.config.walletAddress,
           dryRun: this.config.dryRun,
           liveWrites: this.config.enableLiveWrites,
@@ -161,7 +162,9 @@ export class AutoLpBot {
           accountingPoolIds: accountingPools.map((pool) => pool.id),
           topologyCooldownUntil: this.state.getSetting('walletTopologyCooldownUntil', 0),
           targetSymbols: this.config.targetSymbols,
-          swapSlippageBps: this.config.swapSlippageBps
+          swapSlippageBps: this.config.swapSlippageBps,
+          rangePolicy: rangePolicySnapshot(this.config),
+          absoluteInRangeHold: true
         },
         rpcHealth: this.rpcHealth,
         portfolio,
@@ -176,7 +179,7 @@ export class AutoLpBot {
 
       const pendingRebalances = targetPools.flatMap((pool) =>
         (pool.positions || [])
-          .filter((position) => position.shouldRebalance)
+          .filter((position) => position.outside === true && position.shouldRebalance === true)
           .map((position) => ({ pool, position }))
       );
       if (pendingRebalances.length && this.config.targetMode === 'wallet-active') {
@@ -387,6 +390,7 @@ export class AutoLpBot {
     });
     Object.assign(position, {
       outside: evaluation.outside,
+      nearEdge: Boolean(evaluation.nearEdge),
       excursionPct: evaluation.excursionPct,
       confirmations: evaluation.deepConfirmations,
       deepConfirmations: evaluation.deepConfirmations,
@@ -465,6 +469,18 @@ export class AutoLpBot {
   }
 
   async maybeRebalance(pool, position) {
+    // ABSOLUTE RULE: never auto-withdraw an LP that is currently in its original range.
+    // Re-read the chain immediately before any executor path is allowed to proceed.
+    if (position.outside !== true || position.shouldRebalance !== true) {
+      this.ledger.append('rebalance.blocked', {
+        positionId: position.id,
+        poolId: pool.id,
+        reason: 'absolute in-range hold / position not OOR-eligible'
+      });
+      return;
+    }
+    if (!(await this.assertStillOutOfRangeBeforeRebalance(pool, position))) return;
+
     const topologyCooldownUntil = Number(this.state.getSetting('walletTopologyCooldownUntil', 0) || 0);
     if (Date.now() < topologyCooldownUntil) {
       this.ledger.append('rebalance.blocked', {
@@ -511,6 +527,38 @@ export class AutoLpBot {
       this.ledger.append('rebalance.failed', { positionId: position.id, poolId: pool.id, error: error.message });
       log('error', 'rebalance.failed', { positionId: position.id, error: error.message });
     }
+  }
+
+  async assertStillOutOfRangeBeforeRebalance(pool, position) {
+    const latestState = await this.fables.readPoolState(pool);
+    const outside = isLpOutOfRange(latestState.tick, position.tickLower, position.tickUpper);
+    pool.state = latestState;
+
+    if (outside) return true;
+
+    const stateKey = positionStateKey(pool, position);
+    this.state.setPosition(stateKey, {
+      outOfRangeConfirmations: 0,
+      deepOutOfRangeConfirmations: 0,
+      outOfRangeSince: 0,
+      lastRangeEvaluationAt: Date.now(),
+      lastTick: latestState.tick
+    });
+    this.ledger.append('rebalance.blocked', {
+      positionId: position.id,
+      poolId: pool.id,
+      reason: 'absolute in-range hold',
+      latestTick: latestState.tick,
+      tickLower: position.tickLower,
+      tickUpper: position.tickUpper
+    });
+    log('info', 'rebalance.in_range_hold', {
+      pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+      positionId: position.id,
+      latestTick: latestState.tick,
+      range: [position.tickLower, position.tickUpper]
+    });
+    return false;
   }
 
   async scanGlobalPoolFees(pools, latestBlock) {
@@ -653,7 +701,7 @@ function snapshotPool(pool) {
     paused: pool.state?.paused ?? null,
     positions: (pool.positions || []).map((p) => ({
       id: p.id, shares: p.shares.toString(), tickLower: p.tickLower, tickUpper: p.tickUpper,
-      outside: p.outside, excursionPct: p.excursionPct, confirmations: p.confirmations,
+      outside: p.outside, nearEdge: Boolean(p.nearEdge), excursionPct: p.excursionPct, confirmations: p.confirmations,
       deepConfirmations: p.deepConfirmations, outOfRangeSince: p.outOfRangeSince,
       outOfRangeElapsedMin: p.outOfRangeElapsedMin, evaluationDue: p.evaluationDue,
       lastRangeEvaluationAt: p.lastRangeEvaluationAt, nextRangeEvaluationAt: p.nextRangeEvaluationAt,

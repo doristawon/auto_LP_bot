@@ -2,6 +2,7 @@ import { Contract, Wallet, formatUnits, parseUnits } from 'ethers';
 import { ERC20_ABI } from '../abi.js';
 import { ZERO_ADDRESS } from '../constants.js';
 import { log } from '../logger.js';
+import { isLpOutOfRange } from '../math/ticks.js';
 
 export class RebalanceExecutor {
   constructor(readProvider, writeProvider, config, fables, ledger, getUsdPrice) {
@@ -15,6 +16,9 @@ export class RebalanceExecutor {
   }
 
   async execute(plan) {
+    // First fail-closed OOR check, including dry-run paths.
+    await this.assertPlanStillOutOfRange(plan, 'executor-entry');
+
     if (this.config.dryRun || !this.config.enableLiveWrites) {
       this.ledger.append('rebalance.dry_run', serializablePlan(plan));
       log('info', 'rebalance.dry_run', serializablePlan(plan));
@@ -30,6 +34,7 @@ export class RebalanceExecutor {
     }
 
     if (this.config.claimBeforeWithdraw && (plan.position.owed0 > 0n || plan.position.owed1 > 0n)) {
+      await this.assertPlanStillOutOfRange(plan, 'pre-claim');
       await this.sendVerifiedHookTx({
         to: plan.pool.key.hooks,
         data: this.fables.encodeClaimFees(plan.pool, plan.position),
@@ -37,6 +42,10 @@ export class RebalanceExecutor {
         pool: plan.pool
       });
     }
+
+    // Second chain read immediately before constructing/sending withdraw.
+    // If price has re-entered the old LP range, withdrawal is forbidden.
+    await this.assertPlanStillOutOfRange(plan, 'pre-withdraw');
 
     const deadline = Math.floor(Date.now() / 1000) + this.config.txDeadlineSec;
     const withdrawal = await this.sendVerifiedHookTx({
@@ -55,6 +64,35 @@ export class RebalanceExecutor {
       reason: 'Deposit broadcast remains gated until the Fables deposit execution manifest is verified'
     });
     return { status: 'withdrawn-redeploy-gated', withdrawalHash: withdrawal.hash };
+  }
+
+  async assertPlanStillOutOfRange(plan, phase) {
+    const latestState = await this.fables.readPoolState(plan.pool);
+    const outside = isLpOutOfRange(
+      latestState.tick,
+      plan.position.tickLower,
+      plan.position.tickUpper
+    );
+    plan.currentTick = latestState.tick;
+    plan.pool.state = latestState;
+
+    if (outside) return latestState;
+
+    const details = {
+      positionId: plan.position.id,
+      poolId: plan.pool.id,
+      pair: `${plan.pool.token0.symbol}/${plan.pool.token1.symbol}`,
+      reason: 'absolute in-range hold',
+      phase,
+      latestTick: latestState.tick,
+      tickLower: plan.position.tickLower,
+      tickUpper: plan.position.tickUpper
+    };
+    this.ledger.append('rebalance.blocked', details);
+    log('warn', 'rebalance.in_range_hold', details);
+    throw new Error(
+      `Absolute in-range hold: refusing LP withdrawal at tick ${latestState.tick} within [${plan.position.tickLower}, ${plan.position.tickUpper})`
+    );
   }
 
   assertLiveWallet() {

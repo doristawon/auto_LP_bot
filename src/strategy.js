@@ -1,4 +1,4 @@
-import { buildCenteredRange, isOutsideRange } from './math/ticks.js';
+import { buildCenteredRange, isLpOutOfRange, isOutsideRange } from './math/ticks.js';
 
 export function outOfRangeExcursionPct(currentTick, tickLower, tickUpper) {
   if (currentTick <= tickLower) {
@@ -26,7 +26,11 @@ export function evaluatePosition({
   cooldownUntil = 0,
   nowMs = Date.now()
 }) {
-  const outside = isOutsideRange(currentTick, position.tickLower, position.tickUpper, edgeBufferTicks);
+  // ABSOLUTE RULE: automatic LP withdrawal eligibility uses only the true LP range.
+  // edgeBufferTicks is monitoring-only and can never turn an in-range LP into a rebalance candidate.
+  const outside = isLpOutOfRange(currentTick, position.tickLower, position.tickUpper);
+  const nearEdge = !outside && edgeBufferTicks > 0
+    && isOutsideRange(currentTick, position.tickLower, position.tickUpper, edgeBufferTicks);
   const excursionPct = outOfRangeExcursionPct(currentTick, position.tickLower, position.tickUpper);
   const target = buildCenteredRange(currentTick, tickSpacing, widthBps);
   const cooldownActive = nowMs < cooldownUntil;
@@ -36,6 +40,7 @@ export function evaluatePosition({
     const elapsedMs = outside && outOfRangeSince ? Math.max(0, nowMs - outOfRangeSince) : 0;
     return {
       outside,
+      nearEdge,
       excursionPct,
       evaluationDue: false,
       evaluatedAt: lastEvaluationAt,
@@ -53,6 +58,7 @@ export function evaluatePosition({
   if (!outside) {
     return {
       outside: false,
+      nearEdge,
       excursionPct: 0,
       evaluationDue: true,
       evaluatedAt: nowMs,
@@ -79,6 +85,7 @@ export function evaluatePosition({
 
   return {
     outside: true,
+    nearEdge: false,
     excursionPct,
     evaluationDue: true,
     evaluatedAt: nowMs,

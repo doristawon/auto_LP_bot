@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildCenteredRange, isOutsideRange, priceWidthBpsToTickDelta } from '../src/math/ticks.js';
+import { buildCenteredRange, isLpInRange, isLpOutOfRange, isOutsideRange, priceWidthBpsToTickDelta } from '../src/math/ticks.js';
 import { evaluatePosition, outOfRangeExcursionPct } from '../src/strategy.js';
 
 const M15 = 15 * 60 * 1000;
@@ -17,10 +17,29 @@ test('centered range expands to tick spacing and contains spot', () => {
   assert.equal(r.tickUpper % 10, 0);
 });
 
-test('range boundary counts as out-of-range', () => {
-  assert.equal(isOutsideRange(100, 100, 200), true);
-  assert.equal(isOutsideRange(150, 100, 200), false);
-  assert.equal(isOutsideRange(200, 100, 200), true);
+test('canonical LP range uses lower-inclusive upper-exclusive semantics', () => {
+  assert.equal(isLpInRange(100, 100, 200), true);
+  assert.equal(isLpInRange(199, 100, 200), true);
+  assert.equal(isLpOutOfRange(99, 100, 200), true);
+  assert.equal(isLpOutOfRange(200, 100, 200), true);
+});
+
+test('edge buffer is monitoring-only and cannot authorize an in-range rebalance', () => {
+  assert.equal(isOutsideRange(105, 100, 200, 10), true);
+  const x = evaluatePosition({
+    currentTick: 105,
+    tickSpacing: 10,
+    position: { tickLower: 100, tickUpper: 200 },
+    widthBps: 120,
+    edgeBufferTicks: 10,
+    outOfRangeSince: 1,
+    deepConfirmationsSeen: 99,
+    maxWaitMs: 1,
+    nowMs: 10_000
+  });
+  assert.equal(x.outside, false);
+  assert.equal(x.nearEdge, true);
+  assert.equal(x.shouldRebalance, false);
 });
 
 test('50 ticks outside is about 0.5 percent', () => {
