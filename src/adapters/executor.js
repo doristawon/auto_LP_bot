@@ -62,6 +62,7 @@ export class RebalanceExecutor {
     }
 
     await this.assertLiveReady(plan);
+    this.assertNoUnfinishedExecution();
     let phase = 'prepared';
     let journal = {
       id: `${Date.now()}:${plan.pool.id}:${plan.position.id}`,
@@ -137,7 +138,8 @@ export class RebalanceExecutor {
         data: guardedData,
         value: 0n,
         onSent: (hash) => {
-          journal = this.patchJournal(journal, { phase: 'withdraw_sent', tx: { ...journal.tx, withdraw: hash } });
+          phase = 'withdraw_sent';
+          journal = this.patchJournal(journal, { phase, tx: { ...journal.tx, withdraw: hash } });
         }
       });
       phase = 'withdraw_confirmed';
@@ -204,7 +206,8 @@ export class RebalanceExecutor {
           data: request.data,
           value: request.value,
           onSent: (hash) => {
-            journal = this.patchJournal(journal, { phase: 'swap_sent', tx: { ...journal.tx, swap: hash } });
+            phase = 'swap_sent';
+            journal = this.patchJournal(journal, { phase, tx: { ...journal.tx, swap: hash } });
           }
         });
         phase = 'swap_confirmed';
@@ -274,7 +277,8 @@ export class RebalanceExecutor {
         data: depositData,
         value: 0n,
         onSent: (hash) => {
-          journal = this.patchJournal(journal, { phase: 'deposit_sent', tx: { ...journal.tx, deposit: hash } });
+          phase = 'deposit_sent';
+          journal = this.patchJournal(journal, { phase, tx: { ...journal.tx, deposit: hash } });
         }
       });
       phase = 'deposit_confirmed';
@@ -321,6 +325,7 @@ export class RebalanceExecutor {
       };
     } catch (error) {
       const afterCapitalMoved = [
+        'withdraw_sent',
         'withdraw_confirmed',
         'swap_sent',
         'swap_confirmed',
@@ -344,6 +349,17 @@ export class RebalanceExecutor {
       }
       throw error;
     }
+  }
+
+  assertNoUnfinishedExecution() {
+    if (!this.state) return;
+    const active = this.state.getSetting('activeRebalanceExecution', null);
+    if (!active || !active.phase) return;
+    const terminal = new Set(['completed', 'failed']);
+    if (terminal.has(active.phase)) return;
+    throw new Error(
+      `Unfinished rebalance execution requires recovery before new writes: ${active.phase} (${active.id || 'unknown'})`
+    );
   }
 
   async assertLiveReady(plan) {

@@ -144,7 +144,8 @@ export class AutoLpBot {
           targetSymbols: this.config.targetSymbols,
           swapSlippageBps: this.config.swapSlippageBps,
           rangePolicy: rangePolicySnapshot(this.config),
-          absoluteInRangeHold: true
+          absoluteInRangeHold: true,
+          activeRebalanceExecution: this.state.getSetting('activeRebalanceExecution', null)
         },
         rpcHealth: this.rpcHealth,
         portfolio,
