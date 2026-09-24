@@ -57,7 +57,9 @@ export class PortfolioAnalytics {
         const price0Usd = prices.get(pool.token0.address.toLowerCase());
         const price1Usd = prices.get(pool.token1.address.toLowerCase());
         let rebalancePlan = null;
-        if (position.target && Number.isFinite(price0Usd) && Number.isFinite(price1Usd) && price0Usd > 0 && price1Usd > 0) {
+        // Absolute In-Range Hold: do not even construct an automatic rebalance inventory plan
+        // while the LP is still earning inside its existing range.
+        if (position.outside === true && position.target && Number.isFinite(price0Usd) && Number.isFinite(price1Usd) && price0Usd > 0 && price1Usd > 0) {
           try {
             rebalancePlan = buildRebalanceInventoryPlan({
               amount0: amounts.amount0 + owed0,
