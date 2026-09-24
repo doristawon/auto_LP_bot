@@ -83,6 +83,7 @@ export class AutoLpBot {
       this.market.latestBlock = latestBlock;
       const selection = await this.resolveTargetPools(latestBlock);
       const targetPools = selection.pools;
+      const accountingPools = selection.accountingPools || targetPools;
       if (!targetPools.length) {
         const snapshot = {
           generatedAt: Date.now(),
@@ -131,9 +132,14 @@ export class AutoLpBot {
         }
       }
 
-      const uniqueTokens = uniqueTargetTokens(targetPools);
+      const uniqueTokens = uniqueTargetTokens(accountingPools);
       const walletBalances = await this.fables.readWalletBalances(uniqueTokens);
-      const portfolio = this.analytics.build({ targetPools, walletBalances, prices: this.market.prices });
+      const portfolio = this.analytics.build({
+        targetPools,
+        walletBalances,
+        prices: this.market.prices,
+        trackedTokens: uniqueTokens
+      });
       await this.attachRebalanceQuotes(targetPools, portfolio);
       const points = this.points.snapshot();
       const snapshot = {
@@ -149,6 +155,7 @@ export class AutoLpBot {
           lastAction: this.state.getSetting('lastAction', null),
           targetMode: this.config.targetMode,
           activePoolIds: targetPools.map((pool) => pool.id),
+          accountingPoolIds: accountingPools.map((pool) => pool.id),
           topologyCooldownUntil: this.state.getSetting('walletTopologyCooldownUntil', 0),
           targetSymbols: this.config.targetSymbols,
           swapSlippageBps: this.config.swapSlippageBps
@@ -178,7 +185,8 @@ export class AutoLpBot {
 
   async resolveTargetPools(latestBlock) {
     if (this.config.targetMode !== 'wallet-active') {
-      return { pools: this.fables.targetPools(this.market.pools), discovery: null };
+      const pools = this.fables.targetPools(this.market.pools);
+      return { pools, accountingPools: pools, discovery: null };
     }
 
     const cursorKey = 'walletPoolDiscovery';
