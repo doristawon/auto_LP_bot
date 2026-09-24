@@ -96,8 +96,19 @@ for (const hash of hashes) {
   });
 }
 
+let openchainLookup = null;
+try {
+  const response = await fetch('https://api.openchain.xyz/signature-database/v1/lookup?function=0x289a2a15', {
+    headers: { accept: 'application/json', 'user-agent': 'auto-LP-bot-withdraw-reverse/0.3.4' }
+  });
+  openchainLookup = response.ok ? await response.json() : { httpStatus: response.status };
+} catch (error) {
+  openchainLookup = { error: error.message };
+}
+
 const summary={
   selectors:[...new Set(rows.map(x=>x.selector))],
+  openchainLookup,
   candidateSelectors,
   selectorMatches:Object.entries(candidateSelectors).filter(([,selector])=>rows.some(x=>x.selector===selector)).map(([signature,selector])=>({signature,selector})),
   calldataBytes:[...new Set(rows.map(x=>x.calldataBytes))],
@@ -109,6 +120,7 @@ fs.mkdirSync(dir,{recursive:true});
 fs.writeFileSync(path.join(dir,'fixtures.json'),JSON.stringify(summary,null,2));
 console.log(JSON.stringify({
   selectors:summary.selectors,
+  openchainLookup:summary.openchainLookup,
   selectorMatches:summary.selectorMatches,
   candidateSelectors:summary.candidateSelectors,
   calldataBytes:summary.calldataBytes,
