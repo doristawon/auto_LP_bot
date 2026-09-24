@@ -47,6 +47,8 @@ export function buildRebalanceInventoryPlan({
     tokenOut = 1;
   }
   return {
+    provisional: true,
+    basis: 'pre-withdraw spot / approximate inventory ratio',
     totalValueUsd,
     target0,
     target1,
@@ -107,6 +109,8 @@ export function buildDepositPlan({
   const amount1Max = approxUint128Ceil(amount1MaxRawApprox, 'amount1Max');
 
   return {
+    provisional: true,
+    basis: 'pre-swap float approximation; must be rebuilt from post-swap receipt before live deposit',
     projected0,
     projected1,
     tickLower,
