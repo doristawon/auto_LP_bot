@@ -309,7 +309,10 @@ export class AutoLpBot {
 
   async attachRebalanceQuotes(targetPools, portfolio) {
     for (const metric of portfolio.positions || []) {
-      if (!metric.outside || !metric.rebalancePlan || !metric.target) continue;
+      // Chain quote/deposit planning is only needed once the hysteresis policy has
+      // actually made the position execution-eligible. Waiting OOR positions keep
+      // their analytical inventory plan but do not burn RPC quota on transient quotes.
+      if (!metric.outside || !metric.shouldRebalance || !metric.rebalancePlan || !metric.target) continue;
       const pool = targetPools.find((x) => x.id === metric.poolId);
       if (!pool) continue;
       let quote = null;
@@ -508,9 +511,31 @@ export class AutoLpBot {
       quote: position.rebalanceQuote || null,
       depositPlan: position.depositPlan || null
     };
-    this.state.setSetting('lastAction', `rebalance ${pool.token0.symbol}/${pool.token1.symbol} ${position.id.slice(0, 10)}…`);
     try {
       const result = await this.executor.execute(plan);
+
+      // Dry-run is observation only. Never mutate the strategy state as though the
+      // on-chain position moved, otherwise cooldown/rate-limit/OOR timers diverge
+      // from the wallet's real LP.
+      if (result.status === 'dry-run') {
+        this.state.setSetting(
+          'lastAction',
+          `dry-run ${pool.token0.symbol}/${pool.token1.symbol} ${position.id.slice(0, 10)}…`
+        );
+        return;
+      }
+
+      // Only a fully completed state machine may commit a rebalance to strategy state.
+      if (result.status !== 'completed') {
+        this.ledger.append('rebalance.uncommitted', {
+          positionId: position.id,
+          poolId: pool.id,
+          status: result.status,
+          reason: 'executor did not report a fully completed withdraw-swap-deposit cycle'
+        });
+        return;
+      }
+
       const cooldownUntil = Date.now() + this.config.minRebalanceIntervalSec * 1000;
       this.state.setPosition(positionStateKey(pool, position), {
         cooldownUntil,
@@ -523,6 +548,10 @@ export class AutoLpBot {
         ts: Date.now(), positionId: position.id, poolId: pool.id, result: result.status,
         currentTick: pool.state.tick, target: position.target
       });
+      this.state.setSetting(
+        'lastAction',
+        `completed ${pool.token0.symbol}/${pool.token1.symbol} ${position.id.slice(0, 10)}…`
+      );
     } catch (error) {
       this.ledger.append('rebalance.failed', { positionId: position.id, poolId: pool.id, error: error.message });
       log('error', 'rebalance.failed', { positionId: position.id, error: error.message });
