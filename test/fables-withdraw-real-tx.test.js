@@ -9,20 +9,25 @@ const REAL = '0x289a2a150000000000000000000000005fc5360d0400a0fd4f2af552add042d7
 
 test('discover and decode real Fables withdraw ABI from selector', () => {
   const matches = [];
-  for (const liquidityType of ['uint128','uint256']) {
-    for (const minType of ['uint128','uint256']) {
-      for (const deadlineType of ['uint48','uint64','uint128','uint256']) {
-        for (const trailingType of UINTS) {
-          const signature = `withdraw(${POOL_KEY} key,int24 tickLower,int24 tickUpper,${liquidityType} liquidity,address recipient,${minType} amount0Min,${minType} amount1Min,${deadlineType} deadline,${trailingType} trailing)`;
-          const iface = new Interface([`function ${signature}`]);
-          const selector = iface.getFunction('withdraw').selector;
-          if (selector === REAL_SELECTOR) matches.push({ signature, liquidityType, minType, deadlineType, trailingType, iface });
+  for (const tickType of ['int24','int32','int64','int128','int256']) {
+    for (const liquidityType of ['uint128','uint256']) {
+      for (const min0Type of ['uint128','uint256']) {
+        for (const min1Type of ['uint128','uint256']) {
+          for (const deadlineType of ['uint48','uint64','uint128','uint256']) {
+            for (const trailingType of UINTS) {
+              const signature = `withdraw(${POOL_KEY} key,${tickType} tickLower,${tickType} tickUpper,${liquidityType} liquidity,address recipient,${min0Type} amount0Min,${min1Type} amount1Min,${deadlineType} deadline,${trailingType} trailing)`;
+              const iface = new Interface([`function ${signature}`]);
+              if (iface.getFunction('withdraw').selector === REAL_SELECTOR) {
+                matches.push({ signature, tickType, liquidityType, min0Type, min1Type, deadlineType, trailingType, iface });
+              }
+            }
+          }
         }
       }
     }
   }
   console.log(JSON.stringify(matches.map(({ iface, ...x }) => x), null, 2));
-  assert.ok(matches.length > 0, 'no candidate ABI combination matches real selector');
+  assert.ok(matches.length > 0, 'no static width combination matches real selector');
   const { iface, ...match } = matches[0];
   const decoded = iface.decodeFunctionData('withdraw', REAL);
   console.log(JSON.stringify({
