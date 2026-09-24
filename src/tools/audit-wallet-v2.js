@@ -255,12 +255,24 @@ const netPnlUsd = Number.isFinite(initialCapital.usd)
   : null;
 const excessVsHodlUsd = currentPortfolio.totalUsd - hodlCurrentUsd - gasUsdCurrent;
 const activeIlUsd = activePositions.reduce((sum, p) => sum + (Number.isFinite(p.ilUsd) ? p.ilUsd : 0), 0);
+const scanEndBlock = await readProvider.getBlockNumber();
+const postSnapshotLifecycle = scanEndBlock > latestBlock
+  ? await scanWalletLifecycleWindow(latestBlock + 1, scanEndBlock)
+  : [];
+const topologyChangedDuringScan = postSnapshotLifecycle.length > 0;
 
 const report = {
   generatedAt: new Date().toISOString(),
   wallet: config.walletAddress,
   chainId: config.chainId,
   latestBlock,
+  scanEndBlock,
+  snapshotConsistency: {
+    asOfBlock: latestBlock,
+    scanEndBlock,
+    topologyChangedDuringScan,
+    lifecycleEventsAfterSnapshot: postSnapshotLifecycle
+  },
   firstFablesBlock,
   firstFablesTime: new Date(await blockTimestamp(firstFablesBlock)).toISOString(),
   walletPools: walletPools.map((pool) => ({
@@ -290,6 +302,9 @@ const report = {
   transactions: txLedger,
   lifecycle: lifecycle.map((x) => ({ ...x, liquidity: x.liquidity.toString() })),
   notes: [
+    topologyChangedDuringScan
+      ? 'WARNING: wallet Fables topology changed after the audit snapshot block; portfolio/active-position figures are an as-of snapshot, not end-of-scan current state.'
+      : 'Snapshot consistency check passed: no wallet Fables deposit/withdraw occurred after the audit snapshot block during this scan.',
     'Pool association is resolved from rangeKey() full PoolKey, not hook address alone.',
     'Active-position IL compares current LP principal (fees excluded) with the remaining wallet-boundary token mix supplied to that range epoch.',
     'Confirmed fee income equals explicit claimFees wallet inflows plus currently owed fees; this is a conservative on-chain lower bound if a protocol route pays fees through a non-claim path.',
@@ -306,6 +321,8 @@ console.log(JSON.stringify({
   pools: report.walletPools.map((x) => x.pair),
   relevantTransactions: report.transactions.length,
   activePositions: report.activePositions.length,
+  topologyChangedDuringScan: report.snapshotConsistency.topologyChangedDuringScan,
+  scanEndBlock: report.scanEndBlock,
   currentValueUsd: report.currentPortfolio.totalUsd,
   initialCapitalUsd: report.initialCapital.usd,
   netPnlUsd: report.pnl.netPnlUsd,
@@ -316,6 +333,28 @@ console.log(JSON.stringify({
   gasEth: report.pnl.totalGasEth,
   report: path.join(config.dataDir, 'audits', 'latest-v2.md')
 }, null, 2));
+
+async function scanWalletLifecycleWindow(fromBlock, toBlock) {
+  if (fromBlock > toBlock) return [];
+  const found = [];
+  for (const hook of hooks) {
+    const logs = await fables.getLogsAdaptive(
+      { address: hook, topics: [[depositedTopic, withdrawnTopic], walletTopic] },
+      fromBlock,
+      toBlock
+    );
+    for (const log of logs) {
+      found.push({
+        blockNumber: Number(log.blockNumber),
+        transactionHash: String(log.transactionHash || '').toLowerCase(),
+        hook,
+        rangeId: String(log.topics?.[2] || '').toLowerCase(),
+        kind: String(log.topics?.[0] || '').toLowerCase() === depositedTopic ? 'deposit' : 'withdraw'
+      });
+    }
+  }
+  return found.sort((a, b) => a.blockNumber - b.blockNumber);
+}
 
 async function discoverAddressActivityHashes() {
   const txs = await fetchBlockscoutPages('/addresses/' + config.walletAddress + '/transactions');
@@ -790,6 +829,11 @@ function renderMarkdown(report) {
   lines.push('');
   lines.push('- Wallet: `' + report.wallet + '`');
   lines.push('- Generated: ' + report.generatedAt);
+  lines.push('- Snapshot block: ' + report.latestBlock + ' (scan ended at ' + report.scanEndBlock + ')');
+  if (report.snapshotConsistency?.topologyChangedDuringScan) {
+    lines.push('');
+    lines.push('> **STALE SNAPSHOT WARNING:** Fables deposit/withdraw activity occurred after the snapshot block while this audit was running. Active-position and current-value fields are valid only as-of the snapshot block.');
+  }
   lines.push('- First observed Fables operation: block ' + report.firstFablesBlock + ' · ' + report.firstFablesTime);
   lines.push('- Pools touched: ' + report.walletPools.map((x) => x.pair).join(', '));
   lines.push('');
