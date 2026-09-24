@@ -116,7 +116,10 @@ export class AutoLpBot {
       for (const pool of targetPools) {
         pool.state = await this.fables.readPoolState(pool);
         const cursorKey = `positionLogs:${pool.id}`;
-        const previousCursor = this.state.getCursor(cursorKey, this.config.logFromBlock);
+        const fallbackCursor = this.config.targetMode === 'wallet-active'
+          ? Math.max(this.config.logFromBlock, latestBlock - this.config.reorgLookbackBlocks)
+          : this.config.logFromBlock;
+        const previousCursor = this.state.getCursor(cursorKey, fallbackCursor);
         const fromBlock = Math.max(this.config.logFromBlock, previousCursor - this.config.reorgLookbackBlocks);
         const result = await this.fables.discoverPositions(pool, fromBlock, latestBlock);
         pool.positions = result.positions;
