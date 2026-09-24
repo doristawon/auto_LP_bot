@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { Interface, id } from 'ethers';
 
 const signature = 'deposit((address,address,uint24,int24,address),int24,int24,uint128,uint128,uint128,uint256)';
-const abi = ['function ' + signature];
+const abi = [
+  'function deposit((address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks) key,int24 tickLower,int24 tickUpper,uint128 liquidity,uint128 amount0Max,uint128 amount1Max,uint256 deadline)'
+];
 const iface = new Interface(abi);
 
 const cases = [
