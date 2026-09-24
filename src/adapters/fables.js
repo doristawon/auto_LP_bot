@@ -60,15 +60,107 @@ export class FablesAdapter {
     return pools;
   }
 
-  targetPools(allPools) {
+  targetPools(allPools, walletActivePoolIds = []) {
+    if (this.config.targetMode === 'wallet-active') {
+      const ids = new Set(walletActivePoolIds.map((x) => String(x).toLowerCase()));
+      return allPools.filter((pool) => ids.has(pool.id));
+    }
     return allPools.filter((pool) => this.matchesTarget(pool));
   }
 
   matchesTarget(pool) {
+    if (this.config.targetMode === 'allowlist') {
+      return this.config.targetPoolIds.includes(pool.id);
+    }
     if (this.config.targetPoolIds.length) return this.config.targetPoolIds.includes(pool.id);
     if (!this.config.targetSymbols.length) return true;
     const symbols = new Set([pool.token0.symbol.toUpperCase(), pool.token1.symbol.toUpperCase()]);
     return this.config.targetSymbols.every((symbol) => symbols.has(symbol));
+  }
+
+  async discoverWalletActivePools(allPools, fromBlock, latestBlock, knownRangeKeys = []) {
+    const poolByFingerprint = new Map(allPools.map((pool) => [poolKeyFingerprint(pool.key), pool]));
+    const hookAddresses = new Map();
+    for (const pool of allPools) hookAddresses.set(pool.key.hooks.toLowerCase(), pool.key.hooks);
+
+    const candidates = new Map();
+    for (const value of knownRangeKeys || []) {
+      const parsed = parseRangeCandidateKey(value);
+      if (parsed && hookAddresses.has(parsed.hook.toLowerCase())) {
+        candidates.set(rangeCandidateKey(parsed.hook, parsed.rangeId), parsed);
+      }
+    }
+
+    if (fromBlock <= latestBlock) {
+      const walletTopic = zeroPadValue(this.config.walletAddress, 32).toLowerCase();
+      for (const [hookLower, hookAddress] of hookAddresses) {
+        const logs = await this.getLogsAdaptive({
+          address: hookAddress,
+          topics: [[depositedTopic, withdrawnTopic], walletTopic]
+        }, fromBlock, latestBlock);
+        for (const item of logs) {
+          const rangeId = item.topics?.[2]?.toLowerCase();
+          if (!rangeId) continue;
+          const key = rangeCandidateKey(hookLower, rangeId);
+          candidates.set(key, { hook: hookAddress, rangeId });
+        }
+      }
+    }
+
+    const hookContracts = new Map();
+    const activePoolIds = new Set();
+    const activeRangeKeys = [];
+    for (const [candidateKey, candidate] of candidates) {
+      const hookLower = candidate.hook.toLowerCase();
+      let hook = hookContracts.get(hookLower);
+      if (!hook) {
+        hook = new Contract(candidate.hook, HOOK_ABI, this.provider);
+        hookContracts.set(hookLower, hook);
+      }
+      let shares;
+      let range;
+      try {
+        [shares, range] = await Promise.all([
+          hook.balanceOf(this.config.walletAddress, candidate.rangeId),
+          hook.rangeKey(candidate.rangeId)
+        ]);
+      } catch (error) {
+        log('warn', 'wallet_pool.range_probe_failed', {
+          hook: candidate.hook,
+          rangeId: candidate.rangeId,
+          error: error.message
+        });
+        continue;
+      }
+      if (!range.exists) continue;
+      const pool = poolByFingerprint.get(poolKeyFingerprint(range.key));
+      if (!pool) {
+        log('warn', 'wallet_pool.registry_miss', {
+          hook: candidate.hook,
+          rangeId: candidate.rangeId,
+          fingerprint: poolKeyFingerprint(range.key)
+        });
+        continue;
+      }
+      let seeded = this.positionCandidates.get(pool.id);
+      if (!seeded) {
+        seeded = new Set(this.config.positionIds);
+        this.positionCandidates.set(pool.id, seeded);
+      }
+      seeded.add(candidate.rangeId.toLowerCase());
+      if (BigInt(shares) > 0n) {
+        activePoolIds.add(pool.id);
+        activeRangeKeys.push(candidateKey);
+      }
+    }
+
+    const activeIds = [...activePoolIds];
+    return {
+      activePools: this.targetPools(allPools, activeIds),
+      activePoolIds: activeIds,
+      knownRangeKeys: [...candidates.keys()],
+      activeRangeKeys
+    };
   }
 
   async getToken(address) {
@@ -231,13 +323,19 @@ export class FablesAdapter {
   }
 }
 
+export function poolKeyFingerprint(key) {
+  if (!key) return '';
+  return [
+    String(key.currency0).toLowerCase(),
+    String(key.currency1).toLowerCase(),
+    Number(key.fee),
+    Number(key.tickSpacing),
+    String(key.hooks).toLowerCase()
+  ].join(':');
+}
+
 export function samePoolKey(left, right) {
-  if (!left || !right) return false;
-  return String(left.currency0).toLowerCase() === String(right.currency0).toLowerCase()
-    && String(left.currency1).toLowerCase() === String(right.currency1).toLowerCase()
-    && Number(left.fee) === Number(right.fee)
-    && Number(left.tickSpacing) === Number(right.tickSpacing)
-    && String(left.hooks).toLowerCase() === String(right.hooks).toLowerCase();
+  return Boolean(left && right) && poolKeyFingerprint(left) === poolKeyFingerprint(right);
 }
 
 export function poolKeyArgs(pool) {
@@ -256,3 +354,14 @@ export function lifecycleLiquidity(logEntry) {
 }
 
 function short(value) { return `${value.slice(0, 6)}...${value.slice(-4)}`; }
+
+function rangeCandidateKey(hook, rangeId) {
+  return `${String(hook).toLowerCase()}|${String(rangeId).toLowerCase()}`;
+}
+
+function parseRangeCandidateKey(value) {
+  const [hook, rangeId] = String(value || '').split('|');
+  if (!/^0x[0-9a-fA-F]{40}$/.test(hook || '')) return null;
+  if (!/^0x[0-9a-fA-F]{64}$/.test(rangeId || '')) return null;
+  return { hook: getAddress(hook), rangeId: rangeId.toLowerCase() };
+}
