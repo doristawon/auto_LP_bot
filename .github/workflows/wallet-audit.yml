@@ -33,7 +33,7 @@ jobs:
           SWAP_SLIPPAGE_BPS: "50"
           DATA_DIR: "./data"
           STATE_FILE: "./state/audit-state.json"
-        run: npm run audit:wallet
+        run: node src/tools/audit-wallet-v2.js
       - name: Show report
         if: always()
         run: |
