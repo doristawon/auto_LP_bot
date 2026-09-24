@@ -29,3 +29,32 @@ test('target pool id allowlist is exclusive', () => {
   assert.equal(FablesAdapter.prototype.matchesTarget.call(adapterLike, cashcatPool), false);
   assert.equal(FablesAdapter.prototype.matchesTarget.call(adapterLike, mooPool), true);
 });
+
+
+test('wallet-active mode follows discovered active pool ids and ignores stale static ids', () => {
+  const adapterLike = {
+    config: {
+      targetMode: 'wallet-active',
+      targetPoolIds: ['0xstale'],
+      targetSymbols: ['OLD', 'USDG']
+    }
+  };
+  const oldPool = { id: '0xold', token0: { symbol: 'OLD' }, token1: { symbol: 'USDG' } };
+  const newMemePool = { id: '0xnew', token0: { symbol: 'NEWMEME' }, token1: { symbol: 'USDG' } };
+  const selected = FablesAdapter.prototype.targetPools.call(adapterLike, [oldPool, newMemePool], ['0xnew']);
+  assert.deepEqual(selected.map((x) => x.id), ['0xnew']);
+});
+
+test('allowlist mode never auto-adopts another matching meme pool', () => {
+  const adapterLike = {
+    config: {
+      targetMode: 'allowlist',
+      targetPoolIds: ['0xlocked'],
+      targetSymbols: []
+    }
+  };
+  const locked = { id: '0xlocked', token0: { symbol: 'A' }, token1: { symbol: 'USDG' } };
+  const other = { id: '0xother', token0: { symbol: 'B' }, token1: { symbol: 'USDG' } };
+  const selected = FablesAdapter.prototype.targetPools.call(adapterLike, [locked, other], ['0xother']);
+  assert.deepEqual(selected.map((x) => x.id), ['0xlocked']);
+});
