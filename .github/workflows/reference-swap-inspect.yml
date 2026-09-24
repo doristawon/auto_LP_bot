@@ -6,6 +6,7 @@ on:
     paths:
       - ".swap-inspect-trigger"
       - ".github/workflows/reference-swap-inspect.yml"
+      - "src/tools/decode-universal-router-tx.js"
   workflow_dispatch:
 
 jobs:
@@ -26,6 +27,11 @@ jobs:
         with:
           node-version: 22
       - run: npm install
+      - name: Decode Universal Router path
+        env:
+          RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
+          TX_HASH: "${{ matrix.tx }}"
+        run: node src/tools/decode-universal-router-tx.js "${TX_HASH}"
       - name: Read real swap transaction
         env:
           RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
