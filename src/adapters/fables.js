@@ -65,7 +65,7 @@ export class FablesAdapter {
   }
 
   matchesTarget(pool) {
-    if (this.config.targetPoolIds.length && this.config.targetPoolIds.includes(pool.id)) return true;
+    if (this.config.targetPoolIds.length) return this.config.targetPoolIds.includes(pool.id);
     if (!this.config.targetSymbols.length) return true;
     const symbols = new Set([pool.token0.symbol.toUpperCase(), pool.token1.symbol.toUpperCase()]);
     return this.config.targetSymbols.every((symbol) => symbols.has(symbol));
@@ -145,13 +145,16 @@ export class FablesAdapter {
 
     const hook = new Contract(pool.key.hooks, HOOK_ABI, this.provider);
     const positions = [];
+    const matchingRangeIds = new Set();
     for (const rangeId of candidates) {
-      const [shares, rangeKey, user] = await Promise.all([
+      const [shares, rangeKey] = await Promise.all([
         hook.balanceOf(this.config.walletAddress, rangeId),
-        hook.rangeKey(rangeId),
-        hook.userPosition(rangeId, this.config.walletAddress).catch(() => null)
+        hook.rangeKey(rangeId)
       ]);
-      if (shares === 0n || !rangeKey.exists) continue;
+      if (!rangeKey.exists || !samePoolKey(rangeKey.key, pool.key)) continue;
+      matchingRangeIds.add(rangeId.toLowerCase());
+      if (shares === 0n) continue;
+      const user = await hook.userPosition(rangeId, this.config.walletAddress).catch(() => null);
       positions.push({
         id: rangeId,
         shares: BigInt(shares),
@@ -161,7 +164,10 @@ export class FablesAdapter {
         owed1: user ? BigInt(user.owed1) : 0n
       });
     }
-    return { positions, lifecycleLogs: logs };
+    const lifecycleLogs = logs.filter((item) =>
+      item.topics?.[2] && matchingRangeIds.has(item.topics[2].toLowerCase())
+    );
+    return { positions, lifecycleLogs };
   }
 
   async scanPoolFees(pool, fromBlock, toBlock) {
@@ -223,6 +229,15 @@ export class FablesAdapter {
       this.config.walletAddress, 0n, 0n, deadline
     ]);
   }
+}
+
+export function samePoolKey(left, right) {
+  if (!left || !right) return false;
+  return String(left.currency0).toLowerCase() === String(right.currency0).toLowerCase()
+    && String(left.currency1).toLowerCase() === String(right.currency1).toLowerCase()
+    && Number(left.fee) === Number(right.fee)
+    && Number(left.tickSpacing) === Number(right.tickSpacing)
+    && String(left.hooks).toLowerCase() === String(right.hooks).toLowerCase();
 }
 
 export function poolKeyArgs(pool) {
