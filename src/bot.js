@@ -6,6 +6,7 @@ import { V4QuoterAdapter } from './adapters/quoter.js';
 import { buildUsdPriceMap } from './analytics/prices.js';
 import { PortfolioAnalytics } from './analytics/portfolio.js';
 import { PointsTracker } from './analytics/points-tracker.js';
+import { buildDepositPlan } from './analytics/rebalance-plan.js';
 import { evaluatePosition } from './strategy.js';
 import { LedgerStore } from './ledger.js';
 import { StateStore } from './state.js';
@@ -254,25 +255,43 @@ export class AutoLpBot {
 
   async attachRebalanceQuotes(targetPools, portfolio) {
     for (const metric of portfolio.positions || []) {
-      if (!metric.outside || !metric.rebalancePlan || metric.rebalancePlan.direction === 'none' || !(metric.rebalancePlan.amountIn > 0)) continue;
+      if (!metric.outside || !metric.rebalancePlan || !metric.target) continue;
       const pool = targetPools.find((x) => x.id === metric.poolId);
       if (!pool) continue;
+      let quote = null;
       try {
-        const quote = await this.quoter.quoteExactInputSingle(
-          pool,
-          metric.rebalancePlan.tokenIn,
-          metric.rebalancePlan.amountIn,
-          this.config.swapSlippageBps
-        );
-        metric.rebalanceQuote = quote;
+        if (metric.rebalancePlan.direction !== 'none' && metric.rebalancePlan.amountIn > 0) {
+          quote = await this.quoter.quoteExactInputSingle(
+            pool,
+            metric.rebalancePlan.tokenIn,
+            metric.rebalancePlan.amountIn,
+            this.config.swapSlippageBps
+          );
+          metric.rebalanceQuote = quote;
+        }
+        metric.depositPlan = buildDepositPlan({
+          amount0: metric.amount0 + metric.owed0,
+          amount1: metric.amount1 + metric.owed1,
+          inventoryPlan: metric.rebalancePlan,
+          quote,
+          sqrtPriceX96: pool.state.sqrtPriceX96,
+          tickLower: metric.target.tickLower,
+          tickUpper: metric.target.tickUpper,
+          decimals0: pool.token0.decimals,
+          decimals1: pool.token1.decimals,
+          slippageBps: this.config.depositSlippageBps,
+          liquidityReserveBps: this.config.depositLiquidityReserveBps
+        });
         const position = (pool.positions || []).find((x) => x.id.toLowerCase() === metric.id.toLowerCase());
         if (position) {
           position.rebalancePlan = metric.rebalancePlan;
           position.rebalanceQuote = quote;
+          position.depositPlan = metric.depositPlan;
         }
       } catch (error) {
         metric.rebalanceQuoteError = error.message;
-        log('warn', 'rebalance.quote_failed', { positionId: metric.id, poolId: metric.poolId, error: error.message });
+        metric.depositPlan = null;
+        log('warn', 'rebalance.plan_failed', { positionId: metric.id, poolId: metric.poolId, error: error.message });
       }
     }
   }
@@ -395,7 +414,8 @@ export class AutoLpBot {
       currentTick: pool.state.tick,
       target: position.target,
       inventoryPlan: position.rebalancePlan || null,
-      quote: position.rebalanceQuote || null
+      quote: position.rebalanceQuote || null,
+      depositPlan: position.depositPlan || null
     };
     this.state.setSetting('lastAction', `rebalance ${pool.token0.symbol}/${pool.token1.symbol} ${position.id.slice(0, 10)}…`);
     try {
@@ -553,7 +573,8 @@ function snapshotPool(pool) {
     positions: (pool.positions || []).map((p) => ({
       id: p.id, shares: p.shares.toString(), tickLower: p.tickLower, tickUpper: p.tickUpper,
       outside: p.outside, confirmations: p.confirmations, target: p.target,
-      rebalancePlan: p.rebalancePlan || null, rebalanceQuote: p.rebalanceQuote || null
+      rebalancePlan: p.rebalancePlan || null, rebalanceQuote: p.rebalanceQuote || null,
+      depositPlan: p.depositPlan || null
     }))
   };
 }
