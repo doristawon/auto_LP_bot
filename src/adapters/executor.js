@@ -1,5 +1,6 @@
 import { log } from '../logger.js';
 import { isLpOutOfRange } from '../math/ticks.js';
+import { outOfRangeExcursionPct } from '../strategy.js';
 
 export class RebalanceExecutor {
   constructor(readProvider, writeProvider, config, fables, ledger, getUsdPrice) {
@@ -42,7 +43,34 @@ export class RebalanceExecutor {
     plan.currentTick = latestState.tick;
     plan.pool.state = latestState;
 
-    if (outside) return latestState;
+    if (outside) {
+      const excursionPct = outOfRangeExcursionPct(
+        latestState.tick,
+        plan.position.tickLower,
+        plan.position.tickUpper
+      );
+      if (
+        plan.position.rebalanceReason === 'deep_oor_confirmed'
+        && excursionPct <= this.config.oorShallowThresholdPct
+      ) {
+        const details = {
+          positionId: plan.position.id,
+          poolId: plan.pool.id,
+          pair: `${plan.pool.token0.symbol}/${plan.pool.token1.symbol}`,
+          reason: 'deep OOR faded below threshold before executor',
+          phase,
+          latestTick: latestState.tick,
+          excursionPct,
+          thresholdPct: this.config.oorShallowThresholdPct
+        };
+        this.ledger.append('rebalance.blocked', details);
+        log('info', 'rebalance.deep_oor_faded', details);
+        throw new Error(
+          `Deep OOR faded to ${excursionPct.toFixed(4)}%, below ${this.config.oorShallowThresholdPct}% threshold`
+        );
+      }
+      return latestState;
+    }
 
     const details = {
       positionId: plan.position.id,
