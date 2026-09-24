@@ -12,11 +12,32 @@ export function loadConfig() {
   const targetMode = (process.env.TARGET_MODE?.trim() || 'wallet-active').toLowerCase();
   const logFromBlock = envInt('LOG_FROM_BLOCK', 44_000_000);
   const oorMaxWaitMin = envInt('OOR_MAX_WAIT_MIN', 90);
+  const targetSymbols = envList('TARGET_SYMBOLS', []).map((x) => x.toUpperCase());
+  const targetPoolIds = envList('TARGET_POOL_IDS', []).map((x) => x.toLowerCase());
+  const rangeCheckIntervalMs = envInt('RANGE_CHECK_INTERVAL_MS', 15 * 60 * 1000);
+  const oorShallowThresholdPct = envNum('OOR_SHALLOW_THRESHOLD_PCT', 0.5);
+  const oorDeepConfirmations = envInt('OOR_DEEP_CONFIRMATIONS', envInt('OUT_OF_RANGE_CONFIRMATIONS', 2));
+  const swapSlippageBps = envInt('SWAP_SLIPPAGE_BPS', 50);
+  const depositSlippageBps = envInt('DEPOSIT_SLIPPAGE_BPS', 50);
 
   if (!rpcUrls.length) throw new Error('RPC_URLS must contain at least one endpoint');
   if (!['wallet-active', 'allowlist', 'symbols'].includes(targetMode)) {
     throw new Error('TARGET_MODE must be wallet-active, allowlist, or symbols');
   }
+  if (targetMode === 'allowlist' && !targetPoolIds.length) {
+    throw new Error('TARGET_MODE=allowlist requires at least one TARGET_POOL_IDS entry; refusing fail-open all-pool selection');
+  }
+  if (targetMode === 'symbols' && !targetSymbols.length) {
+    throw new Error('TARGET_MODE=symbols requires TARGET_SYMBOLS; refusing fail-open all-pool selection');
+  }
+  if (rangeCheckIntervalMs <= 0) throw new Error('RANGE_CHECK_INTERVAL_MS must be > 0');
+  if (!(oorShallowThresholdPct >= 0 && oorShallowThresholdPct <= 100)) {
+    throw new Error('OOR_SHALLOW_THRESHOLD_PCT must be between 0 and 100');
+  }
+  if (oorMaxWaitMin <= 0) throw new Error('OOR_MAX_WAIT_MIN must be > 0');
+  if (oorDeepConfirmations < 1) throw new Error('OOR_DEEP_CONFIRMATIONS must be >= 1');
+  if (swapSlippageBps < 0 || swapSlippageBps >= 10_000) throw new Error('SWAP_SLIPPAGE_BPS must be 0..9999');
+  if (depositSlippageBps < 0 || depositSlippageBps >= 10_000) throw new Error('DEPOSIT_SLIPPAGE_BPS must be 0..9999');
   if (!dryRun && enableLiveWrites && !privateKey) throw new Error('PRIVATE_KEY is required when live writes are enabled');
   if (!dryRun && enableAutoRedeploy) {
     throw new Error('Live auto-redeploy is gated until the full receipt-reconciled withdraw -> swap -> deposit state machine and exact fixed-point deposit math are implemented');
@@ -33,8 +54,8 @@ export function loadConfig() {
     enableLiveWrites,
     enableAutoRedeploy,
     targetMode,
-    targetSymbols: envList('TARGET_SYMBOLS', []).map((x) => x.toUpperCase()),
-    targetPoolIds: envList('TARGET_POOL_IDS', []).map((x) => x.toLowerCase()),
+    targetSymbols,
+    targetPoolIds,
     positionIds: envList('POSITION_IDS', []).map(normalizeBytes32),
     pollIntervalMs: envInt('POLL_INTERVAL_MS', 15_000),
     logChunkBlocks: envInt('LOG_CHUNK_BLOCKS', 500_000),
@@ -47,15 +68,15 @@ export function loadConfig() {
     reorgLookbackBlocks: envInt('REORG_LOOKBACK_BLOCKS', 64),
     tightWidthBps: envInt('TIGHT_WIDTH_BPS', 120),
     edgeBufferTicks: envInt('EDGE_BUFFER_TICKS', 0),
-    rangeCheckIntervalMs: envInt('RANGE_CHECK_INTERVAL_MS', 15 * 60 * 1000),
-    oorShallowThresholdPct: envNum('OOR_SHALLOW_THRESHOLD_PCT', 0.5),
+    rangeCheckIntervalMs,
+    oorShallowThresholdPct,
     oorMaxWaitMin,
     oorMaxWaitMs: oorMaxWaitMin * 60 * 1000,
-    oorDeepConfirmations: envInt('OOR_DEEP_CONFIRMATIONS', envInt('OUT_OF_RANGE_CONFIRMATIONS', 2)),
+    oorDeepConfirmations,
     minRebalanceIntervalSec: envInt('MIN_REBALANCE_INTERVAL_SEC', 300),
     maxRebalancesPerHour: envInt('MAX_REBALANCES_PER_HOUR', 3),
-    swapSlippageBps: envInt('SWAP_SLIPPAGE_BPS', 50),
-    depositSlippageBps: envInt('DEPOSIT_SLIPPAGE_BPS', 50),
+    swapSlippageBps,
+    depositSlippageBps,
     depositLiquidityReserveBps: envInt('DEPOSIT_LIQUIDITY_RESERVE_BPS', 10),
     claimBeforeWithdraw: envBool('CLAIM_BEFORE_WITHDRAW', true),
     allowZeroMinOut: envBool('ALLOW_ZERO_MIN_OUT', false),
