@@ -14,9 +14,10 @@
     "inspect:tx": "node src/tools/inspect-reference-tx.js",
     "audit:wallet": "node src/tools/audit-wallet-v2.js",
     "test": "node --test",
-    "check": "node --check src/index.js && node --check src/bot.js && node --check src/config.js && node --check src/adapters/fables.js && node --check src/adapters/executor.js && node --check src/adapters/quoter.js && node --check src/analytics/portfolio.js && node --check src/analytics/rebalance-plan.js && node --check src/analytics/points.js && node --check src/analytics/points-tracker.js && node --check src/dashboard/page.js && node --check src/dashboard/server.js && node --check src/execution/reference-analysis.js && node --check src/rpc/providers.js && node --check src/rpc/blockscout.js && node --check src/tools/inspect-reference-tx.js && node --check src/tools/audit-wallet-v2.js && node --check src/adapters/universal-router.js && node --check src/tools/simulate-v4-swap.js && node --check src/tools/verify-wallet-topology.js"
+    "check": "node --check src/index.js && node --check src/bot.js && node --check src/config.js && node --check src/adapters/fables.js && node --check src/adapters/executor.js && node --check src/adapters/quoter.js && node --check src/analytics/portfolio.js && node --check src/analytics/rebalance-plan.js && node --check src/analytics/points.js && node --check src/analytics/points-tracker.js && node --check src/dashboard/page.js && node --check src/dashboard/server.js && node --check src/execution/reference-analysis.js && node --check src/rpc/providers.js && node --check src/rpc/blockscout.js && node --check src/tools/inspect-reference-tx.js && node --check src/tools/audit-wallet-v2.js && node --check src/adapters/universal-router.js && node --check src/tools/simulate-v4-swap.js && node --check src/tools/verify-wallet-topology.js && node --check src/tools/analyze-range-policy.js",
+    "analyze:range-policy": "node src/tools/analyze-range-policy.js"
   },
   "dependencies": {
     "ethers": "^6.15.0"
   }
-}
+}\n

@@ -1,0 +1,47 @@
+name: Range Policy Backtest
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".range-policy-trigger"
+      - "src/tools/analyze-range-policy.js"
+      - ".github/workflows/range-policy-backtest.yml"
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Backtest wallet LP range exit policy
+        env:
+          RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
+          WALLET_ADDRESS: "0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF"
+          TARGET_MODE: "wallet-active"
+          LOG_FROM_BLOCK: "44000000"
+          RANGE_BACKTEST_FROM_BLOCK: "71121689"
+          RANGE_SCAN_MINUTES: "5,10,15,30"
+          RANGE_WAIT_MINUTES: "30,60,90,120,180"
+          RANGE_OOR_THRESHOLDS_PCT: "0.25,0.5,0.75,1"
+          RANGE_DEEP_CONFIRM_SCANS: "1,2"
+          RANGE_POST_CLOSE_LOOKAHEAD_MIN: "180"
+          DATA_DIR: "./data"
+          STATE_FILE: "./state/range-policy-state.json"
+        run: node src/tools/analyze-range-policy.js
+      - name: Show result
+        if: always()
+        run: cat data/range-policy-backtest.md || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: range-policy-backtest
+          path: |
+            data/range-policy-backtest.json
+            data/range-policy-backtest.md
+          if-no-files-found: warn
