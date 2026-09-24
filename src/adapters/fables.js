@@ -108,6 +108,7 @@ export class FablesAdapter {
     }
 
     const hookContracts = new Map();
+    const knownPoolIds = new Set();
     const activePoolIds = new Set();
     const activeRangeKeys = [];
     for (const [candidateKey, candidate] of candidates) {
@@ -142,6 +143,7 @@ export class FablesAdapter {
         });
         continue;
       }
+      knownPoolIds.add(pool.id);
       let seeded = this.positionCandidates.get(pool.id);
       if (!seeded) {
         seeded = new Set(this.config.positionIds);
@@ -155,9 +157,12 @@ export class FablesAdapter {
     }
 
     const activeIds = [...activePoolIds];
+    const knownIds = [...knownPoolIds];
     return {
       activePools: this.targetPools(allPools, activeIds),
       activePoolIds: activeIds,
+      knownPools: allPools.filter((pool) => knownPoolIds.has(pool.id)),
+      knownPoolIds: knownIds,
       knownRangeKeys: [...candidates.keys()],
       activeRangeKeys
     };
