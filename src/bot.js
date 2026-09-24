@@ -200,30 +200,48 @@ export class AutoLpBot {
 
     const previousIds = (this.state.getSetting('activeWalletPoolIds', []) || []).map((x) => String(x).toLowerCase()).sort();
     const currentIds = result.activePoolIds.map((x) => String(x).toLowerCase()).sort();
-    if (!sameStringArray(previousIds, currentIds)) {
+    const previousRanges = (this.state.getSetting('activeWalletRangeKeys', []) || []).map((x) => String(x).toLowerCase()).sort();
+    const currentRanges = result.activeRangeKeys.map((x) => String(x).toLowerCase()).sort();
+    const poolsChanged = !sameStringArray(previousIds, currentIds);
+    const rangesChanged = !sameStringArray(previousRanges, currentRanges);
+    if (poolsChanged || rangesChanged) {
       const previousSet = new Set(previousIds);
       const currentSet = new Set(currentIds);
+      const previousRangeSet = new Set(previousRanges);
+      const currentRangeSet = new Set(currentRanges);
       const added = currentIds.filter((id) => !previousSet.has(id));
       const removed = previousIds.filter((id) => !currentSet.has(id));
+      const addedRanges = currentRanges.filter((id) => !previousRangeSet.has(id));
+      const removedRanges = previousRanges.filter((id) => !currentRangeSet.has(id));
       const cooldownUntil = Date.now() + this.config.manualTopologyCooldownSec * 1000;
       this.state.setSetting('activeWalletPoolIds', currentIds);
+      this.state.setSetting('activeWalletRangeKeys', currentRanges);
       this.state.setSetting('walletTopologyCooldownUntil', cooldownUntil);
-      this.ledger.append('wallet.pool_topology_changed', {
+      this.ledger.append('wallet.lp_topology_changed', {
+        poolsChanged,
+        rangesChanged,
         added,
         removed,
+        addedRanges,
+        removedRanges,
         activePoolIds: currentIds,
+        activeRangeKeys: currentRanges,
         cooldownUntil,
         cooldownSec: this.config.manualTopologyCooldownSec
       });
-      log('warn', 'wallet.pool_topology_changed', {
+      log('warn', 'wallet.lp_topology_changed', {
+        poolsChanged,
+        rangesChanged,
         added,
         removed,
+        addedRanges,
+        removedRanges,
         activePoolIds: currentIds,
         cooldownUntil
       });
     }
 
-    return { pools: result.activePools, discovery: result };
+    return { pools: result.activePools, accountingPools: result.knownPools || result.activePools, discovery: result };
   }
 
   async attachRebalanceQuotes(targetPools, portfolio) {
