@@ -1,0 +1,54 @@
+name: Reference Swap Inspect
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".swap-inspect-trigger"
+      - ".github/workflows/reference-swap-inspect.yml"
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        tx:
+          - "0xf00e69c5b4a75b389d0dd95f7e7a78ccdb798273e6473e3add6976495d87bbed"
+          - "0x6e4416b97539e06a08f7953c82a99c6e8dd35f065b441ec2a56d16af0825859c"
+          - "0xedcfa99048e3a0929258faf70d78e76e7ecf063fa34e8d1c80b421d3ffd5f6df"
+          - "0x037d8931ab392d83be9be222a25840d33b4a4894a27df641405bb775f657a013"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Read real swap transaction
+        env:
+          RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
+          WALLET_ADDRESS: "0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF"
+          TX_HASH: "${{ matrix.tx }}"
+        run: |
+          node --input-type=module <<'NODE'
+          import { JsonRpcProvider } from 'ethers';
+          const rpc = new JsonRpcProvider(process.env.RPC_URLS);
+          const hash = process.env.TX_HASH;
+          const [tx, receipt] = await Promise.all([rpc.getTransaction(hash), rpc.getTransactionReceipt(hash)]);
+          if (!tx || !receipt) throw new Error('transaction unavailable ' + hash);
+          console.log(JSON.stringify({
+            hash,
+            from: tx.from,
+            to: tx.to,
+            nonce: tx.nonce,
+            value: tx.value.toString(),
+            selector: tx.data.slice(0,10),
+            data: tx.data,
+            blockNumber: receipt.blockNumber,
+            status: receipt.status,
+            gasUsed: receipt.gasUsed.toString(),
+            logs: receipt.logs.map(x => ({address:x.address,topics:[...x.topics],data:x.data,index:x.index}))
+          }, null, 2));
+          NODE
