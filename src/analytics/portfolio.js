@@ -10,10 +10,14 @@ export class PortfolioAnalytics {
     this.state = state;
   }
 
-  build({ targetPools, walletBalances, prices }) {
+  build({ targetPools, walletBalances, prices, trackedTokens = [] }) {
     const positionMetrics = [];
     const inventory = new Map();
     const targetTokens = new Map();
+
+    for (const token of trackedTokens || []) {
+      targetTokens.set(token.address.toLowerCase(), token);
+    }
 
     for (const pool of targetPools) {
       targetTokens.set(pool.token0.address.toLowerCase(), pool.token0);
