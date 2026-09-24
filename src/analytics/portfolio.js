@@ -1,5 +1,5 @@
 import { formatUnits } from 'ethers';
-import { rangeAmounts } from './liquidity.js';
+import { rangeAmounts, spotToken1PerToken0 } from './liquidity.js';
 import { usdValue } from './prices.js';
 import { buildRebalanceInventoryPlan } from './rebalance-plan.js';
 
@@ -54,24 +54,31 @@ export class PortfolioAnalytics {
         const hodlUsd = valuePair(baseline.amount0, baseline.token0, baseline.amount1, baseline.token1, prices);
         const ilUsd = finitePair(principalUsd, hodlUsd) ? principalUsd - hodlUsd : null;
         const ilPct = Number.isFinite(ilUsd) && hodlUsd > 0 ? ilUsd / hodlUsd * 100 : null;
-        const price0Usd = prices.get(pool.token0.address.toLowerCase());
-        const price1Usd = prices.get(pool.token1.address.toLowerCase());
         let rebalancePlan = null;
+        // Rebalance sizing must use THIS pool's own spot ratio, never a global
+        // USD graph that could have priced the meme through a different pool.
+        // token1 is the local reference unit: token0 value = token1/token0 spot.
+        const localSpot1Per0 = spotToken1PerToken0(
+          pool.state.sqrtPriceX96,
+          pool.token0.decimals,
+          pool.token1.decimals
+        );
         // Absolute In-Range Hold: do not even construct an automatic rebalance inventory plan
         // while the LP is still earning inside its existing range.
-        if (position.outside === true && position.target && Number.isFinite(price0Usd) && Number.isFinite(price1Usd) && price0Usd > 0 && price1Usd > 0) {
+        if (position.outside === true && position.target && Number.isFinite(localSpot1Per0) && localSpot1Per0 > 0) {
           try {
             rebalancePlan = buildRebalanceInventoryPlan({
               amount0: amounts.amount0 + owed0,
               amount1: amounts.amount1 + owed1,
-              price0Usd,
-              price1Usd,
+              price0Usd: localSpot1Per0,
+              price1Usd: 1,
               sqrtPriceX96: pool.state.sqrtPriceX96,
               tickLower: position.target.tickLower,
               tickUpper: position.target.tickUpper,
               decimals0: pool.token0.decimals,
               decimals1: pool.token1.decimals
             });
+            rebalancePlan.valuationBasis = 'pool-local spot ratio; token1 reference unit';
           } catch {}
         }
 
