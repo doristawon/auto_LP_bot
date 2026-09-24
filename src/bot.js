@@ -37,7 +37,8 @@ export class AutoLpBot {
       config,
       this.fables,
       this.ledger,
-      (address) => this.market.prices.get(String(address).toLowerCase()) || 0
+      (address) => this.market.prices.get(String(address).toLowerCase()) || 0,
+      this.state
     );
   }
 
@@ -129,7 +130,7 @@ export class AutoLpBot {
         generatedAt: Date.now(),
         blockNumber: latestBlock,
         bot: {
-          version: '0.3.4',
+          version: '0.4.0',
           wallet: this.config.walletAddress,
           dryRun: this.config.dryRun,
           liveWrites: this.config.enableLiveWrites,

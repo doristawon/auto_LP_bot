@@ -15,9 +15,17 @@ export class V4QuoterAdapter {
   async quoteExactInputSingle(pool, tokenInIndex, amountIn, slippageBps = 50) {
     if (![0, 1].includes(tokenInIndex)) throw new Error('tokenInIndex must be 0 or 1');
     const tokenIn = tokenInIndex === 0 ? pool.token0 : pool.token1;
+    if (tokenIn.decimals == null) throw new Error('Token decimals unavailable for quote');
+    const rawAmountIn = parseUnits(decimalString(amountIn, tokenIn.decimals), tokenIn.decimals);
+    return this.quoteExactInputSingleRaw(pool, tokenInIndex, rawAmountIn, slippageBps);
+  }
+
+  async quoteExactInputSingleRaw(pool, tokenInIndex, rawAmountIn, slippageBps = 50) {
+    if (![0, 1].includes(tokenInIndex)) throw new Error('tokenInIndex must be 0 or 1');
+    const tokenIn = tokenInIndex === 0 ? pool.token0 : pool.token1;
     const tokenOut = tokenInIndex === 0 ? pool.token1 : pool.token0;
     if (tokenIn.decimals == null || tokenOut.decimals == null) throw new Error('Token decimals unavailable for quote');
-    const rawAmountIn = parseUnits(decimalString(amountIn, tokenIn.decimals), tokenIn.decimals);
+    rawAmountIn = BigInt(rawAmountIn);
     if (rawAmountIn <= 0n || rawAmountIn > MAX_UINT128) throw new Error('Quote amount must fit uint128');
     const params = [poolKeyArgs(pool), tokenInIndex === 0, rawAmountIn, '0x'];
     const data = iface.encodeFunctionData('quoteExactInputSingle', [params]);

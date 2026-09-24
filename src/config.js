@@ -19,6 +19,9 @@ export function loadConfig() {
   const oorDeepConfirmations = envInt('OOR_DEEP_CONFIRMATIONS', envInt('OUT_OF_RANGE_CONFIRMATIONS', 2));
   const swapSlippageBps = envInt('SWAP_SLIPPAGE_BPS', 50);
   const depositSlippageBps = envInt('DEPOSIT_SLIPPAGE_BPS', 50);
+  const withdrawSlippageBps = envInt('WITHDRAW_SLIPPAGE_BPS', 50);
+  const eip7702GuardAddress = optionalAddress('EIP7702_GUARD_ADDRESS');
+  const eip7702GuardVerified = envBool('EIP7702_GUARD_VERIFIED', false);
 
   if (!rpcUrls.length) throw new Error('RPC_URLS must contain at least one endpoint');
   if (!['wallet-active', 'allowlist', 'symbols'].includes(targetMode)) {
@@ -38,9 +41,11 @@ export function loadConfig() {
   if (oorDeepConfirmations < 1) throw new Error('OOR_DEEP_CONFIRMATIONS must be >= 1');
   if (swapSlippageBps < 0 || swapSlippageBps >= 10_000) throw new Error('SWAP_SLIPPAGE_BPS must be 0..9999');
   if (depositSlippageBps < 0 || depositSlippageBps >= 10_000) throw new Error('DEPOSIT_SLIPPAGE_BPS must be 0..9999');
+  if (withdrawSlippageBps < 0 || withdrawSlippageBps >= 10_000) throw new Error('WITHDRAW_SLIPPAGE_BPS must be 0..9999');
   if (!dryRun && enableLiveWrites && !privateKey) throw new Error('PRIVATE_KEY is required when live writes are enabled');
-  if (!dryRun && enableAutoRedeploy) {
-    throw new Error('Live auto-redeploy is gated until the full receipt-reconciled withdraw -> swap -> deposit state machine and exact fixed-point deposit math are implemented');
+  if (!dryRun && enableAutoRedeploy && !enableLiveWrites) throw new Error('ENABLE_AUTO_REDEPLOY requires ENABLE_LIVE_WRITES=true');
+  if (!dryRun && enableAutoRedeploy && (!eip7702GuardAddress || !eip7702GuardVerified)) {
+    throw new Error('Live auto-redeploy requires a deployed and canary-verified EIP-7702 atomic OOR guard');
   }
 
   return {
@@ -77,7 +82,12 @@ export function loadConfig() {
     maxRebalancesPerHour: envInt('MAX_REBALANCES_PER_HOUR', 3),
     swapSlippageBps,
     depositSlippageBps,
+    withdrawSlippageBps,
     depositLiquidityReserveBps: envInt('DEPOSIT_LIQUIDITY_RESERVE_BPS', 10),
+    fablesWalk: envInt('FABLES_WALK', 1000),
+    permit2ExpirationSec: envInt('PERMIT2_EXPIRATION_SEC', 30 * 24 * 60 * 60),
+    eip7702GuardAddress,
+    eip7702GuardVerified,
     claimBeforeWithdraw: envBool('CLAIM_BEFORE_WITHDRAW', true),
     allowZeroMinOut: envBool('ALLOW_ZERO_MIN_OUT', false),
     txDeadlineSec: envInt('TX_DEADLINE_SEC', 1200),
@@ -108,4 +118,9 @@ function requiredAddress(name) {
 function normalizeBytes32(value) {
   if (!/^0x[0-9a-fA-F]{64}$/.test(value)) throw new Error(`Invalid bytes32: ${value}`);
   return value.toLowerCase();
+}
+
+function optionalAddress(name) {
+  const value = process.env[name]?.trim();
+  return value ? getAddress(value) : '';
 }
