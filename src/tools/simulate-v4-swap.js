@@ -37,7 +37,8 @@ const deadline = Math.floor(Date.now() / 1000) + config.txDeadlineSec;
 const inputToken = tokenInIndex === 0 ? pool.token0 : pool.token1;
 const erc20 = new Contract(inputToken.address, ERC20_ABI, readProvider);
 const permit2 = new Contract(PERMIT2, PERMIT2_ABI, readProvider);
-const [erc20Allowance, p2Allowance] = await Promise.all([
+const [freeBalance, erc20Allowance, p2Allowance] = await Promise.all([
+  erc20.balanceOf(config.walletAddress),
   erc20.allowance(config.walletAddress, PERMIT2),
   permit2.allowance(config.walletAddress, inputToken.address, UNISWAP_UNIVERSAL_ROUTER_212)
 ]);
@@ -50,6 +51,19 @@ try {
   simulationError = error.shortMessage || error.reason || error.message;
 }
 
+const rawAmountIn = BigInt(quote.rawAmountIn);
+const permit2Unexpired = Number(p2Allowance.expiration) > Math.floor(Date.now() / 1000);
+const allowanceReady =
+  BigInt(erc20Allowance) >= rawAmountIn &&
+  BigInt(p2Allowance.amount) >= rawAmountIn &&
+  permit2Unexpired;
+const insufficientFreeBalance = BigInt(freeBalance) < rawAmountIn;
+const expectedPreWithdrawBalanceFailure =
+  !simulation &&
+  insufficientFreeBalance &&
+  allowanceReady &&
+  /TRANSFER_FROM_FAILED/i.test(String(simulationError || ''));
+
 const result = {
   wallet: config.walletAddress,
   pair: pool.token0.symbol + '/' + pool.token1.symbol,
@@ -59,6 +73,8 @@ const result = {
   amountIn,
   inputToken: inputToken.symbol,
   quote,
+  freeWalletBalanceRaw: freeBalance.toString(),
+  rawAmountIn: rawAmountIn.toString(),
   allowances: {
     erc20ToPermit2: erc20Allowance.toString(),
     permit2ToRouter: {
@@ -68,6 +84,15 @@ const result = {
     }
   },
   simulationOk: Boolean(simulation),
+  simulationStatus: simulation
+    ? 'success'
+    : expectedPreWithdrawBalanceFailure
+      ? 'expected-pre-withdraw-insufficient-free-balance'
+      : 'failed',
+  expectedPreWithdrawBalanceFailure,
+  allowanceReady,
+  permit2Unexpired,
+  insufficientFreeBalance,
   simulationError,
   routerPlan: simulation ? {
     router: simulation.router,
@@ -80,7 +105,11 @@ const result = {
   } : router.buildV4ExactInputSingle({ pool, quote, deadline })
 };
 console.log(JSON.stringify(result, bigintReplacer, 2));
-if (!simulation) process.exitCode = 2;
+// A reverse route can be structurally valid while the token principal is still
+// locked inside the LP. In that case a pre-withdraw eth_call is expected to fail
+// TRANSFER_FROM_FAILED even though approvals and route encoding are correct.
+// Treat only unexpected simulation failures as workflow failures.
+if (!simulation && !expectedPreWithdrawBalanceFailure) process.exitCode = 2;
 
 
 function bigintReplacer(_key, value) {

@@ -7,7 +7,7 @@
 ### Swap path review
 
 - Bot 的 minimal direct V4 path 使用 Universal Router `V4_SWAP (0x10)` + `SWAP_EXACT_IN_SINGLE (0x06) / SETTLE_ALL (0x0c) / TAKE_ALL (0x0f)`；USDG→MOO、USDG→ZZZ 已用真實 wallet allowance 做 `eth_call` 成功。
-- 反向 MOO/ZZZ→USDG 在 withdraw **之前**模擬會回 `TRANSFER_FROM_FAILED`，因 meme token principal 仍鎖在 LP；最終 swap simulation 必須放在 withdraw receipt 後，以實際 wallet delta 作 amountIn。
+- 反向 MOO/ZZZ→USDG 在 withdraw **之前**若 free wallet balance 不足，模擬可能回 `TRANSFER_FROM_FAILED`，因 meme token principal 仍鎖在 LP；最終 swap simulation 必須放在 withdraw receipt 後，以實際 wallet delta 作 amountIn。Simulation workflow 會同時檢查 free balance + ERC20→Permit2 + Permit2→Router allowance，只有「allowance 足夠但 principal 尚鎖在 LP」才標記為 expected pre-withdraw failure，不再誤報 route 壞掉。
 - 真實手動 ZZZ→USDG 成功 TX 顯示前端可能使用 Permit2 + 多段 V4 + V3/WETH 的複合路徑；因此 direct Fables-pool route 是有效 fallback，**不是已證明的最佳 route**。正式 live 應比較可執行 routes 的實際 quote / gas / slippage。
 - Swap sizing 使用該 LP 自己的 `sqrtPriceX96` relative price，不再使用可能被其他 pool 污染的 global USD graph。
 - Production executor 尚未呼叫 Universal Router；目前只做到 quote / encoding / simulation tooling，所有 live rebalance writes 仍 hard-block。
