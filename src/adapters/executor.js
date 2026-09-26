@@ -19,6 +19,7 @@ import {
   ZERO_ADDRESS
 } from '../constants.js';
 import { UniversalRouterAdapter } from './universal-router.js';
+import { samePoolKey } from './fables.js';
 import { V4QuoterAdapter } from './quoter.js';
 import { buildExactBalancedSwapPlan } from '../execution/exact-rebalance.js';
 import {
@@ -315,6 +316,21 @@ export class RebalanceExecutor {
       phase = 'deposit_confirmed';
       const depositEvent = this.findWalletDepositEvent(plan.pool, depositReceipt);
       if (!depositEvent) throw new Error('Deposit receipt is missing the wallet Deposited event');
+
+      // Shared hooks can manage multiple PoolKeys. Prove that the minted range is
+      // exactly the pool + ticks this execution intended, not merely "some range"
+      // emitted by the same hook.
+      const hookContract = new Contract(plan.pool.key.hooks, HOOK_ABI, this.readProvider);
+      const mintedRange = await hookContract.rangeKey(depositEvent.rangeId);
+      if (
+        !mintedRange.exists ||
+        !samePoolKey(mintedRange.key, plan.pool.key) ||
+        Number(mintedRange.tickLower) !== finalTarget.tickLower ||
+        Number(mintedRange.tickUpper) !== finalTarget.tickUpper
+      ) {
+        throw new Error('Deposit receipt minted an unexpected PoolKey/range');
+      }
+
       const newShares = await this.readPositionShares(plan.pool, depositEvent.rangeId);
       if (newShares <= 0n) throw new Error('Deposit confirmed but no new ERC-6909 LP shares were minted');
       const oldSharesAfter = await this.readPositionShares(plan.pool, plan.position.id);
