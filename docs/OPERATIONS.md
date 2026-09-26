@@ -21,6 +21,48 @@ ENABLE_AUTO_REDEPLOY=false
 
 `http://127.0.0.1:8787`
 
+v0.5.0 Control Center 會顯示：
+
+- tracked value / PnL / IL / fees / gas
+- active LP、current tick、LP range、OOR excursion、OOR 持續時間
+- deep OOR confirmations、rebalance eligibility、next target range
+- signer / live writes / auto redeploy / EIP-7702 guard runtime readiness
+- recovery journal、wallet topology cooldown、current block / RPC health
+- 15 分鐘 range policy、0.5% threshold、90 分鐘 max wait、2 次 deep confirmation
+- withdraw / swap / deposit slippage、max gas
+- transaction / accounting ledger
+
+控制項：
+
+- `Refresh`：只重新讀取 dashboard API。
+- `Scan now · no trades`：立即 fresh scan 鏈上狀態與 accounting，但強制 `executeRebalances=false`，不會送交易。
+- `Pause execution / Resume execution`：只控制鏈上 execution，不停止監控。
+- 每個 position 的 `Manual rebalance`：只會對「已經 OOR 且符合既定 policy」的 position 開放。
+
+手動 rebalance 預設關閉：
+
+```env
+DASHBOARD_MANUAL_CONTROL_ENABLED=false
+```
+
+要進行 dry-run canary 或小額 live canary 時才顯式改成：
+
+```env
+DASHBOARD_MANUAL_CONTROL_ENABLED=true
+```
+
+Manual control **不能**繞過：
+
+1. Absolute In-Range Hold
+2. OOR hysteresis policy
+3. wallet topology cooldown / topology revalidation
+4. execution pause
+5. hourly rate limit
+6. live signer / guard / write gates
+7. receipt-reconciled executor state machine
+
+若 dashboard bind 到 loopback 以外，必須設定 `DASHBOARD_TOKEN`。
+
 建議先跑 24 小時以上 dry-run，確認：
 
 - pool / range / shares 與 Fables UI 一致
