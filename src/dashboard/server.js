@@ -99,8 +99,8 @@ export class DashboardServer {
     if (req.method === 'POST' && url.pathname === '/api/points/baseline') {
       const body = await readJsonBody(req);
       if (!Number.isFinite(Number(body.points)) || Number(body.points) < 0) return sendJson(res, 400, { error: 'invalid points' });
-      this.pointsTracker.setActualBaseline(Number(body.points), body.at || new Date().toISOString());
-      return sendJson(res, 200, { ok: true, points: Number(body.points) });
+      const result = this.pointsTracker.setActualBaseline(Number(body.points), body.at || null);
+      return sendJson(res, 200, { ok: true, ...result });
     }
     if (req.method === 'POST' && url.pathname === '/api/cashflow') {
       const body = await readJsonBody(req);

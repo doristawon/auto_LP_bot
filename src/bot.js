@@ -1,18 +1,25 @@
-import { formatUnits } from 'ethers';
+import { Interface, formatUnits, id } from 'ethers';
 import { createProviders, verifyProviders } from './rpc/providers.js';
 import { FablesAdapter, lifecycleEventType, lifecycleLiquidity } from './adapters/fables.js';
 import { RebalanceExecutor } from './adapters/executor.js';
 import { V4QuoterAdapter } from './adapters/quoter.js';
 import { buildUsdPriceMap } from './analytics/prices.js';
+import { spotToken1PerToken0 } from './analytics/liquidity.js';
 import { PortfolioAnalytics } from './analytics/portfolio.js';
 import { PointsTracker } from './analytics/points-tracker.js';
+import { valueSwapFeeInUsd } from './analytics/points-accounting.js';
 import { buildDepositPlan } from './analytics/rebalance-plan.js';
 import { evaluatePosition, outOfRangeExcursionPct } from './strategy.js';
 import { LedgerStore } from './ledger.js';
 import { StateStore } from './state.js';
 import { ZERO_ADDRESS } from './constants.js';
 import { isLpOutOfRange } from './math/ticks.js';
+import { buildExactWithdrawBounds } from './math/v4-fixed.js';
+import { HOOK_ABI } from './abi.js';
 import { log } from './logger.js';
+
+const hookInterface = new Interface(HOOK_ABI);
+const transferTopic = id('Transfer(address,address,uint256)').toLowerCase();
 
 export class AutoLpBot {
   constructor(config) {
@@ -181,7 +188,7 @@ export class AutoLpBot {
     const pools = await this.fables.hydratePoolStates(discovered);
     const prices = buildUsdPriceMap(pools, this.config.usdgAddress);
     this.market = { refreshedAt: Date.now(), pools, prices, latestBlock };
-    await this.scanGlobalPoolFees(pools, latestBlock);
+    await this.scanGlobalPointFees(pools, latestBlock);
     log('info', 'market.refreshed', {
       block: latestBlock,
       pools: pools.length,
@@ -217,7 +224,13 @@ export class AutoLpBot {
         });
       }
 
-      for (const pool of targetPools) {
+      this.points.noteUserTrackingStarted(Date.now());
+      const executionPoolIds = new Set(targetPools.map((pool) => pool.id.toLowerCase()));
+
+      // Accounting must continue for pools that just became inactive; otherwise a
+      // full withdrawal can disappear from the execution set before its final fee
+      // claim is reconciled.
+      for (const pool of accountingPools) {
         pool.state = await this.fables.readPoolState(pool);
         const cursorKey = `positionLogs:${pool.id}`;
         const fallbackCursor = this.config.targetMode === 'wallet-active'
@@ -230,7 +243,7 @@ export class AutoLpBot {
         await this.recordLifecycleLogs(pool, result.lifecycleLogs);
         this.state.setCursor(cursorKey, latestBlock + 1);
         for (const position of pool.positions) {
-          await this.decoratePosition(pool, position);
+          if (executionPoolIds.has(pool.id.toLowerCase())) await this.decoratePosition(pool, position);
           this.trackFeeAccrual(pool, position);
         }
       }
@@ -249,7 +262,7 @@ export class AutoLpBot {
         generatedAt: Date.now(),
         blockNumber: latestBlock,
         bot: {
-          version: '0.5.0',
+          version: '0.5.1',
           wallet: this.config.walletAddress,
           dryRun: this.config.dryRun,
           liveWrites: this.config.enableLiveWrites,
@@ -541,15 +554,19 @@ export class AutoLpBot {
     const previous = this.state.getSetting(key, null);
     const current = { owed0: position.owed0.toString(), owed1: position.owed1.toString(), shares: position.shares.toString(), at: Date.now() };
     this.state.setSetting(key, current);
-    if (!previous || String(previous.shares) !== position.shares.toString()) return;
+    if (!previous) return;
     const prev0 = BigInt(previous.owed0 || 0);
     const prev1 = BigInt(previous.owed1 || 0);
     const d0 = position.owed0 - prev0;
     const d1 = position.owed1 - prev1;
     if (d0 > 0n || d1 > 0n) {
-      const amount0 = d0 > 0n ? Number(formatUnits(d0, pool.token0.decimals)) : 0;
-      const amount1 = d1 > 0n ? Number(formatUnits(d1, pool.token1.decimals)) : 0;
-      const feeUsd = amount0 * this.priceOf(pool.token0.address) + amount1 * this.priceOf(pool.token1.address);
+      const raw0 = d0 > 0n ? d0 : 0n;
+      const raw1 = d1 > 0n ? d1 : 0n;
+      const amount0 = Number(formatUnits(raw0, pool.token0.decimals));
+      const amount1 = Number(formatUnits(raw1, pool.token1.decimals));
+      const feeUsd = pool.state?.sqrtPriceX96
+        ? this.feePairUsdAtSwap(pool, raw0, raw1, pool.state.sqrtPriceX96)
+        : amount0 * this.priceOf(pool.token0.address) + amount1 * this.priceOf(pool.token1.address);
       this.ledger.append('fee.accrual', {
         positionId: position.id,
         poolId: pool.id,
@@ -570,6 +587,10 @@ export class AutoLpBot {
         currentOwed0: position.owed0.toString(),
         currentOwed1: position.owed1.toString(),
         note: 'Claim, withdraw, checkpoint, or accounting reset detected'
+      });
+      this.points.markUserCoverageBroken(Date.now(), 'active-position-owed-decrease', {
+        poolId: pool.id,
+        positionId: position.id
       });
     }
   }
@@ -782,6 +803,108 @@ export class AutoLpBot {
     return false;
   }
 
+  async scanGlobalPointFees(pools, latestBlock) {
+    const desiredStartMs = this.points.predictionStartMs(Date.now());
+    const previousStartMs = Number(this.state.getSetting('pointsGlobalSwapScanStartMs', 0) || 0);
+    if (previousStartMs && desiredStartMs < previousStartMs) {
+      // A user moved the official baseline backwards. Re-open the cursor so the
+      // missing earlier campaign interval is backfilled; appendUnique keeps
+      // already-known swaps idempotent.
+      this.state.setCursor('pointsGlobalSwapsV2', 0);
+    }
+    this.state.setSetting('pointsGlobalSwapScanStartMs', desiredStartMs);
+
+    const startBlock = await this.blockAtOrAfterTimestamp(desiredStartMs, latestBlock);
+    const storedCursor = this.state.getCursor('pointsGlobalSwapsV2', 0);
+    const fromBlock = storedCursor > 0
+      ? Math.max(startBlock, storedCursor - this.config.reorgLookbackBlocks)
+      : startBlock;
+    if (fromBlock > latestBlock) return;
+
+    let swaps;
+    try {
+      swaps = await this.fables.scanGlobalSwaps(pools, fromBlock, latestBlock);
+    } catch (error) {
+      log('warn', 'points.global_swap_scan_failed', {
+        fromBlock,
+        latestBlock,
+        error: error.message
+      });
+      return;
+    }
+
+    let priced = 0;
+    let unpriced = 0;
+    for (const swap of swaps) {
+      const valuation = valueSwapFeeInUsd({
+        pool: swap.pool,
+        swap,
+        usdgAddress: this.config.usdgAddress
+      });
+      const ts = await this.blockTimestamp(swap.blockNumber);
+      if (valuation.priced) priced += 1;
+      else unpriced += 1;
+      this.ledger.appendUnique(
+        `points-swap:${swap.transactionHash}:${swap.index}`,
+        'points.global_swap_fee',
+        {
+          poolId: swap.poolId,
+          pair: `${swap.pool.token0.symbol}/${swap.pool.token1.symbol}`,
+          hash: swap.transactionHash,
+          blockNumber: swap.blockNumber,
+          logIndex: swap.index,
+          feePips: swap.fee,
+          amount0Raw: swap.amount0.toString(),
+          amount1Raw: swap.amount1.toString(),
+          sqrtPriceX96: swap.sqrtPriceX96.toString(),
+          tick: swap.tick,
+          priced: valuation.priced,
+          valuation: valuation.valuation || null,
+          reason: valuation.reason || null,
+          inputToken: valuation.inputToken,
+          inputAmount: valuation.inputAmount,
+          feeAmount: valuation.feeAmount,
+          feeUsd: valuation.feeUsd
+        },
+        ts
+      );
+    }
+    this.state.setCursor('pointsGlobalSwapsV2', latestBlock + 1);
+    this.state.setSetting('pointsLastGlobalScan', {
+      at: Date.now(),
+      fromBlock,
+      latestBlock,
+      swaps: swaps.length,
+      priced,
+      unpriced,
+      desiredStartAt: new Date(desiredStartMs).toISOString()
+    });
+    if (swaps.length || unpriced) {
+      log('info', 'points.global_scan', { fromBlock, latestBlock, swaps: swaps.length, priced, unpriced });
+    }
+  }
+
+  async blockAtOrAfterTimestamp(timestampMs, latestBlock) {
+    const cacheKey = `pointsBlockAtOrAfter:${timestampMs}`;
+    const cached = Number(this.state.getSetting(cacheKey, 0) || 0);
+    if (cached > 0 && cached <= latestBlock) return cached;
+
+    let low = 0;
+    let high = latestBlock;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      const block = await this.providers.readProvider.getBlock(mid);
+      if (!block) {
+        low = mid + 1;
+        continue;
+      }
+      if (Number(block.timestamp) * 1000 < timestampMs) low = mid + 1;
+      else high = mid;
+    }
+    this.state.setSetting(cacheKey, low);
+    return low;
+  }
+
   async scanGlobalPoolFees(pools, latestBlock) {
     const poolsPerHook = new Map();
     for (const pool of pools) {
@@ -842,12 +965,21 @@ export class AutoLpBot {
       const kind = lifecycleEventType(entry);
       if (!kind) continue;
       const rangeId = entry.topics?.[2]?.toLowerCase();
-      const eventKey = `lifecycle:${entry.transactionHash}:${Number(entry.index ?? 0)}`;
-      if (this.ledger.seenKeys.has(eventKey)) continue;
+      const logIndex = Number(entry.index ?? 0);
+      const eventKey = `lifecycle:${entry.transactionHash}:${logIndex}`;
+      const feeKey = `points-withdraw-fee:${entry.transactionHash}:${logIndex}`;
+      const needsLifecycle = !this.ledger.seenKeys.has(eventKey);
+      const needsWithdrawalFee = kind === 'withdraw' && !this.ledger.seenKeys.has(feeKey);
+      if (!needsLifecycle && !needsWithdrawalFee) continue;
+
       const ts = await this.blockTimestamp(entry.blockNumber);
-      let gasEth = 0; let gasUsd = 0; let txFrom = null;
+      let gasEth = 0;
+      let gasUsd = 0;
+      let txFrom = null;
+      let receipt = null;
+      let tx = null;
       try {
-        const [receipt, tx] = await Promise.all([
+        [receipt, tx] = await Promise.all([
           this.providers.readProvider.getTransactionReceipt(entry.transactionHash),
           this.providers.readProvider.getTransaction(entry.transactionHash)
         ]);
@@ -858,18 +990,207 @@ export class AutoLpBot {
           gasUsd = gasEth * this.priceOf(ZERO_ADDRESS);
         }
       } catch {}
-      this.ledger.appendUnique(eventKey, `lp.${kind}`, {
-        poolId: pool.id,
-        pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
-        positionId: rangeId,
-        hash: entry.transactionHash,
-        blockNumber: entry.blockNumber,
-        liquidity: lifecycleLiquidity(entry).toString(),
-        txFrom,
-        gasEth,
-        gasUsd
-      }, ts);
+
+      if (needsLifecycle) {
+        this.ledger.appendUnique(eventKey, `lp.${kind}`, {
+          poolId: pool.id,
+          pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+          positionId: rangeId,
+          hash: entry.transactionHash,
+          blockNumber: entry.blockNumber,
+          liquidity: lifecycleLiquidity(entry).toString(),
+          txFrom,
+          gasEth,
+          gasUsd
+        }, ts);
+      }
+
+      if (needsWithdrawalFee) {
+        const result = this.reconcileWithdrawalUserFees(pool, rangeId, entry, receipt, tx, ts);
+        const feeEventData = {
+          poolId: pool.id,
+          pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+          positionId: rangeId,
+          hash: entry.transactionHash,
+          blockNumber: Number(entry.blockNumber),
+          logIndex,
+          ...result
+        };
+        if (result.ok) {
+          this.ledger.appendUnique(feeKey, 'points.withdraw_fee_reconciled', feeEventData, ts);
+        } else {
+          this.ledger.appendUnique(
+            `points-withdraw-fee-unresolved:${entry.transactionHash}:${logIndex}:${result.reason || 'unknown'}`,
+            'points.withdraw_fee_unresolved',
+            feeEventData,
+            ts
+          );
+          if (ts >= this.points.predictionStartMs(Date.now())) {
+            this.points.markUserCoverageBroken(ts, 'withdraw-fee-unresolved', {
+              poolId: pool.id,
+              positionId: rangeId,
+              hash: entry.transactionHash,
+              detail: result.reason || 'unknown'
+            });
+          }
+        }
+      }
     }
+  }
+
+  reconcileWithdrawalUserFees(pool, rangeId, entry, receipt, tx, ts) {
+    if (!rangeId || !receipt || !tx) return { ok: false, reason: 'missing-withdrawal-receipt-or-transaction' };
+    let decoded;
+    try { decoded = hookInterface.parseTransaction({ data: tx.data, value: tx.value }); }
+    catch { return { ok: false, reason: 'withdrawal-calldata-decode-failed' }; }
+    if (!decoded || decoded.name !== 'withdrawAndClaim') {
+      return { ok: false, reason: `unsupported-withdrawal-call:${decoded?.name || 'unknown'}` };
+    }
+
+    const preSwap = this.lastPointSwapBefore(pool.id, Number(entry.blockNumber), Number(entry.index ?? 0));
+    if (!preSwap?.sqrtPriceX96) return { ok: false, reason: 'missing-pre-withdraw-swap-state' };
+
+    let principal;
+    try {
+      principal = buildExactWithdrawBounds({
+        sqrtPriceX96: BigInt(preSwap.sqrtPriceX96),
+        tickLower: Number(decoded.args[1]),
+        tickUpper: Number(decoded.args[2]),
+        liquidity: BigInt(decoded.args[3]),
+        slippageBps: 0
+      });
+    } catch (error) {
+      return { ok: false, reason: `principal-reconstruction-failed:${error.message}` };
+    }
+
+    const actual = this.receiptWalletDeltasForPool(receipt, pool);
+    if (!actual) return { ok: false, reason: 'unsupported-native-token-withdrawal' };
+    const claimed0 = actual.raw0 > principal.expected0 ? actual.raw0 - principal.expected0 : 0n;
+    const claimed1 = actual.raw1 > principal.expected1 ? actual.raw1 - principal.expected1 : 0n;
+
+    const feeStateKey = `feeState:${pool.id.toLowerCase()}:${rangeId.toLowerCase()}`;
+    const previous = this.state.getSetting(feeStateKey, null);
+    if (!previous) return { ok: false, reason: 'missing-pre-withdraw-user-fee-state' };
+
+    const previousOwed0 = BigInt(previous.owed0 || 0);
+    const previousOwed1 = BigInt(previous.owed1 || 0);
+    const tolerance = 2n;
+    if (claimed0 + tolerance < previousOwed0 || claimed1 + tolerance < previousOwed1) {
+      return {
+        ok: false,
+        reason: 'reconstructed-claim-below-last-observed-owed',
+        claimed0: claimed0.toString(),
+        claimed1: claimed1.toString(),
+        previousOwed0: previousOwed0.toString(),
+        previousOwed1: previousOwed1.toString()
+      };
+    }
+
+    const unseen0 = claimed0 > previousOwed0 ? claimed0 - previousOwed0 : 0n;
+    const unseen1 = claimed1 > previousOwed1 ? claimed1 - previousOwed1 : 0n;
+    const feeUsd = this.feePairUsdAtSwap(pool, unseen0, unseen1, BigInt(preSwap.sqrtPriceX96));
+
+    if (unseen0 > 0n || unseen1 > 0n) {
+      this.ledger.appendUnique(
+        `points-user-fee-adjust:${entry.transactionHash}:${Number(entry.index ?? 0)}`,
+        'points.user_fee_adjustment',
+        {
+          poolId: pool.id,
+          pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+          positionId: rangeId,
+          hash: entry.transactionHash,
+          blockNumber: Number(entry.blockNumber),
+          amount0: Number(formatUnits(unseen0, pool.token0.decimals)),
+          amount1: Number(formatUnits(unseen1, pool.token1.decimals)),
+          symbol0: pool.token0.symbol,
+          symbol1: pool.token1.symbol,
+          feeUsd,
+          reason: 'withdrawAndClaim receipt minus exact principal minus last observed owed'
+        },
+        ts
+      );
+    }
+
+    this.state.setSetting(feeStateKey, {
+      owed0: '0',
+      owed1: '0',
+      shares: '0',
+      at: ts
+    });
+
+    return {
+      ok: true,
+      preSwapBlock: preSwap.blockNumber,
+      principal0: principal.expected0.toString(),
+      principal1: principal.expected1.toString(),
+      claimed0: claimed0.toString(),
+      claimed1: claimed1.toString(),
+      previousOwed0: previousOwed0.toString(),
+      previousOwed1: previousOwed1.toString(),
+      unseen0: unseen0.toString(),
+      unseen1: unseen1.toString(),
+      feeUsd
+    };
+  }
+
+  lastPointSwapBefore(poolId, blockNumber, logIndex) {
+    const rows = this.ledger.all();
+    for (let i = rows.length - 1; i >= 0; i -= 1) {
+      const event = rows[i];
+      if (event.type !== 'points.global_swap_fee') continue;
+      if (String(event.poolId).toLowerCase() !== String(poolId).toLowerCase()) continue;
+      const eventBlock = Number(event.blockNumber || 0);
+      const eventIndex = Number(event.logIndex || 0);
+      if (eventBlock < blockNumber || (eventBlock === blockNumber && eventIndex < logIndex)) return event;
+    }
+    return null;
+  }
+
+  receiptWalletDeltasForPool(receipt, pool) {
+    if (
+      pool.token0.address.toLowerCase() === ZERO_ADDRESS
+      || pool.token1.address.toLowerCase() === ZERO_ADDRESS
+    ) return null;
+    const wallet = this.config.walletAddress.toLowerCase();
+    const totals = new Map([
+      [pool.token0.address.toLowerCase(), 0n],
+      [pool.token1.address.toLowerCase(), 0n]
+    ]);
+    for (const item of receipt.logs || []) {
+      if (String(item.topics?.[0] || '').toLowerCase() !== transferTopic) continue;
+      const token = String(item.address || '').toLowerCase();
+      if (!totals.has(token)) continue;
+      const from = topicAddress(item.topics?.[1]);
+      const to = topicAddress(item.topics?.[2]);
+      const amount = BigInt(item.data || 0);
+      let delta = totals.get(token) || 0n;
+      if (from === wallet) delta -= amount;
+      if (to === wallet) delta += amount;
+      totals.set(token, delta);
+    }
+    const raw0 = totals.get(pool.token0.address.toLowerCase()) || 0n;
+    const raw1 = totals.get(pool.token1.address.toLowerCase()) || 0n;
+    return {
+      raw0: raw0 > 0n ? raw0 : 0n,
+      raw1: raw1 > 0n ? raw1 : 0n
+    };
+  }
+
+  feePairUsdAtSwap(pool, raw0, raw1, sqrtPriceX96) {
+    const amount0 = Number(formatUnits(raw0, pool.token0.decimals));
+    const amount1 = Number(formatUnits(raw1, pool.token1.decimals));
+    const usdg = this.config.usdgAddress.toLowerCase();
+    const k0 = pool.token0.address.toLowerCase();
+    const k1 = pool.token1.address.toLowerCase();
+    if (k0 === usdg) {
+      const spot = spotToken1PerToken0(sqrtPriceX96, pool.token0.decimals, pool.token1.decimals);
+      return amount0 + (spot > 0 ? amount1 / spot : 0);
+    }
+    if (k1 === usdg) {
+      const spot = spotToken1PerToken0(sqrtPriceX96, pool.token0.decimals, pool.token1.decimals);
+      return amount1 + amount0 * spot;
+    }
+    return amount0 * this.priceOf(pool.token0.address) + amount1 * this.priceOf(pool.token1.address);
   }
 
   async blockTimestamp(blockNumber) {
@@ -947,6 +1268,11 @@ function rangePolicySnapshot(config) {
     deepConfirmationsRequired: config.oorDeepConfirmations,
     monitorPollIntervalMs: config.pollIntervalMs
   };
+}
+
+function topicAddress(value) {
+  const raw = String(value || '').toLowerCase();
+  return /^0x[0-9a-f]{64}$/.test(raw) ? `0x${raw.slice(-40)}` : null;
 }
 
 function emptyPortfolio() {

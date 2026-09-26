@@ -35,6 +35,7 @@ export const ERC20_ABI = [
 export const DEPOSITED_EVENT = 'Deposited(address,uint256,uint128)';
 export const WITHDRAWN_EVENT = 'Withdrawn(address,uint256,uint128)';
 export const FEES_COLLECTED_EVENT = 'FeesCollected(uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint128,uint128,uint64,uint64)';
+export const V4_SWAP_EVENT = 'Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)';
 
 
 export const UNIVERSAL_ROUTER_ABI = [
