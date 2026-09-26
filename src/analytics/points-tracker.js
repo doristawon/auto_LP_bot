@@ -29,6 +29,25 @@ export class PointsTracker {
       this.state.setSetting('actualPointsBaselineAt', new Date(atMs).toISOString());
     }
 
+    const storedBaseline = Number(this.state.getSetting('actualPointsBaseline', 0) || 0);
+    const storedAtRaw = this.state.getSetting('actualPointsBaselineAt', null);
+    if (storedBaseline > 0 && storedAtRaw) {
+      const parsed = Date.parse(storedAtRaw);
+      if (Number.isFinite(parsed)) {
+        const normalized = normalizedBoundary(parsed);
+        if (normalized !== parsed) {
+          const normalizedIso = new Date(normalized).toISOString();
+          this.state.setSetting('actualPointsBaselineAt', normalizedIso);
+          this.ledger.append('points.baseline_migrated_v2', {
+            points: storedBaseline,
+            previousAt: storedAtRaw,
+            normalizedAt: normalizedIso,
+            reason: 'campaign day is anchored at 02:00 UTC'
+          }, Date.now());
+        }
+      }
+    }
+
     if (this.state.getSetting('pointsUserTrackingStartedAt', null) == null) {
       const earliest = this.ledger.all().find((event) =>
         USER_FEE_TYPES.has(event.type)
