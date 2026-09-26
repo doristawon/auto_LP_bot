@@ -57,8 +57,12 @@ export class DashboardServer {
       return sendJson(res, 200, { ok: true, executionPaused: true });
     }
     if (req.method === 'POST' && url.pathname === '/api/control/resume') {
-      this.bot.setExecutionPaused(false, 'dashboard');
-      return sendJson(res, 200, { ok: true, executionPaused: false });
+      try {
+        this.bot.setExecutionPaused(false, 'dashboard');
+        return sendJson(res, 200, { ok: true, executionPaused: false });
+      } catch (error) {
+        return sendJson(res, 409, { error: error.shortMessage || error.message });
+      }
     }
     if (req.method === 'POST' && url.pathname === '/api/control/scan') {
       const snapshot = await this.bot.runOnce({ executeRebalances: false, source: 'dashboard-scan' });
