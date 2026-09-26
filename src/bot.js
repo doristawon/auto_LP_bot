@@ -7,12 +7,13 @@ import { buildUsdPriceMap } from './analytics/prices.js';
 import { spotToken1PerToken0 } from './analytics/liquidity.js';
 import { PortfolioAnalytics } from './analytics/portfolio.js';
 import { PointsTracker } from './analytics/points-tracker.js';
+import { POINTS_DAY_MS } from './analytics/points.js';
 import { valueSwapFeeInUsd } from './analytics/points-accounting.js';
 import { buildDepositPlan } from './analytics/rebalance-plan.js';
 import { evaluatePosition, outOfRangeExcursionPct } from './strategy.js';
 import { LedgerStore } from './ledger.js';
 import { StateStore } from './state.js';
-import { ZERO_ADDRESS } from './constants.js';
+import { FABLES_POINTS_END_MS, ZERO_ADDRESS } from './constants.js';
 import { isLpOutOfRange } from './math/ticks.js';
 import { buildExactWithdrawBounds } from './math/v4-fixed.js';
 import { HOOK_ABI } from './abi.js';
@@ -815,6 +816,15 @@ export class AutoLpBot {
     this.state.setSetting('pointsGlobalSwapScanStartMs', desiredStartMs);
 
     const startBlock = await this.blockAtOrAfterTimestamp(desiredStartMs, latestBlock);
+    const accountingBoundaries = [{ dayStartMs: desiredStartMs, blockNumber: startBlock }];
+    const horizonMs = Math.min(Date.now(), FABLES_POINTS_END_MS);
+    for (let dayStartMs = desiredStartMs + POINTS_DAY_MS; dayStartMs <= horizonMs; dayStartMs += POINTS_DAY_MS) {
+      accountingBoundaries.push({
+        dayStartMs,
+        blockNumber: await this.blockAtOrAfterTimestamp(dayStartMs, latestBlock)
+      });
+    }
+
     const storedCursor = this.state.getCursor('pointsGlobalSwapsV2', 0);
     const fromBlock = storedCursor > 0
       ? Math.max(startBlock, storedCursor - this.config.reorgLookbackBlocks)
@@ -841,7 +851,7 @@ export class AutoLpBot {
         swap,
         usdgAddress: this.config.usdgAddress
       });
-      const ts = await this.blockTimestamp(swap.blockNumber);
+      const accountingDayStartMs = pointDayStartForBlock(swap.blockNumber, accountingBoundaries);
       if (valuation.priced) priced += 1;
       else unpriced += 1;
       this.ledger.appendUnique(
@@ -854,6 +864,8 @@ export class AutoLpBot {
           blockNumber: swap.blockNumber,
           logIndex: swap.index,
           feePips: swap.fee,
+          accountingDayStartMs,
+          accountingDay: new Date(accountingDayStartMs).toISOString(),
           amount0Raw: swap.amount0.toString(),
           amount1Raw: swap.amount1.toString(),
           sqrtPriceX96: swap.sqrtPriceX96.toString(),
@@ -866,7 +878,7 @@ export class AutoLpBot {
           feeAmount: valuation.feeAmount,
           feeUsd: valuation.feeUsd
         },
-        ts
+        Date.now()
       );
     }
     this.state.setCursor('pointsGlobalSwapsV2', latestBlock + 1);
@@ -1268,6 +1280,15 @@ function rangePolicySnapshot(config) {
     deepConfirmationsRequired: config.oorDeepConfirmations,
     monitorPollIntervalMs: config.pollIntervalMs
   };
+}
+
+function pointDayStartForBlock(blockNumber, boundaries) {
+  let dayStartMs = boundaries[0]?.dayStartMs ?? Date.now();
+  for (const boundary of boundaries) {
+    if (Number(blockNumber) < Number(boundary.blockNumber)) break;
+    dayStartMs = boundary.dayStartMs;
+  }
+  return dayStartMs;
 }
 
 function topicAddress(value) {
