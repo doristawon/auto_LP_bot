@@ -161,7 +161,9 @@ function render(){
   const healthy=(state.rpcHealth||[]).filter(x=>x.ok).length;$('rpc').textContent=healthy+'/'+(state.rpcHealth||[]).length;$('block').textContent=state.blockNumber||'--';
   const s=ctl.strategy||{},l=ctl.limits||{};$('policyScan').textContent=Math.round(Number(s.evaluationIntervalMs||0)/60000)+' min';$('policyDeep').textContent=pct(s.shallowThresholdPct);$('policyWait').textContent=num(s.maxWaitMin)+' min';$('policyConfirm').textContent=num(s.deepConfirmationsRequired);$('policyWidth').textContent=num(s.tightWidthBps)+' bps';
   $('slippage').textContent=num(l.withdrawSlippageBps)+' / '+num(l.swapSlippageBps)+' / '+num(l.depositSlippageBps)+' bps';$('maxGas').textContent=num(l.maxGasGwei)+' gwei';
-  $('points').textContent=num(pt.estimatedTotal);$('pointsNote').textContent='Actual baseline '+num(pt.actualBaseline)+' + estimated delta '+num(pt.estimatedDelta);
+  const exactPoints=pt.estimatedTotal!=null;const shownPoints=exactPoints?pt.estimatedTotal:pt.provisionalEstimatedTotal;
+  $('points').textContent=(exactPoints?'':'~')+num(shownPoints);
+  $('pointsNote').textContent='V'+(pt.version||1)+' '+(pt.status||'unknown')+' · baseline '+num(pt.actualBaseline)+' · delta '+num(exactPoints?pt.estimatedDelta:pt.provisionalEstimatedDelta)+' · global coverage '+pct(pt.denominatorCoveragePct)+' · next '+(pt.nextDistributionAt?dt(Date.parse(pt.nextDistributionAt)):'--');
   $('positions').innerHTML=pos.map(positionRow).join('')||'<tr><td colspan="10" class="muted">No tracked positions</td></tr>';
   const cd=Math.max(0,Math.ceil((Number(ctl.topologyCooldownUntil||0)-Date.now())/1000));if(cd>0)$('lastAction').textContent+=' · topology cooldown '+cd+'s';
   const b=$('liveBanner');
