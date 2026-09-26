@@ -1,8 +1,22 @@
 # Auto LP Bot — Fables.fi / Robinhood Chain
 
-> v0.4.1：API-less on-chain LP monitor + dynamic wallet-active topology + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
+> v0.5.0：在 v0.4.1 receipt-reconciled executor 上完成 deployment-aware local control center、observation-only manual scan、explicitly-armed manual rebalance 與完整 safety/readiness 顯示。
 
 > Review correction: **dry-run 不得改變策略 state**。v0.3.4 起，`rebalance.dry_run` 只寫 ledger，不再重設 OOR timer、cooldown 或 rebalanceHistory；只有 executor 回報完整 `completed` 才能 commit strategy state。另將 pre-withdraw inventory / deposit plan 明確標為 provisional，live 執行前必須在 withdraw/swap receipt 後重算。
+
+## v0.5.0 — Deployment control center + manual canary control
+
+中控台新增：
+
+- signer / live writes / auto redeploy / EIP-7702 guard config + runtime readiness
+- recovery journal、topology cooldown、current block / RPC health
+- OOR excursion、elapsed time、deep confirmation、eligibility、target range
+- range policy / slippage / max gas 顯示
+- `Scan now · no trades`：fresh scan 但強制 `executeRebalances=false`
+- 指定 position 的 Manual Rebalance
+- `DASHBOARD_MANUAL_CONTROL_ENABLED=false` 預設 SAFE-OFF；只有顯式 armed 才接受 capital-moving dashboard request
+
+Manual Rebalance 不提供 bypass：In-Range Hold、OOR hysteresis、topology revalidation/cooldown、Pause、rate limit、live signer/guard gates、receipt state machine 全部照常生效。
 
 ## v0.4.1 — Real-wallet replay hardening
 
@@ -255,21 +269,22 @@ Robinhood RPC / managed RPC
 
 Dashboard 顯示：
 
-- 目前 LP + 錢包相關資產總值
-- Net PnL
-- HODL baseline
-- vs HODL 損益
-- Impermanent Loss / 無常損失
-- LP fee 累積
-- 未領 fees
-- Gas fee（ETH / USD 估值）
-- Fables Points：actual baseline + estimated delta
-- 各 LP Range / current tick / In Range / Out of Range
-- RPC health
-- Execution / Dry-run / Pause 狀態
+- 目前 LP + 錢包相關資產總值、Net PnL、HODL baseline、vs HODL、IL
+- LP fee、未領 fees、Gas fee、Fables Points
+- 各 LP current tick / range / OOR excursion / OOR elapsed / deep confirmations / eligibility / target range
+- signer、Live Writes、Auto Redeploy、Manual Control arming
+- EIP-7702 guard config flag + runtime identity readiness
+- recovery state / active execution journal / topology cooldown
+- RPC health / current block
+- 15m / 0.5% / 90m / deep-confirm=2 policy 與 withdraw/swap/deposit slippage、max gas
 - append-only transaction / accounting ledger
-- 手動 cashflow adjustment
-- 手動輸入官方 Points baseline 校準
+
+Dashboard 控制：
+
+- `Scan now · no trades`：立即讀鏈上與 accounting，但不執行 rebalance。
+- `Pause / Resume`：kill switch。
+- `Manual Rebalance`：只對已符合 OOR policy 的 position 開放；預設由 `DASHBOARD_MANUAL_CONTROL_ENABLED=false` 關閉。
+- 手動 cashflow adjustment / Points baseline 只影響 accounting。
 
 ### 交易紀錄與會計
 
@@ -463,9 +478,11 @@ npm run verify:guard
 
 - `GET /api/state`
 - `GET /api/events?limit=200`
+- `GET /api/control/status`
 - `POST /api/control/pause`
 - `POST /api/control/resume`
-- `POST /api/control/scan`
+- `POST /api/control/scan` — observation-only, no trades
+- `POST /api/control/rebalance` — requires `DASHBOARD_MANUAL_CONTROL_ENABLED=true` and JSON `confirm: "REBALANCE"`
 - `POST /api/points/baseline`
 - `POST /api/cashflow`
 
