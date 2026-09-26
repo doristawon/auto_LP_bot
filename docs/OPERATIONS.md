@@ -102,6 +102,6 @@ Estimated Total = Actual Baseline + Estimated Delta
 
 ## Emergency stop
 
-Dashboard `Pause execution` 只停鏈上執行，不停監控與會計。
+Dashboard `Pause new execution` 會阻止新的 rebalance 開始，但不停監控與會計；若已有 capital-moving state machine 啟動，不會在 withdraw / swap / deposit 半途硬中斷，而是讓它完成或進入 `recovery_required`。
 
 也可以直接停止 process/container；ledger 已落盤。
