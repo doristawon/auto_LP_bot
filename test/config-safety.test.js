@@ -10,7 +10,7 @@ const BASE = {
 };
 
 function withEnv(extra, fn) {
-  const keys = new Set([...Object.keys(BASE), ...Object.keys(extra), 'TARGET_POOL_IDS', 'TARGET_SYMBOLS', 'TARGET_MODE', 'SWAP_SLIPPAGE_BPS', 'PRIVATE_KEY', 'EIP7702_GUARD_ADDRESS', 'EIP7702_GUARD_VERIFIED']);
+  const keys = new Set([...Object.keys(BASE), ...Object.keys(extra), 'TARGET_POOL_IDS', 'TARGET_SYMBOLS', 'TARGET_MODE', 'SWAP_SLIPPAGE_BPS', 'PRIVATE_KEY', 'EIP7702_GUARD_ADDRESS', 'EIP7702_GUARD_VERIFIED', 'DASHBOARD_MANUAL_CONTROL_ENABLED']);
   const previous = Object.fromEntries([...keys].map((k) => [k, process.env[k]]));
   try {
     for (const key of keys) delete process.env[key];
@@ -63,4 +63,16 @@ test('live auto-redeploy requires the atomic guard to be configured and canary-v
     }, () => loadConfig()),
     /EIP-7702 atomic OOR guard/
   );
+});
+
+
+test('dashboard manual control defaults safe-off and requires explicit opt-in', () => {
+  const safe = withEnv({ TARGET_MODE: 'wallet-active' }, () => loadConfig());
+  assert.equal(safe.dashboardManualControlEnabled, false);
+
+  const armed = withEnv({
+    TARGET_MODE: 'wallet-active',
+    DASHBOARD_MANUAL_CONTROL_ENABLED: 'true'
+  }, () => loadConfig());
+  assert.equal(armed.dashboardManualControlEnabled, true);
 });
