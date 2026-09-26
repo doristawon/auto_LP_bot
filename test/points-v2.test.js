@@ -97,6 +97,29 @@ test('points v2 predicts from fee share when denominator and user coverage are c
   assert.equal(snap.denominatorCoveragePct, 100);
 });
 
+test('global fee buckets use campaign accounting day even when the swap was indexed later', () => {
+  const day = Date.parse('2026-09-25T02:00:00Z');
+  const nextDay = day + 24 * 60 * 60 * 1000;
+  const state = fakeState({
+    actualPointsBaseline: 1000,
+    actualPointsBaselineAt: new Date(day).toISOString(),
+    pointsUserTrackingStartedAtV2: day
+  });
+  const ledger = fakeLedger([
+    event(day + 60_000, 'fee.accrual', { feeUsd: 10 }),
+    event(nextDay + 60_000, 'points.global_swap_fee', {
+      accountingDayStartMs: day,
+      feeUsd: 100,
+      priced: true
+    })
+  ]);
+  const tracker = new PointsTracker({ actualPointsBaseline: 0, actualPointsBaselineAt: '' }, ledger, state);
+  const snap = tracker.snapshot(day + 12 * 60 * 60 * 1000);
+  const bucket = snap.buckets[new Date(day).toISOString()];
+  assert.equal(bucket.totalFeeUsd, 100);
+  assert.equal(bucket.userFeeUsd, 10);
+});
+
 test('points v2 refuses exact prediction if any global swap is unpriced', () => {
   const day = Date.parse('2026-09-25T02:00:00Z');
   const state = fakeState({
