@@ -75,7 +75,7 @@ export function valueSwapFeeInUsd({ pool, swap, usdgAddress }) {
     };
   }
 
-  // When the non-USDG token is the input, the negative USDG pool delta is the
+  // When the non-USDG token is the input, the positive USDG BalanceDelta is the
   // realized output after the LP fee was removed from input. Valuing the fee at
   // the same realized execution rate gives:
   //   feeUsd = outputUsd * fee / (1 - fee)
