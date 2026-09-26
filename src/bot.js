@@ -560,9 +560,13 @@ export class AutoLpBot {
     const d0 = position.owed0 - prev0;
     const d1 = position.owed1 - prev1;
     if (d0 > 0n || d1 > 0n) {
-      const amount0 = d0 > 0n ? Number(formatUnits(d0, pool.token0.decimals)) : 0;
-      const amount1 = d1 > 0n ? Number(formatUnits(d1, pool.token1.decimals)) : 0;
-      const feeUsd = amount0 * this.priceOf(pool.token0.address) + amount1 * this.priceOf(pool.token1.address);
+      const raw0 = d0 > 0n ? d0 : 0n;
+      const raw1 = d1 > 0n ? d1 : 0n;
+      const amount0 = Number(formatUnits(raw0, pool.token0.decimals));
+      const amount1 = Number(formatUnits(raw1, pool.token1.decimals));
+      const feeUsd = pool.state?.sqrtPriceX96
+        ? this.feePairUsdAtSwap(pool, raw0, raw1, pool.state.sqrtPriceX96)
+        : amount0 * this.priceOf(pool.token0.address) + amount1 * this.priceOf(pool.token1.address);
       this.ledger.append('fee.accrual', {
         positionId: position.id,
         poolId: pool.id,
