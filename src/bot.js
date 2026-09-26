@@ -605,6 +605,29 @@ export class AutoLpBot {
       this.ledger.append('rebalance.blocked', { positionId: position.id, reason: 'execution paused', source });
       return { status: 'blocked', reason: 'execution-paused' };
     }
+
+    const minIntervalMs = Math.max(0, Number(this.config.minRebalanceIntervalSec || 0) * 1000);
+    if (minIntervalMs > 0) {
+      const recentForInterval = this.state.recentRebalances(minIntervalMs);
+      const latestSuccessful = recentForInterval.reduce(
+        (latest, entry) => Number(entry.ts || 0) > Number(latest?.ts || 0) ? entry : latest,
+        null
+      );
+      if (latestSuccessful && Date.now() - Number(latestSuccessful.ts) < minIntervalMs) {
+        this.ledger.append('rebalance.blocked', {
+          positionId: position.id,
+          poolId: pool.id,
+          reason: 'global minimum rebalance interval',
+          source,
+          previousPositionId: latestSuccessful.positionId || null,
+          previousPoolId: latestSuccessful.poolId || null,
+          previousRebalanceAt: latestSuccessful.ts,
+          minIntervalSec: this.config.minRebalanceIntervalSec
+        });
+        return { status: 'blocked', reason: 'global-min-rebalance-interval' };
+      }
+    }
+
     if (this.state.recentRebalances().length >= this.config.maxRebalancesPerHour) {
       this.ledger.append('rebalance.blocked', { positionId: position.id, reason: 'hourly rate limit', source });
       return { status: 'blocked', reason: 'hourly-rate-limit' };
