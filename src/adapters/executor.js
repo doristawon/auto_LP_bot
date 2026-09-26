@@ -606,7 +606,9 @@ export class RebalanceExecutor {
     await this.sendVerifiedTx({
       label: `approve:${token.symbol}:hook`,
       to: token.address,
-      data: erc20Interface.encodeFunctionData('approve', [hookAddress, MAX_UINT256]),
+      // Fables deposit amount caps are uint128. Never grant a dynamic hook
+      // more ERC20 allowance than the ABI can actually consume per deposit.
+      data: erc20Interface.encodeFunctionData('approve', [hookAddress, MAX_UINT128]),
       value: 0n
     });
     allowance = BigInt(await tokenContract.allowance(this.config.walletAddress, hookAddress));
