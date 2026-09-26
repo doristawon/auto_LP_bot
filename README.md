@@ -377,8 +377,8 @@ dailyPoints = dailyBudget × userEffectiveFeeUsd / globalEffectiveFeeUsd
 2. **Global denominator 改讀 Uniswap v4 PoolManager `Swap(poolId,...,fee)`**。每筆 swap 都有明確 `poolId`，因此不受 shared Fables hook 影響。
 3. USDG 作為 input 時直接由 USDG input fee 計價；非 USDG token 作 input、USDG 作 output 時，用同一筆 swap 的 realized USDG output 對 fee 估值，不使用之後的現價。
 4. 非 USDG pair 或任何無法可靠估值的 swap 會標成 `unpriced`；只要 denominator coverage 不完整，`estimatedTotal` 直接回 `null`，Dashboard 只顯示 `~provisionalEstimatedTotal`，避免假精準。
-5. `pointsUserTrackingStartedAt` 會記錄 user fee numerator 的連續追蹤起點。若 baseline 早於可靠追蹤起點，狀態會是 `incomplete-user-coverage`。
-6. 每次輸入新的官方 Points 總分時，V2 會把舊 baseline 到新 distribution boundary 的 `predictedDelta` 與官方 `actualDelta` 寫成 `points.reconciliation`，保留誤差 points / % 供後續校正。
+5. `userTrackingStartedAt` 會記錄 Points V2 user-fee numerator 的可靠追蹤起點。完整 `withdrawAndClaim` 會用 **receipt token delta - BigInt exact LP principal - 最後一次已觀察 owed fee** 補入最後一小段尚未被 polling 捕捉的 fee；若遇到無法安全重建的 standalone claim / owed reset，V2 會標記 `incomplete-user-coverage`，不冒充 exact prediction。
+6. 每次輸入新的官方 Points 總分時，V2 會把舊 baseline 到新 distribution boundary 的 `predictedDelta` 與官方 `actualDelta` 寫成 `points.reconciliation`，保留誤差 points / % 供後續校正。新的官方 checkpoint 也會重新建立其後區間的可信 coverage。
 
 Snapshot 主要欄位：
 
