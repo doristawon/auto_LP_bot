@@ -185,3 +185,58 @@ test('bot auto-pauses when executor enters recovery_required after capital moved
   assert.equal(settings.get('executionPaused'), true);
   assert.ok(events.some((x) => x.type === 'rebalance.auto_paused'));
 });
+
+
+test('minimum rebalance interval is global across newly minted range IDs', async () => {
+  const events = [];
+  let executions = 0;
+  const now = Date.now();
+  const bot = {
+    state: {
+      getSetting(key, fallback) {
+        if (key === 'walletTopologyCooldownUntil') return 0;
+        return fallback;
+      },
+      recentRebalances(windowMs) {
+        const previous = {
+          ts: now - 60_000,
+          positionId: '0x' + 'aa'.repeat(32),
+          poolId: '0xprevious'
+        };
+        return Number(windowMs || 0) >= 60_000 ? [previous] : [];
+      }
+    },
+    ledger: { append(type, data) { events.push({ type, data }); } },
+    executionPaused: false,
+    config: {
+      minRebalanceIntervalSec: 300,
+      maxRebalancesPerHour: 3
+    },
+    async assertStillOutOfRangeBeforeRebalance() { return true; },
+    executor: {
+      async execute() {
+        executions++;
+        return { status: 'dry-run' };
+      }
+    }
+  };
+
+  const result = await AutoLpBot.prototype.maybeRebalance.call(
+    bot,
+    { ...pool, id: '0xnewpool', state: { tick: 1200 } },
+    {
+      ...position,
+      id: '0x' + 'bb'.repeat(32),
+      outside: true,
+      shouldRebalance: true
+    }
+  );
+
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.reason, 'global-min-rebalance-interval');
+  assert.equal(executions, 0);
+  assert.ok(events.some((x) =>
+    x.type === 'rebalance.blocked'
+    && x.data.reason === 'global minimum rebalance interval'
+  ));
+});
