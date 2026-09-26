@@ -19,6 +19,7 @@ export function valueSwapFeeInUsd({ pool, swap, usdgAddress }) {
   const rawInput = inputIndex === 0 ? amount0 : amount1;
   const inputToken = inputIndex === 0 ? pool.token0 : pool.token1;
   const feeRaw = rawInput * feePips / FEE_DENOMINATOR;
+  const inputAmount = Number(formatUnits(rawInput, inputToken.decimals));
   const feeAmount = Number(formatUnits(feeRaw, inputToken.decimals));
   const usdg = String(usdgAddress).toLowerCase();
   const token0IsUsdg = String(pool.token0.address).toLowerCase() === usdg;
@@ -31,6 +32,7 @@ export function valueSwapFeeInUsd({ pool, swap, usdgAddress }) {
       inputIndex,
       inputToken: inputToken.address,
       rawInput,
+      inputAmount,
       feeRaw,
       feeAmount,
       feeUsd: Number(formatUnits(feeRaw, inputToken.decimals)),
@@ -44,6 +46,7 @@ export function valueSwapFeeInUsd({ pool, swap, usdgAddress }) {
       inputIndex,
       inputToken: inputToken.address,
       rawInput,
+      inputAmount,
       feeRaw,
       feeAmount
     };
@@ -58,6 +61,7 @@ export function valueSwapFeeInUsd({ pool, swap, usdgAddress }) {
       inputIndex,
       inputToken: inputToken.address,
       rawInput,
+      inputAmount,
       feeRaw,
       feeAmount
     };
@@ -96,6 +100,7 @@ function unpriced(reason, swap, feePips) {
     inputIndex: null,
     inputToken: null,
     rawInput: 0n,
+    inputAmount: 0,
     feeRaw: 0n,
     feeAmount: 0,
     feeUsd: null,
