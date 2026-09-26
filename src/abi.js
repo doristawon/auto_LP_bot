@@ -48,5 +48,6 @@ export const PERMIT2_ABI = [
 
 export const EIP7702_GUARD_ABI = [
   `function guardVersion() view returns(bytes32)`,
+  `function IMPLEMENTATION() view returns(address)`,
   `function guardedWithdrawAndClaim(${POOL_KEY_TUPLE} key,int24 tickLower,int24 tickUpper,uint128 liquidity,address recipient,uint128 amount0Min,uint128 amount1Min,uint256 deadline,uint16 walk)`
 ];

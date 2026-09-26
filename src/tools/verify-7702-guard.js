@@ -1,4 +1,4 @@
-import { Interface } from 'ethers';
+import { Interface, id } from 'ethers';
 import { loadDotEnv } from '../env.js';
 import { loadConfig } from '../config.js';
 import { AutoLpBot } from '../bot.js';
@@ -16,11 +16,25 @@ const expected = ('0xef0100' + config.eip7702GuardAddress.slice(2)).toLowerCase(
 if (code !== expected) throw new Error(`Wallet delegation mismatch: expected ${expected}, got ${code}`);
 
 const iface = new Interface(EIP7702_GUARD_ABI);
-await bot.providers.readProvider.call({
+const versionRaw = await bot.providers.readProvider.call({
   from: config.walletAddress,
   to: config.walletAddress,
   data: iface.encodeFunctionData('guardVersion', [])
 });
+const [version] = iface.decodeFunctionResult('guardVersion', versionRaw);
+const expectedVersion = id('Fables7702Guard/v1');
+if (String(version).toLowerCase() !== expectedVersion.toLowerCase()) {
+  throw new Error(`Guard version mismatch: expected ${expectedVersion}, got ${version}`);
+}
+const implRaw = await bot.providers.readProvider.call({
+  from: config.walletAddress,
+  to: config.walletAddress,
+  data: iface.encodeFunctionData('IMPLEMENTATION', [])
+});
+const [implementation] = iface.decodeFunctionResult('IMPLEMENTATION', implRaw);
+if (String(implementation).toLowerCase() !== config.eip7702GuardAddress.toLowerCase()) {
+  throw new Error(`Guard implementation mismatch: expected ${config.eip7702GuardAddress}, got ${implementation}`);
+}
 
 let candidate = null;
 for (const pool of snapshot.pools || []) {

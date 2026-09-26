@@ -443,6 +443,18 @@ export class RebalanceExecutor {
     if (String(version).toLowerCase() !== expectedVersion.toLowerCase()) {
       throw new Error(`Unexpected EIP-7702 guard version: expected ${expectedVersion}, got ${version}`);
     }
+    const implementationData = guardInterface.encodeFunctionData('IMPLEMENTATION', []);
+    const rawImplementation = await this.readProvider.call({
+      from: this.config.walletAddress,
+      to: this.config.walletAddress,
+      data: implementationData
+    });
+    const [implementation] = guardInterface.decodeFunctionResult('IMPLEMENTATION', rawImplementation);
+    if (String(implementation).toLowerCase() !== this.config.eip7702GuardAddress.toLowerCase()) {
+      throw new Error(
+        `Unexpected EIP-7702 guard implementation: expected ${this.config.eip7702GuardAddress}, got ${implementation}`
+      );
+    }
   }
 
   async assertPlanStillOutOfRange(plan, phase) {

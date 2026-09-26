@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { Interface, Wallet, getAddress } from 'ethers';
+import { Interface, Wallet, getAddress, id } from 'ethers';
 import { loadDotEnv } from '../env.js';
 import { loadConfig } from '../config.js';
 import { createProviders, verifyProviders } from '../rpc/providers.js';
@@ -43,4 +43,27 @@ if (!receipt || receipt.status !== 1) throw new Error('EIP-7702 setup transactio
 const code = (await writeProvider.getCode(wallet.address)).toLowerCase();
 const expected = revoke ? '0x' : ('0xef0100' + guardAddress.slice(2)).toLowerCase();
 if (code !== expected) throw new Error(`Delegation verification failed: expected ${expected}, got ${code}`);
+if (!revoke) {
+  const artifact = JSON.parse(fs.readFileSync('artifacts/Fables7702Guard.json', 'utf8'));
+  const iface = new Interface(artifact.abi);
+  const versionRaw = await writeProvider.call({
+    from: wallet.address,
+    to: wallet.address,
+    data: iface.encodeFunctionData('guardVersion', [])
+  });
+  const [version] = iface.decodeFunctionResult('guardVersion', versionRaw);
+  const expectedVersion = id('Fables7702Guard/v1');
+  if (String(version).toLowerCase() !== expectedVersion.toLowerCase()) {
+    throw new Error(`Guard version mismatch after delegation: expected ${expectedVersion}, got ${version}`);
+  }
+  const implRaw = await writeProvider.call({
+    from: wallet.address,
+    to: wallet.address,
+    data: iface.encodeFunctionData('IMPLEMENTATION', [])
+  });
+  const [implementation] = iface.decodeFunctionResult('IMPLEMENTATION', implRaw);
+  if (String(implementation).toLowerCase() !== guardAddress.toLowerCase()) {
+    throw new Error(`Guard implementation mismatch after delegation: expected ${guardAddress}, got ${implementation}`);
+  }
+}
 console.log(JSON.stringify({ ok: true, wallet: wallet.address, code }, null, 2));
