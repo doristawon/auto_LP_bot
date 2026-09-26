@@ -16,6 +16,11 @@ const output = JSON.parse(solc.compile(JSON.stringify(input)));
 const errors = (output.errors || []).filter((x) => x.severity === 'error');
 if (errors.length) throw new Error(errors.map((x) => x.formattedMessage).join('\n'));
 const contract = output.contracts['Fables7702Guard.sol'].Fables7702Guard;
+const requiredFunctions = new Set(['guardVersion', 'IMPLEMENTATION', 'guardedWithdrawAndClaim']);
+const abiFunctions = new Set(contract.abi.filter((x) => x.type === 'function').map((x) => x.name));
+for (const fn of requiredFunctions) {
+  if (!abiFunctions.has(fn)) throw new Error(`Compiled guard ABI is missing required function: ${fn}`);
+}
 const artifact = {
   contractName: 'Fables7702Guard',
   compiler: solc.version(),
