@@ -32,8 +32,8 @@ test('swap fee valuation is exact when USDG is the input', () => {
     pool,
     usdgAddress: USDG,
     swap: {
-      amount0: 1_000_000_000n,
-      amount1: -500_000_000_000_000_000_000n,
+      amount0: -1_000_000_000n,
+      amount1: 500_000_000_000_000_000_000n,
       fee: 3000
     }
   });
@@ -52,8 +52,8 @@ test('non-USDG input fee is valued from realized USDG output, not a later spot p
     pool,
     usdgAddress: USDG,
     swap: {
-      amount0: 100_000_000_000_000_000_000n,
-      amount1: -199_400_000n,
+      amount0: -100_000_000_000_000_000_000n,
+      amount1: 199_400_000n,
       fee: 3000
     }
   });
@@ -71,7 +71,7 @@ test('non-USDG pools fail closed instead of fabricating denominator USD', () => 
   const value = valueSwapFeeInUsd({
     pool,
     usdgAddress: USDG,
-    swap: { amount0: 10n ** 18n, amount1: -(2n * 10n ** 18n), fee: 3000 }
+    swap: { amount0: -(10n ** 18n), amount1: 2n * 10n ** 18n, fee: 3000 }
   });
   assert.equal(value.priced, false);
   assert.equal(value.reason, 'pool-has-no-usdg-leg');
