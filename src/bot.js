@@ -4,6 +4,7 @@ import { FablesAdapter, lifecycleEventType, lifecycleLiquidity } from './adapter
 import { RebalanceExecutor } from './adapters/executor.js';
 import { V4QuoterAdapter } from './adapters/quoter.js';
 import { buildUsdPriceMap } from './analytics/prices.js';
+import { spotToken1PerToken0 } from './analytics/liquidity.js';
 import { PortfolioAnalytics } from './analytics/portfolio.js';
 import { PointsTracker } from './analytics/points-tracker.js';
 import { valueSwapFeeInUsd } from './analytics/points-accounting.js';
@@ -956,12 +957,21 @@ export class AutoLpBot {
       const kind = lifecycleEventType(entry);
       if (!kind) continue;
       const rangeId = entry.topics?.[2]?.toLowerCase();
-      const eventKey = `lifecycle:${entry.transactionHash}:${Number(entry.index ?? 0)}`;
-      if (this.ledger.seenKeys.has(eventKey)) continue;
+      const logIndex = Number(entry.index ?? 0);
+      const eventKey = `lifecycle:${entry.transactionHash}:${logIndex}`;
+      const feeKey = `points-withdraw-fee:${entry.transactionHash}:${logIndex}`;
+      const needsLifecycle = !this.ledger.seenKeys.has(eventKey);
+      const needsWithdrawalFee = kind === 'withdraw' && !this.ledger.seenKeys.has(feeKey);
+      if (!needsLifecycle && !needsWithdrawalFee) continue;
+
       const ts = await this.blockTimestamp(entry.blockNumber);
-      let gasEth = 0; let gasUsd = 0; let txFrom = null;
+      let gasEth = 0;
+      let gasUsd = 0;
+      let txFrom = null;
+      let receipt = null;
+      let tx = null;
       try {
-        const [receipt, tx] = await Promise.all([
+        [receipt, tx] = await Promise.all([
           this.providers.readProvider.getTransactionReceipt(entry.transactionHash),
           this.providers.readProvider.getTransaction(entry.transactionHash)
         ]);
@@ -972,18 +982,202 @@ export class AutoLpBot {
           gasUsd = gasEth * this.priceOf(ZERO_ADDRESS);
         }
       } catch {}
-      this.ledger.appendUnique(eventKey, `lp.${kind}`, {
-        poolId: pool.id,
-        pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
-        positionId: rangeId,
-        hash: entry.transactionHash,
-        blockNumber: entry.blockNumber,
-        liquidity: lifecycleLiquidity(entry).toString(),
-        txFrom,
-        gasEth,
-        gasUsd
-      }, ts);
+
+      if (needsLifecycle) {
+        this.ledger.appendUnique(eventKey, `lp.${kind}`, {
+          poolId: pool.id,
+          pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+          positionId: rangeId,
+          hash: entry.transactionHash,
+          blockNumber: entry.blockNumber,
+          liquidity: lifecycleLiquidity(entry).toString(),
+          txFrom,
+          gasEth,
+          gasUsd
+        }, ts);
+      }
+
+      if (needsWithdrawalFee) {
+        const result = this.reconcileWithdrawalUserFees(pool, rangeId, entry, receipt, tx, ts);
+        this.ledger.appendUnique(
+          feeKey,
+          result.ok ? 'points.withdraw_fee_reconciled' : 'points.withdraw_fee_unresolved',
+          {
+            poolId: pool.id,
+            pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+            positionId: rangeId,
+            hash: entry.transactionHash,
+            blockNumber: Number(entry.blockNumber),
+            logIndex,
+            ...result
+          },
+          ts
+        );
+        if (!result.ok && ts >= this.points.predictionStartMs(Date.now())) {
+          this.points.markUserCoverageBroken(ts, 'withdraw-fee-unresolved', {
+            poolId: pool.id,
+            positionId: rangeId,
+            hash: entry.transactionHash,
+            detail: result.reason || 'unknown'
+          });
+        }
+      }
     }
+  }
+
+  reconcileWithdrawalUserFees(pool, rangeId, entry, receipt, tx, ts) {
+    if (!rangeId || !receipt || !tx) return { ok: false, reason: 'missing-withdrawal-receipt-or-transaction' };
+    let decoded;
+    try { decoded = hookInterface.parseTransaction({ data: tx.data, value: tx.value }); }
+    catch { return { ok: false, reason: 'withdrawal-calldata-decode-failed' }; }
+    if (!decoded || decoded.name !== 'withdrawAndClaim') {
+      return { ok: false, reason: `unsupported-withdrawal-call:${decoded?.name || 'unknown'}` };
+    }
+
+    const preSwap = this.lastPointSwapBefore(pool.id, Number(entry.blockNumber), Number(entry.index ?? 0));
+    if (!preSwap?.sqrtPriceX96) return { ok: false, reason: 'missing-pre-withdraw-swap-state' };
+
+    let principal;
+    try {
+      principal = buildExactWithdrawBounds({
+        sqrtPriceX96: BigInt(preSwap.sqrtPriceX96),
+        tickLower: Number(decoded.args[1]),
+        tickUpper: Number(decoded.args[2]),
+        liquidity: BigInt(decoded.args[3]),
+        slippageBps: 0
+      });
+    } catch (error) {
+      return { ok: false, reason: `principal-reconstruction-failed:${error.message}` };
+    }
+
+    const actual = this.receiptWalletDeltasForPool(receipt, pool);
+    if (!actual) return { ok: false, reason: 'unsupported-native-token-withdrawal' };
+    const claimed0 = actual.raw0 > principal.expected0 ? actual.raw0 - principal.expected0 : 0n;
+    const claimed1 = actual.raw1 > principal.expected1 ? actual.raw1 - principal.expected1 : 0n;
+
+    const feeStateKey = `feeState:${pool.id.toLowerCase()}:${rangeId.toLowerCase()}`;
+    const previous = this.state.getSetting(feeStateKey, null);
+    if (!previous) return { ok: false, reason: 'missing-pre-withdraw-user-fee-state' };
+
+    const previousOwed0 = BigInt(previous.owed0 || 0);
+    const previousOwed1 = BigInt(previous.owed1 || 0);
+    const tolerance = 2n;
+    if (claimed0 + tolerance < previousOwed0 || claimed1 + tolerance < previousOwed1) {
+      return {
+        ok: false,
+        reason: 'reconstructed-claim-below-last-observed-owed',
+        claimed0: claimed0.toString(),
+        claimed1: claimed1.toString(),
+        previousOwed0: previousOwed0.toString(),
+        previousOwed1: previousOwed1.toString()
+      };
+    }
+
+    const unseen0 = claimed0 > previousOwed0 ? claimed0 - previousOwed0 : 0n;
+    const unseen1 = claimed1 > previousOwed1 ? claimed1 - previousOwed1 : 0n;
+    const feeUsd = this.feePairUsdAtSwap(pool, unseen0, unseen1, BigInt(preSwap.sqrtPriceX96));
+
+    if (unseen0 > 0n || unseen1 > 0n) {
+      this.ledger.appendUnique(
+        `points-user-fee-adjust:${entry.transactionHash}:${Number(entry.index ?? 0)}`,
+        'points.user_fee_adjustment',
+        {
+          poolId: pool.id,
+          pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+          positionId: rangeId,
+          hash: entry.transactionHash,
+          blockNumber: Number(entry.blockNumber),
+          amount0: Number(formatUnits(unseen0, pool.token0.decimals)),
+          amount1: Number(formatUnits(unseen1, pool.token1.decimals)),
+          symbol0: pool.token0.symbol,
+          symbol1: pool.token1.symbol,
+          feeUsd,
+          reason: 'withdrawAndClaim receipt minus exact principal minus last observed owed'
+        },
+        ts
+      );
+    }
+
+    this.state.setSetting(feeStateKey, {
+      owed0: '0',
+      owed1: '0',
+      shares: '0',
+      at: ts
+    });
+
+    return {
+      ok: true,
+      preSwapBlock: preSwap.blockNumber,
+      principal0: principal.expected0.toString(),
+      principal1: principal.expected1.toString(),
+      claimed0: claimed0.toString(),
+      claimed1: claimed1.toString(),
+      previousOwed0: previousOwed0.toString(),
+      previousOwed1: previousOwed1.toString(),
+      unseen0: unseen0.toString(),
+      unseen1: unseen1.toString(),
+      feeUsd
+    };
+  }
+
+  lastPointSwapBefore(poolId, blockNumber, logIndex) {
+    const rows = this.ledger.all();
+    for (let i = rows.length - 1; i >= 0; i -= 1) {
+      const event = rows[i];
+      if (event.type !== 'points.global_swap_fee') continue;
+      if (String(event.poolId).toLowerCase() !== String(poolId).toLowerCase()) continue;
+      const eventBlock = Number(event.blockNumber || 0);
+      const eventIndex = Number(event.logIndex || 0);
+      if (eventBlock < blockNumber || (eventBlock === blockNumber && eventIndex < logIndex)) return event;
+    }
+    return null;
+  }
+
+  receiptWalletDeltasForPool(receipt, pool) {
+    if (
+      pool.token0.address.toLowerCase() === ZERO_ADDRESS
+      || pool.token1.address.toLowerCase() === ZERO_ADDRESS
+    ) return null;
+    const wallet = this.config.walletAddress.toLowerCase();
+    const totals = new Map([
+      [pool.token0.address.toLowerCase(), 0n],
+      [pool.token1.address.toLowerCase(), 0n]
+    ]);
+    for (const item of receipt.logs || []) {
+      if (String(item.topics?.[0] || '').toLowerCase() !== transferTopic) continue;
+      const token = String(item.address || '').toLowerCase();
+      if (!totals.has(token)) continue;
+      const from = topicAddress(item.topics?.[1]);
+      const to = topicAddress(item.topics?.[2]);
+      const amount = BigInt(item.data || 0);
+      let delta = totals.get(token) || 0n;
+      if (from === wallet) delta -= amount;
+      if (to === wallet) delta += amount;
+      totals.set(token, delta);
+    }
+    const raw0 = totals.get(pool.token0.address.toLowerCase()) || 0n;
+    const raw1 = totals.get(pool.token1.address.toLowerCase()) || 0n;
+    return {
+      raw0: raw0 > 0n ? raw0 : 0n,
+      raw1: raw1 > 0n ? raw1 : 0n
+    };
+  }
+
+  feePairUsdAtSwap(pool, raw0, raw1, sqrtPriceX96) {
+    const amount0 = Number(formatUnits(raw0, pool.token0.decimals));
+    const amount1 = Number(formatUnits(raw1, pool.token1.decimals));
+    const usdg = this.config.usdgAddress.toLowerCase();
+    const k0 = pool.token0.address.toLowerCase();
+    const k1 = pool.token1.address.toLowerCase();
+    if (k0 === usdg) {
+      const spot = spotToken1PerToken0(sqrtPriceX96, pool.token0.decimals, pool.token1.decimals);
+      return amount0 + (spot > 0 ? amount1 / spot : 0);
+    }
+    if (k1 === usdg) {
+      const spot = spotToken1PerToken0(sqrtPriceX96, pool.token0.decimals, pool.token1.decimals);
+      return amount1 + amount0 * spot;
+    }
+    return amount0 * this.priceOf(pool.token0.address) + amount1 * this.priceOf(pool.token1.address);
   }
 
   async blockTimestamp(blockNumber) {
