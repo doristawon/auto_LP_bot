@@ -126,3 +126,13 @@ test('dashboard resume returns conflict when bot recovery lock refuses resume', 
     assert.match(body.error, /Cannot resume while rebalance execution requires review/);
   });
 });
+
+
+test('dashboard scan returns conflict instead of stale success while bot cycle is busy', async () => {
+  await withServer(async ({ bot, calls }, base) => {
+    bot.cycleActive = true;
+    const response = await fetch(base + '/api/control/scan', { method: 'POST' });
+    assert.equal(response.status, 409);
+    assert.equal(calls.scans.length, 0);
+  });
+});
