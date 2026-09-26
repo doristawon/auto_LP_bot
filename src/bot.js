@@ -252,7 +252,7 @@ export class AutoLpBot {
         generatedAt: Date.now(),
         blockNumber: latestBlock,
         bot: {
-          version: '0.5.0',
+          version: '0.5.1',
           wallet: this.config.walletAddress,
           dryRun: this.config.dryRun,
           liveWrites: this.config.enableLiveWrites,
