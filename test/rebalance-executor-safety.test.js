@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AutoLpBot } from '../src/bot.js';
+import { id } from 'ethers';
 import { RebalanceExecutor } from '../src/adapters/executor.js';
 
 const pool = {
@@ -96,5 +97,63 @@ test('unfinished capital-moving journal blocks another automatic rebalance', () 
   assert.throws(
     () => executor.assertNoUnfinishedExecution(),
     /Unfinished rebalance execution requires recovery/
+  );
+});
+
+
+test('atomic guard readiness rejects a delegated contract with the wrong guardVersion', async () => {
+  const executor = Object.create(RebalanceExecutor.prototype);
+  executor.config = {
+    walletAddress: '0x00000000000000000000000000000000000000aa',
+    eip7702GuardAddress: '0x00000000000000000000000000000000000000bb'
+  };
+  executor.readProvider = {
+    async getCode() {
+      return '0xef0100' + executor.config.eip7702GuardAddress.slice(2).toLowerCase();
+    },
+    async call() {
+      return id('SomeOtherGuard/v1');
+    }
+  };
+  await assert.rejects(
+    RebalanceExecutor.prototype.assertAtomicGuardReady.call(executor),
+    /Unexpected EIP-7702 guard version/
+  );
+});
+
+test('exact-input receipt rejects any over-spend as well as under-spend', () => {
+  const executor = Object.create(RebalanceExecutor.prototype);
+  const swapPlan = {
+    tokenIn: 0,
+    tokenOut: 1,
+    rawAmountIn: 100n,
+    quote: { minRawAmountOut: '90' }
+  };
+  assert.throws(
+    () => executor.assertSwapReceiptBalances(
+      {},
+      swapPlan,
+      { raw0: 1000n, raw1: 0n },
+      { raw0: 899n, raw1: 95n }
+    ),
+    /input mismatch/
+  );
+});
+
+test('exact-input receipt accepts exact spend and output above minOut', () => {
+  const executor = Object.create(RebalanceExecutor.prototype);
+  const swapPlan = {
+    tokenIn: 0,
+    tokenOut: 1,
+    rawAmountIn: 100n,
+    quote: { minRawAmountOut: '90' }
+  };
+  assert.doesNotThrow(
+    () => executor.assertSwapReceiptBalances(
+      {},
+      swapPlan,
+      { raw0: 1000n, raw1: 0n },
+      { raw0: 900n, raw1: 95n }
+    )
   );
 });
