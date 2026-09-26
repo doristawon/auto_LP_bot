@@ -1,4 +1,4 @@
-import { formatUnits } from 'ethers';
+import { Interface, formatUnits, id } from 'ethers';
 import { createProviders, verifyProviders } from './rpc/providers.js';
 import { FablesAdapter, lifecycleEventType, lifecycleLiquidity } from './adapters/fables.js';
 import { RebalanceExecutor } from './adapters/executor.js';
@@ -13,7 +13,12 @@ import { LedgerStore } from './ledger.js';
 import { StateStore } from './state.js';
 import { ZERO_ADDRESS } from './constants.js';
 import { isLpOutOfRange } from './math/ticks.js';
+import { buildExactWithdrawBounds } from './math/v4-fixed.js';
+import { HOOK_ABI } from './abi.js';
 import { log } from './logger.js';
+
+const hookInterface = new Interface(HOOK_ABI);
+const transferTopic = id('Transfer(address,address,uint256)').toLowerCase();
 
 export class AutoLpBot {
   constructor(config) {
