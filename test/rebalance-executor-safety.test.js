@@ -157,3 +157,31 @@ test('exact-input receipt accepts exact spend and output above minOut', () => {
     )
   );
 });
+
+
+test('bot auto-pauses when executor enters recovery_required after capital moved', async () => {
+  const settings = new Map([['activeRebalanceExecution', { id: 'exec-recovery', phase: 'recovery_required' }]]);
+  const events = [];
+  const bot = {
+    state: {
+      getSetting(key, fallback) { return settings.has(key) ? settings.get(key) : fallback; },
+      setSetting(key, value) { settings.set(key, value); },
+      recentRebalances() { return []; }
+    },
+    ledger: { append(type, data) { events.push({ type, data }); } },
+    executionPaused: false,
+    config: { maxRebalancesPerHour: 3, minRebalanceIntervalSec: 300 },
+    async assertStillOutOfRangeBeforeRebalance() { return true; },
+    executor: { async execute() { throw new Error('post-withdraw failure'); } },
+    setExecutionPaused(value, source) {
+      this.executionPaused = Boolean(value);
+      this.state.setSetting('executionPaused', this.executionPaused);
+      events.push({ type: 'execution.control', source, paused: this.executionPaused });
+    }
+  };
+
+  await AutoLpBot.prototype.maybeRebalance.call(bot, pool, { ...position });
+  assert.equal(bot.executionPaused, true);
+  assert.equal(settings.get('executionPaused'), true);
+  assert.ok(events.some((x) => x.type === 'rebalance.auto_paused'));
+});
