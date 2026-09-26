@@ -56,6 +56,111 @@ export class AutoLpBot {
     log('warn', 'execution.control', { paused: this.executionPaused, source });
   }
 
+  async controlStatus() {
+    const activeExecution = this.state.getSetting('activeRebalanceExecution', null);
+    const signerConfigured = Boolean(this.config.privateKey);
+    const guardConfigured = Boolean(this.config.eip7702GuardAddress);
+    const guardVerifiedFlag = Boolean(this.config.eip7702GuardVerified);
+    let guardRuntimeReady = false;
+    let guardError = null;
+    if (guardConfigured && guardVerifiedFlag) {
+      try {
+        await this.executor.assertAtomicGuardReady();
+        guardRuntimeReady = true;
+      } catch (error) {
+        guardError = error.shortMessage || error.message;
+      }
+    }
+    const topologyCooldownUntil = Number(this.state.getSetting('walletTopologyCooldownUntil', 0) || 0);
+    const recoveryRequired = activeExecution?.phase === 'recovery_required';
+    const liveReady = !this.config.dryRun
+      && this.config.enableLiveWrites
+      && this.config.enableAutoRedeploy
+      && signerConfigured
+      && guardConfigured
+      && guardVerifiedFlag
+      && guardRuntimeReady
+      && !this.executionPaused
+      && !recoveryRequired;
+
+    return {
+      generatedAt: Date.now(),
+      mode: this.config.dryRun ? 'dry-run' : 'live',
+      dryRun: this.config.dryRun,
+      liveWrites: this.config.enableLiveWrites,
+      autoRedeploy: this.config.enableAutoRedeploy,
+      executionPaused: this.executionPaused,
+      cycleActive: this.cycleActive,
+      signerConfigured,
+      guard: {
+        address: this.config.eip7702GuardAddress || null,
+        configured: guardConfigured,
+        verifiedFlag: guardVerifiedFlag,
+        runtimeReady: guardRuntimeReady,
+        error: guardError
+      },
+      activeRebalanceExecution: activeExecution,
+      recoveryRequired,
+      topologyCooldownUntil,
+      liveReady,
+      limits: {
+        maxGasGwei: this.config.maxGasGwei,
+        withdrawSlippageBps: this.config.withdrawSlippageBps,
+        swapSlippageBps: this.config.swapSlippageBps,
+        depositSlippageBps: this.config.depositSlippageBps,
+        minRebalanceIntervalSec: this.config.minRebalanceIntervalSec,
+        maxRebalancesPerHour: this.config.maxRebalancesPerHour
+      },
+      strategy: {
+        absoluteInRangeHold: true,
+        tightWidthBps: this.config.tightWidthBps,
+        ...rangePolicySnapshot(this.config)
+      }
+    };
+  }
+
+  async manualRebalance(poolId, positionId, source = 'dashboard') {
+    poolId = String(poolId || '').toLowerCase();
+    positionId = String(positionId || '').toLowerCase();
+    if (!/^0x[0-9a-f]{64}$/.test(poolId)) throw new Error('Invalid poolId');
+    if (!/^0x[0-9a-f]{64}$/.test(positionId)) throw new Error('Invalid positionId');
+    if (this.cycleActive) throw new Error('A monitoring/execution cycle is already running');
+    if (this.executionPaused) throw new Error('Execution is paused; resume before manual rebalance');
+
+    const snapshot = await this.runOnce({ executeRebalances: false, source: 'manual-preflight' });
+    if (this.cycleActive) throw new Error('Monitoring cycle did not release execution lock');
+
+    const activePoolIds = new Set((snapshot?.bot?.activePoolIds || []).map((x) => String(x).toLowerCase()));
+    if (!activePoolIds.has(poolId)) throw new Error('Requested pool is not an active wallet LP pool');
+
+    const pool = this.market.pools.find((x) => String(x.id).toLowerCase() === poolId);
+    const position = pool?.positions?.find((x) => String(x.id).toLowerCase() === positionId);
+    if (!pool || !position) throw new Error('Requested LP position is not active after fresh chain scan');
+    if (position.outside !== true) throw new Error('Absolute in-range hold: manual withdrawal is forbidden while LP is in range');
+    if (position.shouldRebalance !== true) {
+      throw new Error('Position is OOR but has not satisfied the configured rebalance policy yet');
+    }
+
+    this.cycleActive = true;
+    try {
+      if (this.config.targetMode === 'wallet-active') {
+        const stable = await this.revalidateTopologyBeforeExecution(snapshot.blockNumber, [{ pool, position }]);
+        if (!stable) throw new Error('Wallet LP topology changed during manual preflight');
+      }
+      this.ledger.append('rebalance.manual_requested', {
+        source,
+        poolId: pool.id,
+        positionId: position.id,
+        pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+        dryRun: this.config.dryRun
+      });
+      const result = await this.maybeRebalance(pool, position, { source, throwOnFailure: true });
+      return result || { status: 'blocked', reason: 'manual rebalance was blocked by a safety gate' };
+    } finally {
+      this.cycleActive = false;
+    }
+  }
+
   async refreshMarket(force = false) {
     if (!force && Date.now() - this.market.refreshedAt < this.config.marketRefreshMs) return this.market;
     const latestBlock = await this.providers.readProvider.getBlockNumber();
@@ -74,7 +179,8 @@ export class AutoLpBot {
     return this.market;
   }
 
-  async runOnce() {
+  async runOnce(options = {}) {
+    const executeRebalances = options.executeRebalances !== false;
     if (this.cycleActive) {
       log('warn', 'cycle.skipped', { reason: 'previous cycle still running' });
       return this.snapshot;
@@ -130,7 +236,7 @@ export class AutoLpBot {
         generatedAt: Date.now(),
         blockNumber: latestBlock,
         bot: {
-          version: '0.4.0',
+          version: '0.5.0',
           wallet: this.config.walletAddress,
           dryRun: this.config.dryRun,
           liveWrites: this.config.enableLiveWrites,
@@ -163,6 +269,7 @@ export class AutoLpBot {
           .filter((position) => position.outside === true && position.shouldRebalance === true)
           .map((position) => ({ pool, position }))
       );
+      if (!executeRebalances) return snapshot;
       if (pendingRebalances.length && this.config.targetMode === 'wallet-active') {
         const stable = await this.revalidateTopologyBeforeExecution(latestBlock, pendingRebalances);
         if (!stable) return snapshot;
@@ -454,7 +561,9 @@ export class AutoLpBot {
     }
   }
 
-  async maybeRebalance(pool, position) {
+  async maybeRebalance(pool, position, options = {}) {
+    const source = options.source || 'automatic';
+    const throwOnFailure = Boolean(options.throwOnFailure);
     // ABSOLUTE RULE: never auto-withdraw an LP that is currently in its original range.
     // Re-read the chain immediately before any executor path is allowed to proceed.
     if (position.outside !== true || position.shouldRebalance !== true) {
@@ -463,9 +572,11 @@ export class AutoLpBot {
         poolId: pool.id,
         reason: 'absolute in-range hold / position not OOR-eligible'
       });
-      return;
+      return { status: 'blocked', reason: 'position-not-oor-eligible' };
     }
-    if (!(await this.assertStillOutOfRangeBeforeRebalance(pool, position))) return;
+    if (!(await this.assertStillOutOfRangeBeforeRebalance(pool, position))) {
+      return { status: 'blocked', reason: 'latest-chain-state-not-eligible' };
+    }
 
     const topologyCooldownUntil = Number(this.state.getSetting('walletTopologyCooldownUntil', 0) || 0);
     if (Date.now() < topologyCooldownUntil) {
@@ -475,15 +586,15 @@ export class AutoLpBot {
         reason: 'wallet topology cooldown',
         cooldownUntil: topologyCooldownUntil
       });
-      return;
+      return { status: 'blocked', reason: 'wallet-topology-cooldown' };
     }
     if (this.executionPaused) {
-      this.ledger.append('rebalance.blocked', { positionId: position.id, reason: 'execution paused' });
-      return;
+      this.ledger.append('rebalance.blocked', { positionId: position.id, reason: 'execution paused', source });
+      return { status: 'blocked', reason: 'execution-paused' };
     }
     if (this.state.recentRebalances().length >= this.config.maxRebalancesPerHour) {
-      this.ledger.append('rebalance.blocked', { positionId: position.id, reason: 'hourly rate limit' });
-      return;
+      this.ledger.append('rebalance.blocked', { positionId: position.id, reason: 'hourly rate limit', source });
+      return { status: 'blocked', reason: 'hourly-rate-limit' };
     }
     const plan = {
       pool,
@@ -505,7 +616,7 @@ export class AutoLpBot {
           'lastAction',
           `dry-run ${pool.token0.symbol}/${pool.token1.symbol} ${position.id.slice(0, 10)}…`
         );
-        return;
+        return result;
       }
 
       // Only a fully completed state machine may commit a rebalance to strategy state.
@@ -516,7 +627,7 @@ export class AutoLpBot {
           status: result.status,
           reason: 'executor did not report a fully completed withdraw-swap-deposit cycle'
         });
-        return;
+        return result;
       }
 
       const cooldownUntil = Date.now() + this.config.minRebalanceIntervalSec * 1000;
@@ -535,6 +646,7 @@ export class AutoLpBot {
         'lastAction',
         `completed ${pool.token0.symbol}/${pool.token1.symbol} ${position.id.slice(0, 10)}…`
       );
+      return result;
     } catch (error) {
       this.ledger.append('rebalance.failed', { positionId: position.id, poolId: pool.id, error: error.message });
       const activeExecution = this.state.getSetting('activeRebalanceExecution', null);
@@ -547,7 +659,9 @@ export class AutoLpBot {
           reason: 'capital moved but execution did not complete'
         });
       }
-      log('error', 'rebalance.failed', { positionId: position.id, error: error.message });
+      log('error', 'rebalance.failed', { positionId: position.id, error: error.message, source });
+      if (throwOnFailure) throw error;
+      return { status: 'failed', error: error.message };
     }
   }
 
