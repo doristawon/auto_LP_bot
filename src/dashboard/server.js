@@ -65,6 +65,9 @@ export class DashboardServer {
       }
     }
     if (req.method === 'POST' && url.pathname === '/api/control/scan') {
+      if (this.bot.cycleActive) {
+        return sendJson(res, 409, { error: 'monitoring/execution cycle is already running' });
+      }
       const snapshot = await this.bot.runOnce({ executeRebalances: false, source: 'dashboard-scan' });
       return sendJson(res, 200, {
         ok: true,
