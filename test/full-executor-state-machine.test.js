@@ -36,7 +36,8 @@ function createHarness({ failSwap = false } = {}) {
   const balances = [
     { raw0: 10_000_000_000_000_000_000n, raw1: 10_000_000_000_000_000_000n },
     { raw0: 110_000_000_000_000_000_000n, raw1: 10_000_000_000_000_000_000n },
-    { raw0: 50_000_000_000_000_000_000n, raw1: 70_000_000_000_000_000_000n }
+    // Exact-input mock: executor asks to swap 52.747082710266113281 T0 at 1:1.
+    { raw0: 57_252_917_289_733_886_719n, raw1: 62_747_082_710_266_113_281n }
   ];
   let balanceIndex = 0;
   const state = {
