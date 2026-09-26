@@ -82,7 +82,7 @@ test('points v2 predicts from fee share when denominator and user coverage are c
   const state = fakeState({
     actualPointsBaseline: 1000,
     actualPointsBaselineAt: new Date(day).toISOString(),
-    pointsUserTrackingStartedAt: day
+    pointsUserTrackingStartedAtV2: day
   });
   const ledger = fakeLedger([
     event(day + 60_000, 'fee.accrual', { feeUsd: 10 }),
@@ -102,7 +102,7 @@ test('points v2 refuses exact prediction if any global swap is unpriced', () => 
   const state = fakeState({
     actualPointsBaseline: 1000,
     actualPointsBaselineAt: new Date(day).toISOString(),
-    pointsUserTrackingStartedAt: day
+    pointsUserTrackingStartedAtV2: day
   });
   const ledger = fakeLedger([
     event(day + 60_000, 'fee.accrual', { feeUsd: 10 }),
@@ -122,7 +122,7 @@ test('official checkpoint reconciles the previous completed campaign day', () =>
   const state = fakeState({
     actualPointsBaseline: 50_000,
     actualPointsBaselineAt: new Date(day1).toISOString(),
-    pointsUserTrackingStartedAt: day1
+    pointsUserTrackingStartedAtV2: day1
   });
   const ledger = fakeLedger([
     event(day1 + 60_000, 'fee.accrual', { feeUsd: 1 }),
