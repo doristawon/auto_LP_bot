@@ -584,6 +584,10 @@ export class AutoLpBot {
         currentOwed1: position.owed1.toString(),
         note: 'Claim, withdraw, checkpoint, or accounting reset detected'
       });
+      this.points.markUserCoverageBroken(Date.now(), 'active-position-owed-decrease', {
+        poolId: pool.id,
+        positionId: position.id
+      });
     }
   }
 
@@ -1255,6 +1259,11 @@ function rangePolicySnapshot(config) {
     deepConfirmationsRequired: config.oorDeepConfirmations,
     monitorPollIntervalMs: config.pollIntervalMs
   };
+}
+
+function topicAddress(value) {
+  const raw = String(value || '').toLowerCase();
+  return /^0x[0-9a-f]{64}$/.test(raw) ? `0x${raw.slice(-40)}` : null;
 }
 
 function emptyPortfolio() {
