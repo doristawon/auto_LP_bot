@@ -1,2 +1,2 @@
-requested=2026-09-26T11:25:00+08:00
-reason=real-lifecycle-replay-v04
+requested=2026-09-26T11:29:00+08:00
+reason=rerun-after-package-json-fix
