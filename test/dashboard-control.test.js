@@ -136,3 +136,41 @@ test('dashboard scan returns conflict instead of stale success while bot cycle i
     assert.equal(calls.scans.length, 0);
   });
 });
+
+
+test('dashboard requires token when manual capital control is armed even on loopback', async () => {
+  const h = makeHarness();
+  h.config.dashboardManualControlEnabled = true;
+  await assert.rejects(
+    h.server.start(),
+    /DASHBOARD_TOKEN is required whenever live writes or dashboard manual control is enabled/
+  );
+});
+
+test('dashboard requires token when live writes are enabled even on loopback', async () => {
+  const h = makeHarness();
+  h.config.enableLiveWrites = true;
+  await assert.rejects(
+    h.server.start(),
+    /DASHBOARD_TOKEN is required whenever live writes or dashboard manual control is enabled/
+  );
+});
+
+test('dashboard allows sensitive loopback controls when token is configured', async () => {
+  const h = makeHarness();
+  h.config.dashboardManualControlEnabled = true;
+  h.config.dashboardToken = 'test-secret';
+  await h.server.start();
+  try {
+    const address = h.server.server.address();
+    const base = 'http://127.0.0.1:' + address.port;
+    const unauthorized = await fetch(base + '/api/control/status');
+    assert.equal(unauthorized.status, 401);
+    const authorized = await fetch(base + '/api/control/status', {
+      headers: { 'x-dashboard-token': 'test-secret' }
+    });
+    assert.equal(authorized.status, 200);
+  } finally {
+    await h.server.stop();
+  }
+});
