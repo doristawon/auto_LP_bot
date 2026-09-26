@@ -6,6 +6,7 @@ import { V4QuoterAdapter } from './adapters/quoter.js';
 import { buildUsdPriceMap } from './analytics/prices.js';
 import { PortfolioAnalytics } from './analytics/portfolio.js';
 import { PointsTracker } from './analytics/points-tracker.js';
+import { valueSwapFeeInUsd } from './analytics/points-accounting.js';
 import { buildDepositPlan } from './analytics/rebalance-plan.js';
 import { evaluatePosition, outOfRangeExcursionPct } from './strategy.js';
 import { LedgerStore } from './ledger.js';
@@ -181,7 +182,7 @@ export class AutoLpBot {
     const pools = await this.fables.hydratePoolStates(discovered);
     const prices = buildUsdPriceMap(pools, this.config.usdgAddress);
     this.market = { refreshedAt: Date.now(), pools, prices, latestBlock };
-    await this.scanGlobalPoolFees(pools, latestBlock);
+    await this.scanGlobalPointFees(pools, latestBlock);
     log('info', 'market.refreshed', {
       block: latestBlock,
       pools: pools.length,
@@ -216,6 +217,8 @@ export class AutoLpBot {
           accountingPools: accountingPools.map((pool) => pool.id)
         });
       }
+
+      this.points.noteUserTrackingStarted(Date.now());
 
       for (const pool of targetPools) {
         pool.state = await this.fables.readPoolState(pool);
@@ -780,6 +783,102 @@ export class AutoLpBot {
       range: [position.tickLower, position.tickUpper]
     });
     return false;
+  }
+
+  async scanGlobalPointFees(pools, latestBlock) {
+    const desiredStartMs = this.points.predictionStartMs(Date.now());
+    const previousStartMs = Number(this.state.getSetting('pointsGlobalSwapScanStartMs', 0) || 0);
+    if (previousStartMs && desiredStartMs < previousStartMs) {
+      // A user moved the official baseline backwards. Re-open the cursor so the
+      // missing earlier campaign interval is backfilled; appendUnique keeps
+      // already-known swaps idempotent.
+      this.state.setCursor('pointsGlobalSwapsV2', 0);
+    }
+    this.state.setSetting('pointsGlobalSwapScanStartMs', desiredStartMs);
+
+    const startBlock = await this.blockAtOrAfterTimestamp(desiredStartMs, latestBlock);
+    const storedCursor = this.state.getCursor('pointsGlobalSwapsV2', 0);
+    const fromBlock = storedCursor > 0
+      ? Math.max(startBlock, storedCursor - this.config.reorgLookbackBlocks)
+      : startBlock;
+    if (fromBlock > latestBlock) return;
+
+    let swaps;
+    try {
+      swaps = await this.fables.scanGlobalSwaps(pools, fromBlock, latestBlock);
+    } catch (error) {
+      log('warn', 'points.global_swap_scan_failed', {
+        fromBlock,
+        latestBlock,
+        error: error.message
+      });
+      return;
+    }
+
+    let priced = 0;
+    let unpriced = 0;
+    for (const swap of swaps) {
+      const valuation = valueSwapFeeInUsd({
+        pool: swap.pool,
+        swap,
+        usdgAddress: this.config.usdgAddress
+      });
+      const ts = await this.blockTimestamp(swap.blockNumber);
+      if (valuation.priced) priced += 1;
+      else unpriced += 1;
+      this.ledger.appendUnique(
+        `points-swap:${swap.transactionHash}:${swap.index}`,
+        'points.global_swap_fee',
+        {
+          poolId: swap.poolId,
+          pair: `${swap.pool.token0.symbol}/${swap.pool.token1.symbol}`,
+          hash: swap.transactionHash,
+          blockNumber: swap.blockNumber,
+          logIndex: swap.index,
+          feePips: swap.fee,
+          priced: valuation.priced,
+          valuation: valuation.valuation || null,
+          reason: valuation.reason || null,
+          inputToken: valuation.inputToken,
+          inputAmount: valuation.rawInput > 0n && valuation.inputToken
+            ? valuation.feeAmount * 1_000_000 / Math.max(1, valuation.feePips)
+            : null,
+          feeAmount: valuation.feeAmount,
+          feeUsd: valuation.feeUsd
+        },
+        ts
+      );
+    }
+    this.state.setCursor('pointsGlobalSwapsV2', latestBlock + 1);
+    this.ledger.append('points.global_scan', {
+      fromBlock,
+      latestBlock,
+      swaps: swaps.length,
+      priced,
+      unpriced,
+      desiredStartAt: new Date(desiredStartMs).toISOString()
+    });
+  }
+
+  async blockAtOrAfterTimestamp(timestampMs, latestBlock) {
+    const cacheKey = `pointsBlockAtOrAfter:${timestampMs}`;
+    const cached = Number(this.state.getSetting(cacheKey, 0) || 0);
+    if (cached > 0 && cached <= latestBlock) return cached;
+
+    let low = 0;
+    let high = latestBlock;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      const block = await this.providers.readProvider.getBlock(mid);
+      if (!block) {
+        low = mid + 1;
+        continue;
+      }
+      if (Number(block.timestamp) * 1000 < timestampMs) low = mid + 1;
+      else high = mid;
+    }
+    this.state.setSetting(cacheKey, low);
+    return low;
   }
 
   async scanGlobalPoolFees(pools, latestBlock) {
