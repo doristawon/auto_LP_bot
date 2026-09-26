@@ -26,7 +26,9 @@ const hookInterface = new Interface(HOOK_ABI);
 const depositedTopic = eventId(DEPOSITED_EVENT);
 const withdrawnTopic = eventId(WITHDRAWN_EVENT);
 const feesTopic = eventId(FEES_COLLECTED_EVENT);
-const swapInterface = new Interface([`event ${V4_SWAP_EVENT}`]);
+const swapInterface = new Interface([
+  'event Swap(bytes32 indexed id,address indexed sender,int128 amount0,int128 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint24 fee)'
+]);
 const swapTopic = eventId(V4_SWAP_EVENT);
 
 export class FablesAdapter {
