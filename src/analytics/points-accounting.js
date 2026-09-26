@@ -85,6 +85,7 @@ export function valueSwapFeeInUsd({ pool, swap, usdgAddress }) {
     inputIndex,
     inputToken: inputToken.address,
     rawInput,
+    inputAmount,
     feeRaw,
     feeAmount,
     feeUsd,
