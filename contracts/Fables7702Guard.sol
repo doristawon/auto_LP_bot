@@ -34,7 +34,10 @@ interface IFablesWithdrawHook {
 /// @dev This code is intended to execute at the EOA address through EIP-7702.
 ///      Direct calls to the implementation cannot withdraw user positions.
 contract Fables7702Guard {
-    address private immutable IMPLEMENTATION = address(this);
+    // Public so setup/verification tooling can prove that delegated runtime code
+    // is the exact implementation address that was configured and audited.
+    // The immutable value is baked into the implementation bytecode at deploy time.
+    address public immutable IMPLEMENTATION = address(this);
     address internal constant STATE_VIEW = 0xF3334192D15450CdD385c8B70e03f9A6bD9E673b;
     uint256 internal constant ROBINHOOD_CHAIN_ID = 4663;
 
