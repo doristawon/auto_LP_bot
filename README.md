@@ -486,7 +486,7 @@ npm run verify:guard
 - `POST /api/points/baseline`
 - `POST /api/cashflow`
 
-若 `DASHBOARD_HOST` 不是 loopback，程式強制要求 `DASHBOARD_TOKEN`。
+若 `DASHBOARD_HOST` 不是 loopback，或 `ENABLE_LIVE_WRITES=true` / `DASHBOARD_MANUAL_CONTROL_ENABLED=true`，程式都會強制要求 `DASHBOARD_TOKEN`；live/manual control 即使只綁 loopback 也不可無驗證。
 
 ## 測試
 
