@@ -56,9 +56,16 @@ export class PointsTracker {
   }
 
   markUserCoverageBroken(at = Date.now(), reason = 'unknown', detail = {}) {
-    const item = { at: Number(at), reason, ...detail };
+    const brokenAt = Number(at);
+    const current = this.state.getSetting('pointsUserCoverageBrokenV2', null);
+    // One unresolved gap is enough to invalidate the interval until the next
+    // official checkpoint. Preserve the earliest gap and avoid log spam while a
+    // recoverable reconciliation is retried.
+    if (current?.at != null && Number(current.at) <= brokenAt) return current;
+    const item = { at: brokenAt, reason, ...detail };
     this.state.setSetting('pointsUserCoverageBrokenV2', item);
-    this.ledger.append('points.user_coverage_broken', item, Number(at));
+    this.ledger.append('points.user_coverage_broken', item, brokenAt);
+    return item;
   }
 
   predictionStartMs(nowMs = Date.now()) {
