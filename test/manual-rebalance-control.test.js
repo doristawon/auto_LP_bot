@@ -77,3 +77,24 @@ test('manual rebalance refuses while execution is paused before any fresh scan',
   );
   assert.equal(scanned, false);
 });
+
+
+test('resume is blocked while a non-terminal rebalance journal exists', () => {
+  const bot = Object.create(AutoLpBot.prototype);
+  bot.executionPaused = true;
+  bot.state = {
+    getSetting(key) {
+      if (key === 'activeRebalanceExecution') return { id: 'exec-1', phase: 'recovery_required' };
+      return null;
+    },
+    setSetting() {
+      throw new Error('resume should not mutate state while recovery is pending');
+    }
+  };
+  bot.ledger = { append() { throw new Error('resume should not write ledger while recovery is pending'); } };
+  assert.throws(
+    () => bot.setExecutionPaused(false, 'dashboard'),
+    /Cannot resume while rebalance execution requires review: recovery_required/
+  );
+  assert.equal(bot.executionPaused, true);
+});
