@@ -86,6 +86,16 @@ export class RebalanceExecutor {
         preBalancesRaw: stringifyRawBalances(preBalances)
       });
 
+      // Prepare every approval path before principal is withdrawn. If a meme token
+      // rejects approve/Permit2, fail while the LP is still intact.
+      await this.ensureSwapAllowances(plan.pool.token0, MAX_UINT160);
+      await this.ensureSwapAllowances(plan.pool.token1, MAX_UINT160);
+      await this.ensureHookAllowance(plan.pool.token0, plan.pool.key.hooks, MAX_UINT128);
+      await this.ensureHookAllowance(plan.pool.token1, plan.pool.key.hooks, MAX_UINT128);
+      journal = this.patchJournal(journal, { phase: 'approvals_ready' });
+
+      // Approvals can consume blocks; re-check OOR only after all non-capital-moving
+      // setup transactions are complete.
       const latest = await this.assertPlanStillOutOfRange(plan, 'pre-atomic-withdraw');
       const withdrawBounds = buildExactWithdrawBounds({
         sqrtPriceX96: latest.sqrtPriceX96,
@@ -231,13 +241,13 @@ export class RebalanceExecutor {
         throw new Error('No strategy inventory remains for redeposit');
       }
 
-      const postSwapState = await this.fables.readPoolState(plan.pool);
-      const finalTarget = buildCenteredRange(
+      let postSwapState = await this.fables.readPoolState(plan.pool);
+      let finalTarget = buildCenteredRange(
         postSwapState.tick,
         plan.pool.key.tickSpacing,
         this.config.tightWidthBps
       );
-      const exactDeposit = buildExactDepositPlan({
+      let exactDeposit = buildExactDepositPlan({
         rawAmount0: strategyInventory.raw0,
         rawAmount1: strategyInventory.raw1,
         sqrtPriceX96: postSwapState.sqrtPriceX96,
@@ -251,6 +261,27 @@ export class RebalanceExecutor {
       }
       await this.ensureHookAllowance(plan.pool.token0, plan.pool.key.hooks, exactDeposit.amount0Max);
       await this.ensureHookAllowance(plan.pool.token1, plan.pool.key.hooks, exactDeposit.amount1Max);
+
+      // Any allowance transaction, mempool delay, or swap can move the market.
+      // Re-read slot0 immediately before deposit and rebuild range/liquidity/caps.
+      postSwapState = await this.fables.readPoolState(plan.pool);
+      finalTarget = buildCenteredRange(
+        postSwapState.tick,
+        plan.pool.key.tickSpacing,
+        this.config.tightWidthBps
+      );
+      exactDeposit = buildExactDepositPlan({
+        rawAmount0: strategyInventory.raw0,
+        rawAmount1: strategyInventory.raw1,
+        sqrtPriceX96: postSwapState.sqrtPriceX96,
+        tickLower: finalTarget.tickLower,
+        tickUpper: finalTarget.tickUpper,
+        slippageBps: this.config.depositSlippageBps,
+        liquidityReserveBps: this.config.depositLiquidityReserveBps
+      });
+      if (exactDeposit.liquidity <= 0n || exactDeposit.liquidity > MAX_UINT128) {
+        throw new Error('Recomputed exact deposit liquidity is invalid');
+      }
 
       const depositDeadline = this.deadline();
       const depositData = this.fables.encodeDeposit(
@@ -388,11 +419,16 @@ export class RebalanceExecutor {
       throw new Error(`Wallet is not delegated to the verified EIP-7702 guard: expected ${expected}, got ${code}`);
     }
     const versionData = guardInterface.encodeFunctionData('guardVersion', []);
-    await this.readProvider.call({
+    const rawVersion = await this.readProvider.call({
       from: this.config.walletAddress,
       to: this.config.walletAddress,
       data: versionData
     });
+    const [version] = guardInterface.decodeFunctionResult('guardVersion', rawVersion);
+    const expectedVersion = id('Fables7702Guard/v1');
+    if (String(version).toLowerCase() !== expectedVersion.toLowerCase()) {
+      throw new Error(`Unexpected EIP-7702 guard version: expected ${expectedVersion}, got ${version}`);
+    }
   }
 
   async assertPlanStillOutOfRange(plan, phase) {
@@ -558,8 +594,8 @@ export class RebalanceExecutor {
     const outputAfter = swapPlan.tokenOut === 0 ? after.raw0 : after.raw1;
     const spent = inputBefore - inputAfter;
     const received = outputAfter - outputBefore;
-    if (spent < swapPlan.rawAmountIn) {
-      throw new Error(`Swap receipt spent less input than exact-in request: ${spent} < ${swapPlan.rawAmountIn}`);
+    if (spent !== swapPlan.rawAmountIn) {
+      throw new Error(`Swap receipt input mismatch for exact-in request: spent ${spent}, expected ${swapPlan.rawAmountIn}`);
     }
     if (received < BigInt(swapPlan.quote.minRawAmountOut)) {
       throw new Error(`Swap receipt output below minOut: ${received} < ${swapPlan.quote.minRawAmountOut}`);
