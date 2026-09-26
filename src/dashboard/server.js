@@ -45,6 +45,13 @@ export class DashboardServer {
       const limit = Math.min(1000, Math.max(1, Number(url.searchParams.get('limit') || 250)));
       return sendJson(res, 200, { events: this.ledger.list({ limit }) });
     }
+    if (req.method === 'GET' && url.pathname === '/api/control/status') {
+      const status = await this.bot.controlStatus();
+      return sendJson(res, 200, {
+        ...status,
+        manualControlEnabled: Boolean(this.config.dashboardManualControlEnabled)
+      });
+    }
     if (req.method === 'POST' && url.pathname === '/api/control/pause') {
       this.bot.setExecutionPaused(true, 'dashboard');
       return sendJson(res, 200, { ok: true, executionPaused: true });
@@ -54,8 +61,28 @@ export class DashboardServer {
       return sendJson(res, 200, { ok: true, executionPaused: false });
     }
     if (req.method === 'POST' && url.pathname === '/api/control/scan') {
-      await this.bot.runOnce();
-      return sendJson(res, 200, { ok: true });
+      const snapshot = await this.bot.runOnce({ executeRebalances: false, source: 'dashboard-scan' });
+      return sendJson(res, 200, {
+        ok: true,
+        blockNumber: snapshot?.blockNumber ?? null,
+        generatedAt: snapshot?.generatedAt ?? null
+      });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/control/rebalance') {
+      if (!this.config.dashboardManualControlEnabled) {
+        return sendJson(res, 403, { error: 'dashboard manual control is not armed' });
+      }
+      const body = await readJsonBody(req);
+      if (String(body.confirm || '') !== 'REBALANCE') {
+        return sendJson(res, 400, { error: 'manual rebalance requires confirm=REBALANCE' });
+      }
+      try {
+        const result = await this.bot.manualRebalance(body.poolId, body.positionId, 'dashboard');
+        const status = result?.status === 'blocked' ? 409 : 200;
+        return sendJson(res, status, { ok: status === 200, result });
+      } catch (error) {
+        return sendJson(res, 409, { error: error.shortMessage || error.message });
+      }
     }
     if (req.method === 'POST' && url.pathname === '/api/points/baseline') {
       const body = await readJsonBody(req);
