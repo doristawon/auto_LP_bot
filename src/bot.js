@@ -49,7 +49,15 @@ export class AutoLpBot {
   }
 
   setExecutionPaused(value, source = 'system') {
-    this.executionPaused = Boolean(value);
+    const next = Boolean(value);
+    if (!next) {
+      const activeExecution = this.state.getSetting('activeRebalanceExecution', null);
+      const terminal = new Set(['completed', 'failed']);
+      if (activeExecution?.phase && !terminal.has(activeExecution.phase)) {
+        throw new Error(`Cannot resume while rebalance execution requires review: ${activeExecution.phase}`);
+      }
+    }
+    this.executionPaused = next;
     this.state.setSetting('executionPaused', this.executionPaused);
     this.ledger.append('execution.control', { paused: this.executionPaused, source });
     if (this.snapshot?.bot) this.snapshot.bot.executionPaused = this.executionPaused;
@@ -73,6 +81,8 @@ export class AutoLpBot {
     }
     const topologyCooldownUntil = Number(this.state.getSetting('walletTopologyCooldownUntil', 0) || 0);
     const recoveryRequired = activeExecution?.phase === 'recovery_required';
+    const terminalExecution = new Set(['completed', 'failed']);
+    const executionBusy = Boolean(activeExecution?.phase && !terminalExecution.has(activeExecution.phase));
     const liveReady = !this.config.dryRun
       && this.config.enableLiveWrites
       && this.config.enableAutoRedeploy
@@ -81,6 +91,8 @@ export class AutoLpBot {
       && guardVerifiedFlag
       && guardRuntimeReady
       && !this.executionPaused
+      && !this.cycleActive
+      && !executionBusy
       && !recoveryRequired;
 
     return {
@@ -101,6 +113,7 @@ export class AutoLpBot {
       },
       activeRebalanceExecution: activeExecution,
       recoveryRequired,
+      executionBusy,
       topologyCooldownUntil,
       liveReady,
       limits: {
