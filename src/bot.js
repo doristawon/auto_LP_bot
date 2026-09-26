@@ -544,7 +544,7 @@ export class AutoLpBot {
     const previous = this.state.getSetting(key, null);
     const current = { owed0: position.owed0.toString(), owed1: position.owed1.toString(), shares: position.shares.toString(), at: Date.now() };
     this.state.setSetting(key, current);
-    if (!previous || String(previous.shares) !== position.shares.toString()) return;
+    if (!previous) return;
     const prev0 = BigInt(previous.owed0 || 0);
     const prev1 = BigInt(previous.owed1 || 0);
     const d0 = position.owed0 - prev0;
