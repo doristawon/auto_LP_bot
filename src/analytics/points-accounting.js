@@ -13,12 +13,20 @@ export function valueSwapFeeInUsd({ pool, swap, usdgAddress }) {
     return unpriced('missing-token-decimals', swap, feePips);
   }
 
-  const inputIndex = amount0 > 0n ? 0 : amount1 > 0n ? 1 : -1;
-  if (inputIndex < 0) return unpriced('missing-positive-input-delta', swap, feePips);
+  // Uniswap v4 BalanceDelta is from the caller perspective: input is negative
+  // (the caller owes the PoolManager) and output is positive. PoolManager emits
+  // this BalanceDelta verbatim in Swap(amount0, amount1, ...).
+  const inputIndex = amount0 < 0n ? 0 : amount1 < 0n ? 1 : -1;
+  if (inputIndex < 0) return unpriced('missing-negative-input-delta', swap, feePips);
 
-  const rawInput = inputIndex === 0 ? amount0 : amount1;
+  const inputDelta = inputIndex === 0 ? amount0 : amount1;
+  const rawInput = -inputDelta;
   const inputToken = inputIndex === 0 ? pool.token0 : pool.token1;
-  const feeRaw = rawInput * feePips / FEE_DENOMINATOR;
+  // SwapMath charges the fee from gross input. A Swap event only exposes the
+  // aggregate BalanceDelta, not each crossed-tick fee rounding, so this uses
+  // the canonical gross-input fee rate with ceiling division. Any discrepancy
+  // is bounded to raw-unit rounding across crossed ticks.
+  const feeRaw = divRoundingUp(rawInput * feePips, FEE_DENOMINATOR);
   const inputAmount = Number(formatUnits(rawInput, inputToken.decimals));
   const feeAmount = Number(formatUnits(feeRaw, inputToken.decimals));
   const usdg = String(usdgAddress).toLowerCase();
@@ -55,9 +63,9 @@ export function valueSwapFeeInUsd({ pool, swap, usdgAddress }) {
   const usdgIndex = token0IsUsdg ? 0 : 1;
   const usdgDelta = usdgIndex === 0 ? amount0 : amount1;
   const usdgToken = usdgIndex === 0 ? pool.token0 : pool.token1;
-  if (usdgDelta >= 0n) {
+  if (usdgDelta <= 0n) {
     return {
-      ...unpriced('usdg-is-not-output-for-non-usdg-input', swap, feePips),
+      ...unpriced('usdg-is-not-positive-output-for-non-usdg-input', swap, feePips),
       inputIndex,
       inputToken: inputToken.address,
       rawInput,
@@ -67,16 +75,16 @@ export function valueSwapFeeInUsd({ pool, swap, usdgAddress }) {
     };
   }
 
-  // When the non-USDG token is the input, the negative USDG pool delta is the
+  // When the non-USDG token is the input, the positive USDG BalanceDelta is the
   // realized output after the LP fee was removed from input. Valuing the fee at
   // the same realized execution rate gives:
   //   feeUsd = outputUsd * fee / (1 - fee)
   // This avoids using a later/current token price and keeps numerator/denominator
   // valuation tied to the exact on-chain swap.
-  const outputUsd = Number(formatUnits(-usdgDelta, usdgToken.decimals));
-  const feeRate = Number(feePips) / Number(FEE_DENOMINATOR);
-  const feeUsd = feeRate > 0 && feeRate < 1
-    ? outputUsd * feeRate / (1 - feeRate)
+  const outputUsd = Number(formatUnits(usdgDelta, usdgToken.decimals));
+  const netInputRaw = rawInput - feeRaw;
+  const feeUsd = netInputRaw > 0n
+    ? outputUsd * Number(feeRaw) / Number(netInputRaw)
     : 0;
 
   return {
@@ -107,4 +115,11 @@ function unpriced(reason, swap, feePips) {
     feeUsd: null,
     feePips: Number(feePips ?? swap?.fee ?? 0)
   };
+}
+
+function divRoundingUp(numerator, denominator) {
+  numerator = BigInt(numerator);
+  denominator = BigInt(denominator);
+  if (numerator === 0n) return 0n;
+  return (numerator + denominator - 1n) / denominator;
 }
