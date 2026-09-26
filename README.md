@@ -282,7 +282,7 @@ Dashboard 顯示：
 Dashboard 控制：
 
 - `Scan now · no trades`：立即讀鏈上與 accounting，但不執行 rebalance。
-- `Pause / Resume`：kill switch。
+- `Pause new execution / Resume`：阻止新的 rebalance；不會硬中斷已開始的 capital-moving state machine。
 - `Manual Rebalance`：只對已符合 OOR policy 的 position 開放；預設由 `DASHBOARD_MANUAL_CONTROL_ENABLED=false` 關閉。
 - 手動 cashflow adjustment / Points baseline 只影響 accounting。
 
