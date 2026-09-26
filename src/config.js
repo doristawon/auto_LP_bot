@@ -94,6 +94,7 @@ export function loadConfig() {
     confirmations: envInt('TX_CONFIRMATIONS', 1),
     maxGasGwei: envNum('MAX_GAS_GWEI', 1),
     dashboardEnabled: envBool('DASHBOARD_ENABLED', true),
+    dashboardManualControlEnabled: envBool('DASHBOARD_MANUAL_CONTROL_ENABLED', false),
     dashboardHost: process.env.DASHBOARD_HOST?.trim() || '127.0.0.1',
     dashboardPort: envInt('DASHBOARD_PORT', 8787),
     dashboardToken: process.env.DASHBOARD_TOKEN?.trim() || '',
