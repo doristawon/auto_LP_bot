@@ -129,6 +129,7 @@ function actionState(x){
   if(!control||!control.manualControlEnabled)return {disabled:true,label:'Manual disabled',note:'arm DASHBOARD_MANUAL_CONTROL_ENABLED'};
   if(control.executionPaused)return {disabled:true,label:'Paused',note:'resume execution first'};
   if(control.recoveryRequired)return {disabled:true,label:'Recovery lock',note:'inspect recovery first'};
+  if(control.cycleActive||control.executionBusy)return {disabled:true,label:'Execution busy',note:'wait for current cycle/journal'};
   if(!control.dryRun&&!control.liveReady)return {disabled:true,label:'Live gates not ready',note:'guard/signer/live flags incomplete'};
   return {disabled:false,label:control.dryRun?'Run dry-run':'Manual rebalance',note:control.dryRun?'no capital movement':'will move capital'};
 }
@@ -154,7 +155,7 @@ function render(){
   const pos=p.positions||[];$('rangeCount').textContent=pos.length;$('oorCount').textContent=pos.filter(x=>x.outside).length+' out of range';
   $('execution').textContent=ctl.executionPaused?'PAUSED':(ctl.dryRun?'DRY RUN':(ctl.liveReady?'LIVE READY':'LIVE BLOCKED'));$('lastAction').textContent=bot.lastAction||'No action yet';
   $('guard').textContent=ctl.guard&&ctl.guard.runtimeReady?'READY':(ctl.guard&&ctl.guard.verifiedFlag?'VERIFY FAIL':'NOT ARMED');$('guard').className='value '+(ctl.guard&&ctl.guard.runtimeReady?'good':(ctl.guard&&ctl.guard.verifiedFlag?'bad':'warn'));$('guardAddr').textContent=ctl.guard&&ctl.guard.address?short(ctl.guard.address):'not configured';
-  $('recovery').textContent=ctl.recoveryRequired?'REQUIRED':'CLEAR';$('recovery').className='value '+(ctl.recoveryRequired?'bad':'good');$('recoveryDetail').textContent=ctl.activeRebalanceExecution?(ctl.activeRebalanceExecution.phase+' · '+(ctl.activeRebalanceExecution.pair||'')):'no pending execution';
+  $('recovery').textContent=ctl.recoveryRequired?'REQUIRED':(ctl.executionBusy?'BUSY':'CLEAR');$('recovery').className='value '+(ctl.recoveryRequired?'bad':(ctl.executionBusy?'warn':'good'));$('recoveryDetail').textContent=ctl.activeRebalanceExecution?(ctl.activeRebalanceExecution.phase+' · '+(ctl.activeRebalanceExecution.pair||'')):'no pending execution';
   $('signer').innerHTML=yesNo(ctl.signerConfigured);$('liveWrites').innerHTML=yesNo(ctl.liveWrites);$('autoRedeploy').innerHTML=yesNo(ctl.autoRedeploy);$('manualControl').innerHTML=ctl.manualControlEnabled?'<span class="warn">ARMED</span>':'<span class="good">SAFE-OFF</span>';
   $('guardFlag').innerHTML=yesNo(ctl.guard&&ctl.guard.verifiedFlag);$('guardRuntime').innerHTML=(ctl.guard&&ctl.guard.runtimeReady)?'<span class="good">READY</span>':'<span class="bad">'+esc((ctl.guard&&ctl.guard.error)||'NOT READY')+'</span>';
   const healthy=(state.rpcHealth||[]).filter(x=>x.ok).length;$('rpc').textContent=healthy+'/'+(state.rpcHealth||[]).length;$('block').textContent=state.blockNumber||'--';
@@ -168,7 +169,8 @@ function render(){
   else if(!ctl.dryRun&&ctl.liveReady&&ctl.manualControlEnabled){b.style.display='block';b.className='banner bad';b.textContent='LIVE ARMED：Manual Rebalance 會送出真實鏈上交易。In-Range Hold、OOR policy、rate limit、atomic guard 仍不可繞過。'}
   else if(ctl.dryRun){b.style.display='block';b.className='banner good';b.textContent='DRY RUN：Manual Rebalance 只跑完整 preflight / planning，不會移動本金。'}
   else{b.style.display='none'}
-  $('pause').textContent=ctl.executionPaused?'Resume execution':'Pause execution';
+  $('pause').textContent=ctl.executionPaused?'Resume execution':'Pause new execution';
+  $('pause').title='Pause prevents new rebalance starts. It does not interrupt an already-started capital-moving state machine.';
 }
 async function load(){const results=await Promise.all([api('/api/state'),api('/api/control/status'),api('/api/events?limit=250')]);snapshot=results[0];control=results[1];$('events').innerHTML=(results[2].events||[]).map(eventRow).join('');render()}
 async function manualRebalance(poolId,positionId,pair){
