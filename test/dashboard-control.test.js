@@ -113,3 +113,16 @@ test('armed dashboard still requires explicit REBALANCE confirmation', async () 
     assert.equal(calls.manual[0].source, 'dashboard');
   });
 });
+
+
+test('dashboard resume returns conflict when bot recovery lock refuses resume', async () => {
+  await withServer(async ({ bot }, base) => {
+    bot.setExecutionPaused = (value) => {
+      if (value === false) throw new Error('Cannot resume while rebalance execution requires review: recovery_required');
+    };
+    const response = await fetch(base + '/api/control/resume', { method: 'POST' });
+    assert.equal(response.status, 409);
+    const body = await response.json();
+    assert.match(body.error, /Cannot resume while rebalance execution requires review/);
+  });
+});
