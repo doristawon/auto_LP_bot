@@ -259,8 +259,9 @@ for (let i = 0; i < events.length; i++) {
       x.timestampMs >= e.timestampMs &&
       x.timestampMs <= nextDeposit.timestampMs
     );
+    const beforeDepositActivity = between.filter((x) => x.hash !== nextDeposit.txHash);
     const operation = { raw0: 0n, raw1: 0n };
-    for (const tx of between) {
+    for (const tx of beforeDepositActivity) {
       const d = deltasForPoolMap(tx.deltas, depositPool);
       operation.raw0 += d.raw0;
       operation.raw1 += d.raw1;
