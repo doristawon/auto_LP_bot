@@ -232,11 +232,14 @@ export class PointsTracker {
   buildBuckets(startMs) {
     const buckets = {};
     for (const event of this.ledger.all()) {
-      if (event.ts < startMs || event.ts < FABLES_POINTS_START_MS || event.ts >= FABLES_POINTS_END_MS) continue;
       if (!USER_FEE_TYPES.has(event.type) && event.type !== GLOBAL_FEE_TYPE) continue;
-      const key = pointsCampaignDayKey(event.ts);
+      const accountingMs = event.type === GLOBAL_FEE_TYPE && Number.isFinite(Number(event.accountingDayStartMs))
+        ? Number(event.accountingDayStartMs)
+        : Number(event.ts);
+      if (accountingMs < startMs || accountingMs < FABLES_POINTS_START_MS || accountingMs >= FABLES_POINTS_END_MS) continue;
+      const key = pointsCampaignDayKey(accountingMs);
       if (!key) continue;
-      const dayStart = pointsCampaignDayStartMs(event.ts);
+      const dayStart = pointsCampaignDayStartMs(accountingMs);
       if (!buckets[key]) {
         buckets[key] = emptyBucket(dayStart);
       }
