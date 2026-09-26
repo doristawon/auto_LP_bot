@@ -840,9 +840,7 @@ export class AutoLpBot {
           valuation: valuation.valuation || null,
           reason: valuation.reason || null,
           inputToken: valuation.inputToken,
-          inputAmount: valuation.rawInput > 0n && valuation.inputToken
-            ? valuation.feeAmount * 1_000_000 / Math.max(1, valuation.feePips)
-            : null,
+          inputAmount: valuation.inputAmount,
           feeAmount: valuation.feeAmount,
           feeUsd: valuation.feeUsd
         },
@@ -850,7 +848,8 @@ export class AutoLpBot {
       );
     }
     this.state.setCursor('pointsGlobalSwapsV2', latestBlock + 1);
-    this.ledger.append('points.global_scan', {
+    this.state.setSetting('pointsLastGlobalScan', {
+      at: Date.now(),
       fromBlock,
       latestBlock,
       swaps: swaps.length,
@@ -858,6 +857,9 @@ export class AutoLpBot {
       unpriced,
       desiredStartAt: new Date(desiredStartMs).toISOString()
     });
+    if (swaps.length || unpriced) {
+      log('info', 'points.global_scan', { fromBlock, latestBlock, swaps: swaps.length, priced, unpriced });
+    }
   }
 
   async blockAtOrAfterTimestamp(timestampMs, latestBlock) {
