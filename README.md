@@ -1,8 +1,30 @@
 # Auto LP Bot — Fables.fi / Robinhood Chain
 
-> v0.4.0：API-less on-chain LP monitor + dynamic wallet-active topology + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
+> v0.4.1：API-less on-chain LP monitor + dynamic wallet-active topology + local control center + PnL / gas / fee / Impermanent Loss / Fables Points ledger + guarded rebalance executor.
 
 > Review correction: **dry-run 不得改變策略 state**。v0.3.4 起，`rebalance.dry_run` 只寫 ledger，不再重設 OOR timer、cooldown 或 rebalanceHistory；只有 executor 回報完整 `completed` 才能 commit strategy state。另將 pre-withdraw inventory / deposit plan 明確標為 provisional，live 執行前必須在 withdraw/swap receipt 後重算。
+
+## v0.4.1 — Real-wallet replay hardening
+
+2026-09-26 以錢包 `0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF` 的真實 Robinhood Chain 歷史做端到端 replay：
+
+- 掃描 **84 筆 Fables lifecycle**：49 deposits / 35 withdraws，涵蓋 Index/USDG、CASHCAT/USDG、USDG/MOO、USDG/ZZZ。
+- **35 / 35 withdrawAndClaim ABI 驗證通過**。
+- 使用 BOT 的 50 bps BigInt withdraw min-out 回放，**35 / 35 真實 receipt output 均可通過**。
+- 31 次 180 分鐘內的 same-pool withdraw→re-deposit handoff 可重建；其中 30 次已有雙邊 operation inventory，**30 / 30 exact BigInt deposit plan feasible**；另 1 次為單邊 inventory，正確標示為 `NEEDS SWAP` 而非 math failure。
+- lifecycle replay 最後的 active ERC-6909 range/shares 與當前鏈上狀態 **完全一致**。
+- 人工下一個 range 只有 8 次剛好等於 BOT centered target；其餘差異反映人工使用不同寬度/置中方式，不視為 executor failure。
+- 最新 range-policy replay 已擴充到 16 個 LP epochs / 13 個 15 分鐘 OOR episodes。0.5% 第一次就搬會觸發 10 次；連續兩次確認只觸發 7 次，並保留 3 次自然回區間，因此維持 `15m / 0.5% / 90m / deep-confirm=2`。
+
+Executor 額外 hardening：
+
+- 所有 ERC20→Permit2、Permit2→Universal Router、token→Fables hook approvals 優先在 withdraw 前完成；approval 失敗時 LP principal 尚未移動。
+- EIP-7702 delegation 除了 pointer，還驗證 `guardVersion == keccak256("Fables7702Guard/v1")` 與 `IMPLEMENTATION == EIP7702_GUARD_ADDRESS`。
+- exact-input swap receipt 強制 `actual spent == requested amountIn`；under-spend / over-spend 都 fail closed。
+- deposit 前再次讀 current tick，以最新狀態重算 centered range / BigInt liquidity / amount caps。
+- deposit receipt 後再讀 `rangeKey(newRangeId)`，完整驗證 PoolKey + tickLower/tickUpper，避免 shared hook 把錯 pool/range 當成功。
+- withdraw 後任何 failure 進 `recovery_required` 時，BOT 自動 Pause；新 write 必須先完成 recovery review。
+- `solc` 移到 devDependencies；CI 對 production dependency tree 執行 high-level npm audit。
 
 ## v0.4.0 — Full receipt-reconciled executor + exact BigInt math + atomic OOR guard
 
@@ -12,7 +34,7 @@
    - 真實 selector：`0x289a2a15`
    - verified signature：
      `withdrawAndClaim((address,address,uint24,int24,address),int24,int24,uint128,address,uint128,uint128,uint256,uint16)`
-   - 18 筆錢包真實成功 withdraw TX 均為 420-byte / 13 static words；`walk=1000`。
+   - 35 筆錢包真實成功 withdraw TX 均可由 verified ABI 正確 decode；抽樣 raw calldata 為 420-byte / 13 static words，`walk=1000`。
    - regression test 會把 encoder 與真實 calldata 做 byte-for-byte 比對。
 
 2. **Receipt-reconciled withdraw → swap → deposit state machine**
@@ -402,24 +424,38 @@ data/reference-tx/<hash>.json
 
 ## Live mode 現況
 
-目前 rebalance write path 全部保持關閉。尤其 `withdraw()` 先前假設的 ABI 已被真實 TX 否決；三筆手動 withdraw 都使用 selector `0x289a2a15`，在 exact signature 解出前 encoder 會直接 fail closed。
+**完整 executor code path 已實作，但主錢包 live auto-redeploy 仍維持 fail-closed 預設。**
 
-`claimFees()` 也不會由目前的 rebalance executor 自動送出；完整 state machine 驗證前不將任何單步 write 視為 unattended-safe。
+已完成的 live path：
 
-每筆 live transaction 都會先：
+1. Atomic EIP-7702 OOR guard。
+2. verified `withdrawAndClaim` + BigInt withdraw min-out。
+3. receipt 後 actual wallet delta reconciliation。
+4. actual inventory 的 direct V4 quote / Permit2 allowance / `eth_call` simulation / exact-input swap。
+5. swap receipt exact-spend + minOut assertion。
+6. post-swap 最新 tick / BigInt liquidity / amount caps 重算。
+7. Fables deposit preflight + receipt + PoolKey/range + ERC-6909 shares 驗證。
+8. partial execution journal + `recovery_required` + automatic execution Pause。
 
-1. wallet/private-key consistency check
-2. gas guard
-3. `eth_call` preflight
-4. gas estimate
-5. 送交易
-6. 等 receipt
-7. 記 gasUsed / gasPrice / gas ETH / gas USD
-8. 記 token balance delta
+安全預設仍為：
 
-### 重要
+```env
+DRY_RUN=true
+ENABLE_LIVE_WRITES=false
+ENABLE_AUTO_REDEPLOY=false
+EIP7702_GUARD_VERIFIED=false
+```
 
-`withdraw -> swap -> deposit new range` **尚未解除 safety gate**。原因不是缺 Fables API，而是我們還沒有可靠證據確認 Fables 前端目前使用的 deposit/zap calldata。這個限制是刻意避免拿未知 ABI 動真實資金。
+最後的**操作性啟用條件**不是缺 code，而是必須在持有 private key 的本地安全環境完成：
+
+```bash
+npm run compile:guard
+npm run deploy:guard
+npm run setup:guard
+npm run verify:guard
+```
+
+`verify:guard` 必須以目前真實 In-Range LP 證明 atomic withdraw canary 被 block，之後才人工設定 `EIP7702_GUARD_VERIFIED=true` 並考慮小額 canary。GitHub/repo 不持有 private key，因此不會自動替主錢包做 delegation 或 live broadcast。
 
 ## Dashboard API
 
@@ -444,17 +480,15 @@ npm test
 
 v0.2：12 個 pure unit tests。
 
-## 下一個 executor milestone
+## Production activation checklist
 
-1. 用 managed/archive RPC 成功抓 reference deposit tx raw calldata。
-2. 用 `debug_traceTransaction` 找到 router / hook / PoolManager internal calls。
-3. decode Fables new-range deposit/zap ABI。
-4. 建立 token-ratio calculator。
-5. swap router allowlist + quote + minOut + deadline。
-6. deposit `eth_call` simulation。
-7. 小額 mainnet canary。
-8. ERC-6909 share mint assertion。
-9. 才允許 unattended full auto rebalance。
+1. 在獨立 canary wallet 部署 `Fables7702Guard`。
+2. 執行 EIP-7702 delegation，確認 wallet code 為 `0xef0100 + guardAddress`。
+3. `npm run verify:guard` 通過 exact version / implementation / In-Range block canary。
+4. 使用小額 LP 做一次 OOR canary，完整驗證 withdraw → swap → deposit receipt state machine。
+5. 驗證 dashboard / ledger 的 gas、fee、PnL、execution journal 與 explorer receipt 一致。
+6. 確認 recovery 流程後，再逐步提高可管理資金；不直接以完整本金首次開 live。
+7. Direct Fables V4 route 保留為 deterministic fallback；之後可再增加 V3↔V4 route competition 以優化 netOut，但不影響 safety correctness。
 
 ## 資安
 
