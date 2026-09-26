@@ -109,6 +109,12 @@ export class PointsTracker {
     const predictionStartMs = this.predictionStartMs(nowMs);
     const trackingStartedAt = Number(this.state.getSetting('pointsUserTrackingStartedAt', 0) || 0);
     const buckets = this.buildBuckets(predictionStartMs);
+    const horizonMs = Math.min(Math.max(nowMs, predictionStartMs), FABLES_POINTS_END_MS);
+    for (let dayStart = predictionStartMs; dayStart < horizonMs; dayStart += POINTS_DAY_MS) {
+      const key = pointsCampaignDayKey(dayStart);
+      if (!key || buckets[key]) continue;
+      buckets[key] = emptyBucket(dayStart);
+    }
 
     const currentBoundary = latestCompletedPointsBoundaryMs(nowMs);
     const currentDayStart = pointsCampaignDayStartMs(nowMs);
@@ -197,14 +203,7 @@ export class PointsTracker {
       if (!key) continue;
       const dayStart = pointsCampaignDayStartMs(event.ts);
       if (!buckets[key]) {
-        buckets[key] = {
-          timestampMs: dayStart,
-          endMs: Math.min(dayStart + POINTS_DAY_MS, FABLES_POINTS_END_MS),
-          userFeeUsd: 0,
-          totalFeeUsd: 0,
-          globalSwapCount: 0,
-          unpricedGlobalSwapCount: 0
-        };
+        buckets[key] = emptyBucket(dayStart);
       }
       if (USER_FEE_TYPES.has(event.type)) {
         buckets[key].userFeeUsd += finiteNumber(event.feeUsd);
@@ -220,6 +219,17 @@ export class PointsTracker {
     }
     return buckets;
   }
+}
+
+function emptyBucket(dayStart) {
+  return {
+    timestampMs: dayStart,
+    endMs: Math.min(dayStart + POINTS_DAY_MS, FABLES_POINTS_END_MS),
+    userFeeUsd: 0,
+    totalFeeUsd: 0,
+    globalSwapCount: 0,
+    unpricedGlobalSwapCount: 0
+  };
 }
 
 function normalizedBoundary(timestampMs) {
