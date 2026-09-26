@@ -1,0 +1,41 @@
+name: Real Wallet Replay
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".real-replay-trigger"
+      - "src/tools/replay-wallet-rebalances.js"
+      - ".github/workflows/real-wallet-replay.yml"
+  workflow_dispatch:
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Replay real wallet lifecycle and rebalance paths
+        env:
+          RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
+          WALLET_ADDRESS: "0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF"
+          TARGET_MODE: "wallet-active"
+          LOG_FROM_BLOCK: "44000000"
+          REPLAY_FROM_BLOCK: "69000000"
+          REPLAY_DEPOSIT_LOOKAHEAD_MIN: "180"
+          DATA_DIR: "./data"
+          STATE_FILE: "./state/replay-state.json"
+        run: node src/tools/replay-wallet-rebalances.js
+      - name: Show report
+        if: always()
+        run: cat data/real-replay/latest.md || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: real-wallet-replay
+          path: data/real-replay/
+          if-no-files-found: warn
