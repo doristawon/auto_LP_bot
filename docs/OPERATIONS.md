@@ -61,7 +61,7 @@ Manual control **不能**繞過：
 6. live signer / guard / write gates
 7. receipt-reconciled executor state machine
 
-若 dashboard bind 到 loopback 以外，必須設定 `DASHBOARD_TOKEN`。
+`DASHBOARD_TOKEN` 在以下任一情況必填：dashboard bind 到 loopback 以外、`ENABLE_LIVE_WRITES=true`、或 `DASHBOARD_MANUAL_CONTROL_ENABLED=true`。即使只綁 `127.0.0.1`，只要允許 capital-moving control 就不得留空。
 
 建議先跑 24 小時以上 dry-run，確認：
 
