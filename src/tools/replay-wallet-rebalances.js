@@ -339,6 +339,11 @@ for (let i = 0; i < events.length; i++) {
         raw1: depositSpend.raw1.toString()
       },
       exactDeposit: serializeDeposit(exactDeposit),
+      exactDepositStatus: exactDepositFeasible === true
+        ? 'pass'
+        : exactDepositFeasible === false
+          ? 'fail'
+          : 'needs-bot-swap',
       exactDepositFeasible,
       intermediateWalletTxs: nonLifecycle
     };
@@ -532,7 +537,11 @@ function renderMarkdown(r){
   for(const w of r.withdrawReplay){
     const out=w.actualWithdrawRaw0+'/'+w.actualWithdrawRaw1;
     const min=w.botWithdraw?w.botWithdraw.amount0Min+'/'+w.botWithdraw.amount1Min:'N/A';
-    lines.push('| '+w.blockNumber+' | '+w.pair+' | '+(w.abiValid?'PASS':'FAIL')+' | '+(w.preWithdrawTick??'N/A')+' | '+out+' | '+min+' | '+(w.handoff?.depositHash?'yes':'no')+' | '+(w.handoff?(w.handoff.exactDepositFeasible?'PASS':'FAIL'):'N/A')+' | '+(w.handoff?.targetMatchesActual===true?'YES':w.handoff?.targetMatchesActual===false?'NO':'N/A')+' |');
+    const exact = !w.handoff ? 'N/A'
+      : w.handoff.exactDepositStatus === 'pass' ? 'PASS'
+      : w.handoff.exactDepositStatus === 'fail' ? 'FAIL'
+      : 'NEEDS SWAP';
+    lines.push('| '+w.blockNumber+' | '+w.pair+' | '+(w.abiValid?'PASS':'FAIL')+' | '+(w.preWithdrawTick??'N/A')+' | '+out+' | '+min+' | '+(w.handoff?.depositHash?'yes':'no')+' | '+exact+' | '+(w.handoff?.targetMatchesActual===true?'YES':w.handoff?.targetMatchesActual===false?'NO':'N/A')+' |');
   }
   if(r.summary.failures.length){
     lines.push('','## Findings','');
