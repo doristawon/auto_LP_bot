@@ -15,6 +15,7 @@ import {
   HOOK_ABI,
   POOL_MANAGER_ABI,
   REGISTRY_ABI,
+  V4_SWAP_EVENT,
   WITHDRAWN_EVENT
 } from '../abi.js';
 import { POOLS_STORAGE_SLOT, ZERO_ADDRESS } from '../constants.js';
@@ -25,6 +26,8 @@ const hookInterface = new Interface(HOOK_ABI);
 const depositedTopic = eventId(DEPOSITED_EVENT);
 const withdrawnTopic = eventId(WITHDRAWN_EVENT);
 const feesTopic = eventId(FEES_COLLECTED_EVENT);
+const swapInterface = new Interface([`event ${V4_SWAP_EVENT}`]);
+const swapTopic = eventId(V4_SWAP_EVENT);
 
 export class FablesAdapter {
   constructor(provider, config) {
@@ -265,6 +268,58 @@ export class FablesAdapter {
       item.topics?.[2] && matchingRangeIds.has(item.topics[2].toLowerCase())
     );
     return { positions, lifecycleLogs };
+  }
+
+  async scanGlobalSwaps(pools, fromBlock, toBlock) {
+    if (fromBlock > toBlock) return [];
+    const groups = new Map();
+    for (const pool of pools || []) {
+      const manager = pool.state?.poolManager;
+      if (!manager) continue;
+      const key = String(manager).toLowerCase();
+      let group = groups.get(key);
+      if (!group) {
+        group = { manager, pools: new Map() };
+        groups.set(key, group);
+      }
+      group.pools.set(String(pool.id).toLowerCase(), pool);
+    }
+
+    const out = [];
+    for (const group of groups.values()) {
+      const ids = [...group.pools.keys()];
+      // Keep topic OR-lists modest for public RPC compatibility.
+      for (let i = 0; i < ids.length; i += 20) {
+        const chunk = ids.slice(i, i + 20);
+        const logs = await this.getLogsAdaptive({
+          address: group.manager,
+          topics: [swapTopic, chunk]
+        }, fromBlock, toBlock);
+        for (const entry of logs) {
+          let parsed;
+          try { parsed = swapInterface.parseLog(entry); }
+          catch { continue; }
+          const poolId = String(parsed.args.id).toLowerCase();
+          const pool = group.pools.get(poolId);
+          if (!pool) continue;
+          out.push({
+            pool,
+            poolId,
+            blockNumber: Number(entry.blockNumber),
+            transactionHash: String(entry.transactionHash).toLowerCase(),
+            index: Number(entry.index ?? 0),
+            amount0: BigInt(parsed.args.amount0),
+            amount1: BigInt(parsed.args.amount1),
+            sqrtPriceX96: BigInt(parsed.args.sqrtPriceX96),
+            liquidity: BigInt(parsed.args.liquidity),
+            tick: Number(parsed.args.tick),
+            fee: Number(parsed.args.fee)
+          });
+        }
+      }
+    }
+    out.sort((a, b) => a.blockNumber - b.blockNumber || a.index - b.index);
+    return out;
   }
 
   async scanPoolFees(pool, fromBlock, toBlock) {
