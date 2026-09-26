@@ -48,19 +48,17 @@ export class PointsTracker {
       }
     }
 
-    if (this.state.getSetting('pointsUserTrackingStartedAt', null) == null) {
-      const earliest = this.ledger.all().find((event) =>
-        USER_FEE_TYPES.has(event.type)
-        && event.ts >= FABLES_POINTS_START_MS
-        && event.ts < FABLES_POINTS_END_MS
-      );
-      if (earliest) this.state.setSetting('pointsUserTrackingStartedAt', earliest.ts);
-    }
   }
 
   noteUserTrackingStarted(at = Date.now()) {
-    const current = this.state.getSetting('pointsUserTrackingStartedAt', null);
-    if (current == null) this.state.setSetting('pointsUserTrackingStartedAt', Number(at));
+    const current = this.state.getSetting('pointsUserTrackingStartedAtV2', null);
+    if (current == null) this.state.setSetting('pointsUserTrackingStartedAtV2', Number(at));
+  }
+
+  markUserCoverageBroken(at = Date.now(), reason = 'unknown', detail = {}) {
+    const item = { at: Number(at), reason, ...detail };
+    this.state.setSetting('pointsUserCoverageBrokenV2', item);
+    this.ledger.append('points.user_coverage_broken', item, Number(at));
   }
 
   predictionStartMs(nowMs = Date.now()) {
@@ -112,6 +110,10 @@ export class PointsTracker {
     const iso = new Date(atMs).toISOString();
     this.state.setSetting('actualPointsBaseline', value);
     this.state.setSetting('actualPointsBaselineAt', iso);
+    const broken = this.state.getSetting('pointsUserCoverageBrokenV2', null);
+    if (broken?.at != null && Number(broken.at) <= atMs) {
+      this.state.setSetting('pointsUserCoverageBrokenV2', null);
+    }
     this.ledger.append('points.actual_baseline', {
       points: value,
       at: iso,
@@ -126,7 +128,12 @@ export class PointsTracker {
     const baselineAtRaw = this.state.getSetting('actualPointsBaselineAt', null);
     const baselineAtMs = baselineAtRaw ? Date.parse(baselineAtRaw) : 0;
     const predictionStartMs = this.predictionStartMs(nowMs);
-    const trackingStartedAt = Number(this.state.getSetting('pointsUserTrackingStartedAt', 0) || 0);
+    const trackingStartedAt = Number(this.state.getSetting('pointsUserTrackingStartedAtV2', 0) || 0);
+    const coverageBroken = this.state.getSetting('pointsUserCoverageBrokenV2', null);
+    const coverageBrokenAt = Number(coverageBroken?.at || 0);
+    const userCoverageGloballyComplete = trackingStartedAt > 0
+      && trackingStartedAt <= predictionStartMs
+      && !(coverageBrokenAt >= predictionStartMs);
     const buckets = this.buildBuckets(predictionStartMs);
     const horizonMs = Math.min(Math.max(nowMs, predictionStartMs), FABLES_POINTS_END_MS);
     for (let dayStart = predictionStartMs; dayStart < horizonMs; dayStart += POINTS_DAY_MS) {
@@ -148,7 +155,7 @@ export class PointsTracker {
     for (const bucket of Object.values(buckets)) {
       bucket.endMs = Math.min(bucket.timestampMs + POINTS_DAY_MS, FABLES_POINTS_END_MS);
       bucket.denominatorComplete = bucket.globalSwapCount > 0 && bucket.unpricedGlobalSwapCount === 0;
-      bucket.userCoverageComplete = trackingStartedAt > 0 && trackingStartedAt <= bucket.timestampMs;
+      bucket.userCoverageComplete = userCoverageGloballyComplete;
       bucket.complete = bucket.denominatorComplete && bucket.userCoverageComplete;
       bucket.estimatedPoints = estimateDailyPoints(
         bucket.timestampMs,
@@ -178,7 +185,7 @@ export class PointsTracker {
     if (!(actualBaseline > 0) || !(baselineAtMs > 0)) status = 'needs-official-baseline';
     else if (totalGlobalSwaps === 0) status = 'waiting-for-global-swaps';
     else if (totalUnpricedSwaps > 0) status = 'incomplete-denominator';
-    else if (trackingStartedAt <= 0 || trackingStartedAt > predictionStartMs) status = 'incomplete-user-coverage';
+    else if (!userCoverageGloballyComplete) status = 'incomplete-user-coverage';
     else if (hasIncomplete) status = 'incomplete-coverage';
 
     const estimatedTotal = actualBaseline > 0 && exactEstimatedDelta != null
@@ -196,6 +203,8 @@ export class PointsTracker {
       actualBaselineAt: baselineAtRaw,
       predictionStartAt: new Date(predictionStartMs).toISOString(),
       userTrackingStartedAt: trackingStartedAt > 0 ? new Date(trackingStartedAt).toISOString() : null,
+      userCoverageBrokenAt: coverageBrokenAt > 0 ? new Date(coverageBrokenAt).toISOString() : null,
+      userCoverageBrokenReason: coverageBroken?.reason || null,
       settledEstimatedDelta,
       projectedCurrentDay,
       estimatedDelta: exactEstimatedDelta,
