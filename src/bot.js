@@ -1003,27 +1003,32 @@ export class AutoLpBot {
 
       if (needsWithdrawalFee) {
         const result = this.reconcileWithdrawalUserFees(pool, rangeId, entry, receipt, tx, ts);
-        this.ledger.appendUnique(
-          feeKey,
-          result.ok ? 'points.withdraw_fee_reconciled' : 'points.withdraw_fee_unresolved',
-          {
-            poolId: pool.id,
-            pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
-            positionId: rangeId,
-            hash: entry.transactionHash,
-            blockNumber: Number(entry.blockNumber),
-            logIndex,
-            ...result
-          },
-          ts
-        );
-        if (!result.ok && ts >= this.points.predictionStartMs(Date.now())) {
-          this.points.markUserCoverageBroken(ts, 'withdraw-fee-unresolved', {
-            poolId: pool.id,
-            positionId: rangeId,
-            hash: entry.transactionHash,
-            detail: result.reason || 'unknown'
-          });
+        const feeEventData = {
+          poolId: pool.id,
+          pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+          positionId: rangeId,
+          hash: entry.transactionHash,
+          blockNumber: Number(entry.blockNumber),
+          logIndex,
+          ...result
+        };
+        if (result.ok) {
+          this.ledger.appendUnique(feeKey, 'points.withdraw_fee_reconciled', feeEventData, ts);
+        } else {
+          this.ledger.appendUnique(
+            `points-withdraw-fee-unresolved:${entry.transactionHash}:${logIndex}:${result.reason || 'unknown'}`,
+            'points.withdraw_fee_unresolved',
+            feeEventData,
+            ts
+          );
+          if (ts >= this.points.predictionStartMs(Date.now())) {
+            this.points.markUserCoverageBroken(ts, 'withdraw-fee-unresolved', {
+              poolId: pool.id,
+              positionId: rangeId,
+              hash: entry.transactionHash,
+              detail: result.reason || 'unknown'
+            });
+          }
         }
       }
     }
