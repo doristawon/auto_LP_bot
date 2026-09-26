@@ -358,23 +358,39 @@ Portfolio 層另外保留整體 HODL baseline，方便判斷「做 LP」相對�
 
 ## LP fees
 
-BOT 讀兩層：
+BOT 會持續讀 `userPosition().owed0 / owed1`，將同一 range 的 owed-fee 增量記為 `fee.accrual`。v0.5.1 不再因同一 range shares 改變就丟棄 owed-fee 增量；第一次看到一個 range 時仍只建立 baseline，不把啟動前既有 owed fees 冒充成 BOT 期間新增收益。
 
-1. `userPosition().owed0 / owed1`：追蹤你個人的未領 fee 變化。
-2. `claimFees` receipt / wallet token deltas：確認實際已領 fee。
-3. `FeesCollected`：只有在事件可以安全歸屬到唯一 PoolKey 時才可作 pool-level denominator。多個 pool 共用同一 hook 時，v0.3 會 fail-closed 標記為 unattributed，避免重複計算與錯灌 Points。
+`FeesCollected` 仍保留作診斷資料，但 **Points V2 不再拿 shared-hook `FeesCollected` 當全市場 denominator**，因為該事件不能安全歸屬到唯一 PoolKey，會造成重複或漏算。
 
-第一次啟動只建立 user fee baseline，不把既有 owed fees 假裝成 BOT 期間新賺到的 fee。
+## Fables Points Accounting V2
 
-## Fables Points
+Points V2 依目前已驗證的活動規則使用：
 
-Fables UI 說明 Points 跟 LP 實際賺到的 swap fees 相關。v0.2 將 Points 分成：
+```
+dailyBudget = 900,000,000 × weeklyWeight / 7
+dailyPoints = dailyBudget × userEffectiveFeeUsd / globalEffectiveFeeUsd
+```
 
-- `actualBaseline`：你從 Fables leaderboard 看到的官方實際分數，可在 Dashboard 手動輸入。
-- `estimatedDelta`：baseline 之後依 `你的 tracked fee / Fables 全市場 tracked fee` 推估新增分數。
-- `estimatedTotal = actualBaseline + estimatedDelta`
+關鍵差異：
 
-這是 **估算器，不冒充官方 leaderboard**。如果官方 Points 邏輯或活動權重改變，只需調整 estimator；鏈上 fee ledger 不會因此失效。
+1. **Campaign day 固定以 02:00 UTC 為邊界**，不是 00:00 UTC。官方 points baseline 若沒有指定時間，Dashboard 會自動正規化到最近一個 02:00 UTC distribution boundary。
+2. **Global denominator 改讀 Uniswap v4 PoolManager `Swap(poolId,...,fee)`**。每筆 swap 都有明確 `poolId`，因此不受 shared Fables hook 影響。
+3. USDG 作為 input 時直接由 USDG input fee 計價；非 USDG token 作 input、USDG 作 output 時，用同一筆 swap 的 realized USDG output 對 fee 估值，不使用之後的現價。
+4. 非 USDG pair 或任何無法可靠估值的 swap 會標成 `unpriced`；只要 denominator coverage 不完整，`estimatedTotal` 直接回 `null`，Dashboard 只顯示 `~provisionalEstimatedTotal`，避免假精準。
+5. `pointsUserTrackingStartedAt` 會記錄 user fee numerator 的連續追蹤起點。若 baseline 早於可靠追蹤起點，狀態會是 `incomplete-user-coverage`。
+6. 每次輸入新的官方 Points 總分時，V2 會把舊 baseline 到新 distribution boundary 的 `predictedDelta` 與官方 `actualDelta` 寫成 `points.reconciliation`，保留誤差 points / % 供後續校正。
+
+Snapshot 主要欄位：
+
+- `actualBaseline / actualBaselineAt`：最後一次官方 Points checkpoint。
+- `settledEstimatedDelta`：已完成 campaign day、且 coverage 完整的預估。
+- `projectedCurrentDay`：目前尚未結算這一天，依當下 fee share 投射整天 allocation。
+- `estimatedTotal`：只有 numerator/denominator coverage 完整才提供。
+- `provisionalEstimatedTotal`：coverage 不完整時仍保留供診斷，但 Dashboard 會用 `~` 標示。
+- `denominatorCoveragePct`：可可靠 USD 計價的 global swaps 比例。
+- `lastReconciliation`：最近一次官方 Points 與預測誤差。
+
+舊版 state 若把 `ACTUAL_POINTS_BASELINE_AT` 記在手動輸入時間，v0.5.1 啟動時會自動遷移到對應的 02:00 UTC campaign boundary。
 
 ## 快速開始
 
