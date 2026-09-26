@@ -19,7 +19,6 @@ import {
   ZERO_ADDRESS
 } from '../constants.js';
 import { UniversalRouterAdapter } from './universal-router.js';
-import { samePoolKey } from './fables.js';
 import { V4QuoterAdapter } from './quoter.js';
 import { buildExactBalancedSwapPlan } from '../execution/exact-rebalance.js';
 import {
@@ -320,11 +319,10 @@ export class RebalanceExecutor {
       // Shared hooks can manage multiple PoolKeys. Prove that the minted range is
       // exactly the pool + ticks this execution intended, not merely "some range"
       // emitted by the same hook.
-      const hookContract = new Contract(plan.pool.key.hooks, HOOK_ABI, this.readProvider);
-      const mintedRange = await hookContract.rangeKey(depositEvent.rangeId);
+      const mintedRange = await this.fables.readRangeKey(plan.pool, depositEvent.rangeId);
       if (
         !mintedRange.exists ||
-        !samePoolKey(mintedRange.key, plan.pool.key) ||
+        !samePoolKeyLocal(mintedRange.key, plan.pool.key) ||
         Number(mintedRange.tickLower) !== finalTarget.tickLower ||
         Number(mintedRange.tickUpper) !== finalTarget.tickUpper
       ) {
@@ -707,6 +705,15 @@ function serializablePlan(plan) {
     quote: plan.quote || null,
     depositPlan: plan.depositPlan || null
   };
+}
+
+function samePoolKeyLocal(left, right) {
+  if (!left || !right) return false;
+  return String(left.currency0).toLowerCase() === String(right.currency0).toLowerCase()
+    && String(left.currency1).toLowerCase() === String(right.currency1).toLowerCase()
+    && Number(left.fee) === Number(right.fee)
+    && Number(left.tickSpacing) === Number(right.tickSpacing)
+    && String(left.hooks).toLowerCase() === String(right.hooks).toLowerCase();
 }
 
 function operationDelta(before, after) {

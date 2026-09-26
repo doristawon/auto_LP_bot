@@ -277,6 +277,11 @@ export class FablesAdapter {
     });
   }
 
+  async readRangeKey(pool, rangeId) {
+    const hook = new Contract(pool.key.hooks, HOOK_ABI, this.provider);
+    return hook.rangeKey(rangeId);
+  }
+
   async readWalletBalances(tokens) {
     const result = {};
     for (const token of tokens) {

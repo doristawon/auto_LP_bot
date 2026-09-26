@@ -46,6 +46,14 @@ function createHarness({ failSwap = false } = {}) {
   };
   const fables = {
     async readPoolState() { return { tick: 1100, sqrtPriceX96: getSqrtPriceAtTick(1100), paused: false }; },
+    async readRangeKey() {
+      return {
+        exists: true,
+        key: pool.key,
+        tickLower: 980,
+        tickUpper: 1220
+      };
+    },
     encodeDeposit() { return '0xdeadbeef'; }
   };
   const executor = new RebalanceExecutor(
