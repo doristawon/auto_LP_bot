@@ -537,6 +537,16 @@ export class AutoLpBot {
       );
     } catch (error) {
       this.ledger.append('rebalance.failed', { positionId: position.id, poolId: pool.id, error: error.message });
+      const activeExecution = this.state.getSetting('activeRebalanceExecution', null);
+      if (activeExecution?.phase === 'recovery_required') {
+        this.setExecutionPaused(true, 'rebalance_recovery_required');
+        this.ledger.append('rebalance.auto_paused', {
+          positionId: position.id,
+          poolId: pool.id,
+          executionId: activeExecution.id || null,
+          reason: 'capital moved but execution did not complete'
+        });
+      }
       log('error', 'rebalance.failed', { positionId: position.id, error: error.message });
     }
   }
