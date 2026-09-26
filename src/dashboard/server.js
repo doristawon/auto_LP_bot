@@ -14,8 +14,13 @@ export class DashboardServer {
   async start() {
     if (!this.config.dashboardEnabled || this.server) return;
     const loopback = ['127.0.0.1', '::1', 'localhost'].includes(this.config.dashboardHost);
-    if (!loopback && !this.config.dashboardToken) {
-      throw new Error('DASHBOARD_TOKEN is required when dashboard binds outside loopback');
+    const sensitiveControl = Boolean(this.config.enableLiveWrites || this.config.dashboardManualControlEnabled);
+    if ((!loopback || sensitiveControl) && !this.config.dashboardToken) {
+      throw new Error(
+        sensitiveControl
+          ? 'DASHBOARD_TOKEN is required whenever live writes or dashboard manual control is enabled'
+          : 'DASHBOARD_TOKEN is required when dashboard binds outside loopback'
+      );
     }
     this.server = http.createServer((req, res) => this.handle(req, res).catch((error) => {
       log('error', 'dashboard.request_failed', { error: error.message });
