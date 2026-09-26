@@ -1,6 +1,6 @@
 {
   "name": "auto-lp-bot",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "type": "module",
   "description": "Fables.fi LP monitor, accounting dashboard and guarded rebalance bot for Robinhood Chain",
@@ -25,7 +25,9 @@
     "replay:wallet": "node src/tools/replay-wallet-rebalances.js"
   },
   "dependencies": {
-    "ethers": "^6.15.0",
+    "ethers": "^6.15.0"
+  },
+  "devDependencies": {
     "solc": "0.8.30"
   }
 }

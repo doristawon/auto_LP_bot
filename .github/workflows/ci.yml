@@ -12,6 +12,7 @@ jobs:
         with:
           node-version: 22
       - run: npm install
+      - run: npm audit --omit=dev --audit-level=high
       - run: npm run check
       - run: npm run compile:guard
       - run: npm test
