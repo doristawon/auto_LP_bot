@@ -219,8 +219,12 @@ export class AutoLpBot {
       }
 
       this.points.noteUserTrackingStarted(Date.now());
+      const executionPoolIds = new Set(targetPools.map((pool) => pool.id.toLowerCase()));
 
-      for (const pool of targetPools) {
+      // Accounting must continue for pools that just became inactive; otherwise a
+      // full withdrawal can disappear from the execution set before its final fee
+      // claim is reconciled.
+      for (const pool of accountingPools) {
         pool.state = await this.fables.readPoolState(pool);
         const cursorKey = `positionLogs:${pool.id}`;
         const fallbackCursor = this.config.targetMode === 'wallet-active'
@@ -233,7 +237,7 @@ export class AutoLpBot {
         await this.recordLifecycleLogs(pool, result.lifecycleLogs);
         this.state.setCursor(cursorKey, latestBlock + 1);
         for (const position of pool.positions) {
-          await this.decoratePosition(pool, position);
+          if (executionPoolIds.has(pool.id.toLowerCase())) await this.decoratePosition(pool, position);
           this.trackFeeAccrual(pool, position);
         }
       }
