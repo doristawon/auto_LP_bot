@@ -51,10 +51,12 @@ console.log('[replay] wallet', config.walletAddress, 'blocks', fromBlock, '->', 
 
 const fables = new FablesAdapter(readProvider, config);
 const allPools = await fables.discoverAllPools();
+console.log('[replay] discovered pools', allPools.length);
 const poolByFingerprint = new Map(allPools.map((pool) => [poolKeyFingerprint(pool.key), pool]));
 const hooks = [...new Set(allPools.map((pool) => pool.key.hooks.toLowerCase()))];
 const walletTopic = zeroPadValue(config.walletAddress, 32).toLowerCase();
 
+console.log('[replay] scanning wallet lifecycle logs', hooks.length, 'hooks');
 const lifecycleLogs = hooks.length
   ? await fables.getLogsAdaptive({
       address: hooks,
@@ -62,6 +64,7 @@ const lifecycleLogs = hooks.length
     }, fromBlock, latestBlock)
   : [];
 lifecycleLogs.sort(logOrder);
+console.log('[replay] lifecycle logs found', lifecycleLogs.length);
 if (!lifecycleLogs.length) throw new Error('No wallet Fables lifecycle events found');
 
 const hookContracts = new Map();
@@ -123,29 +126,48 @@ for (const pool of touchedPools.values()) {
 
 const managerByHook = new Map();
 const swapsByPool = new Map();
+const poolsByManager = new Map();
 for (const pool of touchedPools.values()) {
   const hookLower = pool.key.hooks.toLowerCase();
   let manager = managerByHook.get(hookLower);
   if (!manager) {
     const hook = new Contract(pool.key.hooks, HOOK_ABI, readProvider);
-    manager = String(await hook.poolManager());
+    manager = String(await hook.poolManager()).toLowerCase();
     managerByHook.set(hookLower, manager);
   }
+  let group = poolsByManager.get(manager);
+  if (!group) {
+    group = { poolIds: [], poolsById: new Map() };
+    poolsByManager.set(manager, group);
+  }
+  group.poolIds.push(pool.id.toLowerCase());
+  group.poolsById.set(pool.id.toLowerCase(), pool);
+  swapsByPool.set(pool.id, []);
+}
+console.log('[replay] scanning swap history for', touchedPools.size, 'pools across', poolsByManager.size, 'pool managers');
+for (const [manager, group] of poolsByManager) {
+  const poolIds = [...new Set(group.poolIds)];
   const logs = await fables.getLogsAdaptive({
     address: manager,
-    topics: [swapTopic, pool.id]
+    topics: [swapTopic, poolIds]
   }, Math.max(0, fromBlock - preSwapBuffer), latestBlock);
-  const points = logs.map((log) => {
+  for (const log of logs) {
+    const pool = group.poolsById.get(String(log.topics?.[1] || '').toLowerCase());
+    if (!pool) continue;
     const parsed = swapIface.parseLog(log);
-    return {
+    swapsByPool.get(pool.id).push({
       blockNumber: Number(log.blockNumber),
       logIndex: Number(log.index || 0),
       txHash: String(log.transactionHash).toLowerCase(),
       sqrtPriceX96: BigInt(parsed.args.sqrtPriceX96),
       tick: Number(parsed.args.tick)
-    };
-  }).sort(pointOrder);
-  swapsByPool.set(pool.id, points);
+    });
+  }
+  for (const poolId of poolIds) {
+    const pool = group.poolsById.get(poolId);
+    swapsByPool.get(pool.id).sort(pointOrder);
+  }
+  console.log('[replay] swap logs found for manager', manager, logs.length);
 }
 
 const txCache = new Map();
@@ -167,18 +189,22 @@ for (const pool of touchedPools.values()) {
   tokenMap.set(pool.token1.address.toLowerCase(), pool.token1);
 }
 const transferTxHashes = new Set(events.map((e) => e.txHash));
-for (const token of tokenMap.values()) {
-  if (token.address.toLowerCase() === ZERO_ADDRESS) continue;
+const transferTokenAddresses = [...new Set([...tokenMap.values()]
+  .map((token) => token.address.toLowerCase())
+  .filter((address) => address !== ZERO_ADDRESS))];
+console.log('[replay] scanning wallet token transfers for', transferTokenAddresses.length, 'tokens');
+if (transferTokenAddresses.length) {
   const outgoing = await fables.getLogsAdaptive({
-    address: token.address,
+    address: transferTokenAddresses,
     topics: [transferTopic, walletTopic]
   }, events[0].blockNumber, latestBlock);
   const incoming = await fables.getLogsAdaptive({
-    address: token.address,
+    address: transferTokenAddresses,
     topics: [transferTopic, null, walletTopic]
   }, events[0].blockNumber, latestBlock);
   for (const log of [...outgoing, ...incoming]) transferTxHashes.add(String(log.transactionHash).toLowerCase());
 }
+console.log('[replay] wallet transactions to inspect', transferTxHashes.size);
 await mapLimit([...transferTxHashes], 8, loadTx);
 
 const activity = [...txCache.values()]
