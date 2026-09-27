@@ -192,6 +192,34 @@ test('bot auto-pauses when executor enters recovery_required after capital moved
   assert.ok(events.some((x) => x.type === 'rebalance.auto_paused'));
 });
 
+test('a failed preflight backs off instead of retrying on the next monitor cycle', async () => {
+  const settings = new Map();
+  const events = [];
+  let executions = 0;
+  const bot = {
+    state: {
+      getSetting(key, fallback) { return settings.has(key) ? settings.get(key) : fallback; },
+      setSetting(key, value) { settings.set(key, value); },
+      recentRebalances() { return []; }
+    },
+    ledger: { append(type, data) { events.push({ type, data }); } },
+    executionPaused: false,
+    market: { pools: [pool], fablesStats: { pools: new Map() } },
+    config: { maxRebalancesPerHour: 3, minRebalanceIntervalSec: 300 },
+    getInvestmentTargetSettings() { return { mode: 'apr-highest', poolId: '' }; },
+    resolveInvestmentTarget(sourcePool) { return sourcePool; },
+    async assertStillOutOfRangeBeforeRebalance() { return true; },
+    executor: { async execute() { executions++; throw new Error('preflight unavailable'); } }
+  };
+  const first = await AutoLpBot.prototype.maybeRebalance.call(bot, pool, { ...position });
+  assert.equal(first.status, 'failed');
+  assert.ok(first.nextRetryAt > Date.now());
+  const second = await AutoLpBot.prototype.maybeRebalance.call(bot, pool, { ...position });
+  assert.equal(second.reason, 'rebalance-failure-backoff');
+  assert.equal(executions, 1);
+  assert.equal(events.filter((event) => event.type === 'rebalance.backoff').length, 1);
+});
+
 
 test('minimum rebalance interval is global across newly minted range IDs', async () => {
   const events = [];

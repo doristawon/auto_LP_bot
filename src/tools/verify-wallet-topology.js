@@ -1,17 +1,20 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { Contract, zeroPadValue, id } from 'ethers';
 import { loadDotEnv } from '../env.js';
 import { loadConfig } from '../config.js';
 import { createProviders, verifyProviders } from '../rpc/providers.js';
 import { REGISTRY_ABI, HOOK_ABI, DEPOSITED_EVENT, WITHDRAWN_EVENT } from '../abi.js';
+import { resolveWalletStorage } from './wallet-storage.js';
 
 loadDotEnv();
 const config = loadConfig();
+const storage = resolveWalletStorage(config);
 const { readProvider, rawProviders } = createProviders(config);
 await verifyProviders(rawProviders, config.chainId);
 
-const snapshot = JSON.parse(fs.readFileSync('data/latest-snapshot.json', 'utf8'));
-const state = JSON.parse(fs.readFileSync(config.stateFile, 'utf8'));
+const snapshot = JSON.parse(fs.readFileSync(path.join(storage.dataDir, 'latest-snapshot.json'), 'utf8'));
+const state = JSON.parse(fs.readFileSync(storage.stateFile, 'utf8'));
 const registry = new Contract(config.registryAddress, REGISTRY_ABI, readProvider);
 const entries = await registry.activePools();
 const pools = [];

@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths:
       - ".audit-trigger"
-      - "src/tools/audit-wallet.js"
+      - "src/tools/audit-wallet-v2.js"
       - ".github/workflows/wallet-audit.yml"
   workflow_dispatch:
 
@@ -18,11 +18,23 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
+      - run: npm ci
+      - name: Check optional wallet secret
+        id: wallet
+        env:
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
+        run: |
+          if [[ -n "$WALLET_ADDRESS" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Wallet audit skipped: WALLET_ADDRESS secret is not configured."
+          fi
       - name: Scan wallet on Robinhood Chain
+        if: steps.wallet.outputs.configured == 'true'
         env:
           RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
-          WALLET_ADDRESS: "0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF"
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
           TARGET_SYMBOLS: "CASHCAT,USDG"
           DRY_RUN: "true"
           ENABLE_LIVE_WRITES: "false"
@@ -33,16 +45,16 @@ jobs:
           SWAP_SLIPPAGE_BPS: "50"
           DATA_DIR: "./data"
           STATE_FILE: "./state/audit-state.json"
-        run: node src/tools/audit-wallet-v2.js
-      - name: Show report
-        if: always()
         run: |
-          if [ -f data/audits/latest.md ]; then
-            cat data/audits/latest.md
+          if node src/tools/audit-wallet-v2.js > "$RUNNER_TEMP/wallet-audit.log" 2>&1; then
+            status=0
+          else
+            status=$?
           fi
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: wallet-lp-audit
-          path: data/audits/
-          if-no-files-found: warn
+          rm -f "$RUNNER_TEMP/wallet-audit.log"
+          rm -rf data/audits
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Wallet audit failed; wallet-specific report details were withheld."
+            exit "$status"
+          fi
+          echo "Wallet audit completed; the report was kept off public logs and artifacts."

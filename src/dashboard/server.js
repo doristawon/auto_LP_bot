@@ -36,6 +36,9 @@ export class DashboardServer {
   }
 
   async handle(req, res) {
+    if (!isAllowedDashboardHost(req, this.config.dashboardHost)) {
+      return sendJson(res, 403, { error: 'invalid host' });
+    }
     this.ledger = this.bot.ledger;
     this.pointsTracker = this.bot.points;
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -209,7 +212,7 @@ export class DashboardServer {
     if (req.method === 'POST' && url.pathname === '/api/points/baseline') {
       const body = await readJsonBody(req);
       if (!Number.isFinite(Number(body.points)) || Number(body.points) < 0) return sendJson(res, 400, { error: 'invalid points' });
-      const result = this.pointsTracker.setActualBaseline(Number(body.points), body.at || null);
+      const result = this.pointsTracker.setManualBaseline(Number(body.points), body.at || null);
       this.bot.updatePointsSnapshot?.(true);
       return sendJson(res, 200, { ok: true, ...result });
     }
@@ -234,7 +237,32 @@ export class DashboardServer {
 }
 
 function isLoopbackHost(host) {
-  return ['127.0.0.1', '::1', 'localhost'].includes(String(host || '').trim().toLowerCase());
+  return ['127.0.0.1', '::1', 'localhost'].includes(normalizeHostname(host));
+}
+
+function normalizeHostname(host) {
+  return String(host || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+}
+
+function requestHostname(hostHeader) {
+  const raw = String(hostHeader || '').trim();
+  if (!raw || /[\r\n\s/@?#\\]/.test(raw)) return null;
+  try {
+    const parsed = new URL(`http://${raw}`);
+    if (parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) return null;
+    return normalizeHostname(parsed.hostname);
+  } catch {
+    return null;
+  }
+}
+
+function isAllowedDashboardHost(req, dashboardHost) {
+  const requested = requestHostname(req.headers.host);
+  if (!requested) return false;
+  const configured = normalizeHostname(dashboardHost);
+  if (isLoopbackHost(configured)) return isLoopbackHost(requested);
+  if (['0.0.0.0', '::'].includes(configured)) return true;
+  return requested === configured;
 }
 
 function sameOriginRequest(req) {
@@ -298,7 +326,9 @@ function liveMarketSnapshot(bot) {
       fees24hUsd: poolStats?.fees24hUsd ?? null,
       aprPct: poolStats?.aprPct ?? null,
       statsObservedAt: stats?.observedAt ?? null,
-      statsSource: stats?.source ?? null
+      statsSource: stats?.source ?? null,
+      statsTvlAvailable: stats?.tvlAvailable ?? null,
+      statsVolumeAvailable: stats?.volumeAvailable ?? null
     };
   });
 }

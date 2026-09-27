@@ -2,10 +2,12 @@ import { loadDotEnv } from '../env.js';
 import { loadConfig } from '../config.js';
 import { StateStore } from '../state.js';
 import { createProviders, verifyProviders } from '../rpc/providers.js';
+import { resolveWalletStorage } from './wallet-storage.js';
 
 loadDotEnv();
 const config = loadConfig();
-const state = new StateStore(config.stateFile);
+const storage = resolveWalletStorage(config);
+const state = new StateStore(storage.stateFile);
 const journal = state.getSetting('activeRebalanceExecution', null);
 if (!journal) {
   console.log(JSON.stringify({ ok: true, status: 'no-pending-execution' }, null, 2));

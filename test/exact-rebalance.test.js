@@ -57,3 +57,31 @@ test('exact receipt inventory balancer selects token1 -> token0 when token1 liqu
   assert.ok(plan.rawAmountIn > 0n);
   assert.ok(plan.quote);
 });
+
+test('exact balancer refuses swap quotes above configured spot price-impact limit', async () => {
+  const expensiveQuoter = {
+    async quoteExactInputSingleRaw(_pool, tokenIn, rawAmountIn, slippageBps) {
+      rawAmountIn = BigInt(rawAmountIn);
+      const rawAmountOut = rawAmountIn * 95n / 100n;
+      return {
+        rawAmountIn: rawAmountIn.toString(),
+        rawAmountOut: rawAmountOut.toString(),
+        minRawAmountOut: (rawAmountOut * BigInt(10000 - slippageBps) / 10000n).toString(),
+        tokenIn: tokenIn === 0 ? pool.token0.address : pool.token1.address,
+        tokenOut: tokenIn === 0 ? pool.token1.address : pool.token0.address
+      };
+    }
+  };
+  const plan = await buildExactBalancedSwapPlan({
+    pool,
+    quoter: expensiveQuoter,
+    rawAmount0: 1_000_000_000_000_000_000_000n,
+    rawAmount1: 100_000_000_000_000_000_000n,
+    sqrtPriceX96: getSqrtPriceAtTick(0),
+    tickLower: -200,
+    tickUpper: 200,
+    maxPriceImpactBps: 200
+  });
+  assert.equal(plan.direction, 'none');
+  assert.equal(plan.blockedReason, 'no-quote-within-price-impact-limit');
+});

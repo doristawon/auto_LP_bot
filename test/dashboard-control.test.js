@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { DashboardServer } from '../src/dashboard/server.js';
 import { dashboardPage } from '../src/dashboard/page.js';
 
 function makeHarness() {
-  const calls = { scans: [], manual: [], pause: [], investmentTarget: [] };
+  const calls = { scans: [], manual: [], pause: [], investmentTarget: [], manualBaselines: [] };
   const config = {
     dashboardEnabled: true,
     dashboardHost: '127.0.0.1',
@@ -52,7 +53,8 @@ function makeHarness() {
     list() { return []; },
     append() {}
   };
-  const pointsTracker = { setActualBaseline() {} };
+  const pointsTracker = { setManualBaseline(points, at) { calls.manualBaselines.push({ points, at }); return { points, at, source: 'manual-fallback' }; } };
+  bot.points = pointsTracker;
   const server = new DashboardServer(config, bot, ledger, pointsTracker);
   return { server, config, bot, calls };
 }
@@ -197,4 +199,76 @@ test('dashboard still requires a token when bound outside loopback', async () =>
   h.config.dashboardToken = 'remote-test-token';
   assert.equal(h.server.authorized({ headers: {} }), false);
   assert.equal(h.server.authorized({ headers: { 'x-dashboard-token': 'remote-test-token' } }), true);
+});
+
+test('loopback dashboard rejects DNS-rebinding Host headers before serving private state', async () => {
+  await withServer(async (_h, base) => {
+    const attacker = await requestWithHost(base + '/api/state', 'attacker.example');
+    assert.equal(attacker.status, 403);
+    assert.deepEqual(attacker.body, { error: 'invalid host' });
+
+    const local = await requestWithHost(base + '/api/state', 'localhost:' + new URL(base).port);
+    assert.equal(local.status, 200);
+  });
+});
+
+function requestWithHost(url, host) {
+  return new Promise((resolve, reject) => {
+    const request = http.request(url, { method: 'GET', headers: { host } }, (response) => {
+      let text = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => { text += chunk; });
+      response.on('end', () => {
+        let body = {};
+        try { body = text ? JSON.parse(text) : {}; } catch { body = { raw: text }; }
+        resolve({ status: response.statusCode, body });
+      });
+    });
+    request.on('error', reject);
+    request.end();
+  });
+}
+
+test('manual points baseline endpoint writes only the fallback baseline', async () => {
+  await withServer(async ({ calls }, base) => {
+    const response = await fetch(base + '/api/points/baseline', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: base },
+      body: JSON.stringify({ points: 1234 })
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls.manualBaselines, [{ points: 1234, at: null }]);
+    assert.equal((await response.json()).source, 'manual-fallback');
+  });
+});
+
+test('dashboard labels source freshness limits and rebalance attention fields', () => {
+  const html = dashboardPage();
+  assert.match(html, /本機取得時間/);
+  assert.match(html, /上游更新時間未提供/);
+  assert.match(html, /rebalanceBackoffNotice/);
+  assert.match(html, /journal 長時間未更新/);
+  assert.match(html, /手動備援分數只供顯示/);
+});
+
+test('dashboard event rows distinguish blocks, confirmed transactions, and failures', () => {
+  const html = dashboardPage();
+  assert.match(html, /function eventStatus\(e\)/);
+  assert.match(html, /安全條件阻擋/);
+  assert.match(html, /type==='tx\.confirmed'/);
+  assert.match(html, /label:'鏈上交易已確認'/);
+  assert.match(html, /label:'執行失敗'/);
+  assert.match(html, /top-up preflight simulation failed/);
+  assert.match(html, /rebalance\.top_up_completed/);
+  assert.match(html, /rebalance\.top_up_dry_run_blocked/);
+  assert.match(html, /lp\.topup_failed/);
+  assert.match(html, /加倉流程異常；請核對 journal 與鏈上 receipt/);
+});
+
+test('dashboard shows available points reconciliation metrics with accurate coverage label', () => {
+  const html = dashboardPage();
+  assert.match(html, /unsettledFeeUsd/);
+  assert.match(html, /calibratedPointsPerFeeUsd/);
+  assert.match(html, /calibrationSource/);
+  assert.match(html, /全市場交易筆數覆蓋率/);
 });

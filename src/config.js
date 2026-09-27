@@ -1,4 +1,4 @@
-import { getAddress } from 'ethers';
+import { getAddress, parseEther } from 'ethers';
 import { CHAIN_ID, DEFAULT_RPC_URL, FABLES_REGISTRY, USDG } from './constants.js';
 import { envBool, envInt, envList, envNum } from './env.js';
 
@@ -43,10 +43,22 @@ export function loadConfig() {
   const aprPoolMinTvlUsd = envNum('APR_POOL_MIN_TVL_USD', 30_000);
   const oorDeepConfirmations = envInt('OOR_DEEP_CONFIRMATIONS', envInt('OUT_OF_RANGE_CONFIRMATIONS', 2));
   const swapSlippageBps = envInt('SWAP_SLIPPAGE_BPS', 50);
+  const maxSwapPriceImpactBps = envInt('MAX_SWAP_PRICE_IMPACT_BPS', 200);
+  const autoTopupMaxSwapPriceImpactBps = envInt('AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS', maxSwapPriceImpactBps);
+  const autoTopupSwapPoolId = process.env.AUTO_TOPUP_SWAP_POOL_ID?.trim().toLowerCase() || '';
+  const autoTopupSwapEnabled = envBool('AUTO_TOPUP_SWAP_ENABLED', false);
   const depositSlippageBps = envInt('DEPOSIT_SLIPPAGE_BPS', 50);
   const withdrawSlippageBps = envInt('WITHDRAW_SLIPPAGE_BPS', 50);
   const eip7702GuardAddress = optionalAddress('EIP7702_GUARD_ADDRESS');
-  const eip7702GuardVerified = envBool('EIP7702_GUARD_VERIFIED', false);
+  const eip7702GuardVerifiedFor = optionalAddress('EIP7702_GUARD_VERIFIED_FOR');
+  const eip7702GuardVerificationEnabled = envBool('EIP7702_GUARD_VERIFIED', false);
+  const eip7702GuardVerified = eip7702GuardVerificationEnabled
+    && Boolean(eip7702GuardVerifiedFor)
+    && eip7702GuardVerifiedFor.toLowerCase() === walletAddress.toLowerCase();
+  const autoTopupMinIdleUsd = envNum('AUTO_TOPUP_MIN_IDLE_USD', 25);
+  const autoTopupDustBps = envInt('AUTO_TOPUP_DUST_BPS', 25);
+  const autoTopupMinIntervalSec = envInt('AUTO_TOPUP_MIN_INTERVAL_SEC', 1800);
+  const topUpMinGasReserveWei = parseEther(process.env.AUTO_TOPUP_MIN_GAS_ETH?.trim() || '0.0002');
 
   if (!rpcUrls.length) throw new Error('RPC_URLS must contain at least one endpoint');
   if (!Number.isSafeInteger(rpcRequestTimeoutMs) || rpcRequestTimeoutMs < 1_000 || rpcRequestTimeoutMs > 300_000) {
@@ -71,8 +83,30 @@ export function loadConfig() {
   if (oorMaxWaitMin <= 0) throw new Error('OOR_MAX_WAIT_MIN must be > 0');
   if (oorDeepConfirmations < 1) throw new Error('OOR_DEEP_CONFIRMATIONS must be >= 1');
   if (swapSlippageBps < 0 || swapSlippageBps >= 10_000) throw new Error('SWAP_SLIPPAGE_BPS must be 0..9999');
+  if (maxSwapPriceImpactBps < 0 || maxSwapPriceImpactBps > 1000) {
+    throw new Error('MAX_SWAP_PRICE_IMPACT_BPS must be 0..1000');
+  }
+  if (autoTopupMaxSwapPriceImpactBps < 0 || autoTopupMaxSwapPriceImpactBps > 1000) {
+    throw new Error('AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS must be 0..1000');
+  }
+  if (autoTopupSwapPoolId && !/^0x[0-9a-f]{64}$/.test(autoTopupSwapPoolId)) {
+    throw new Error('AUTO_TOPUP_SWAP_POOL_ID must be a pool bytes32 ID');
+  }
+  if (autoTopupSwapEnabled && !autoTopupSwapPoolId) {
+    throw new Error('AUTO_TOPUP_SWAP_ENABLED requires AUTO_TOPUP_SWAP_POOL_ID');
+  }
   if (depositSlippageBps < 0 || depositSlippageBps >= 10_000) throw new Error('DEPOSIT_SLIPPAGE_BPS must be 0..9999');
   if (withdrawSlippageBps < 0 || withdrawSlippageBps >= 10_000) throw new Error('WITHDRAW_SLIPPAGE_BPS must be 0..9999');
+  if (!(autoTopupMinIdleUsd > 0) || !Number.isFinite(autoTopupMinIdleUsd)) {
+    throw new Error('AUTO_TOPUP_MIN_IDLE_USD must be positive');
+  }
+  if (autoTopupDustBps < 0 || autoTopupDustBps > 1000) {
+    throw new Error('AUTO_TOPUP_DUST_BPS must be 0..1000');
+  }
+  if (autoTopupMinIntervalSec < 60) throw new Error('AUTO_TOPUP_MIN_INTERVAL_SEC must be at least 60');
+  if (topUpMinGasReserveWei < 0n || topUpMinGasReserveWei > parseEther('1')) {
+    throw new Error('AUTO_TOPUP_MIN_GAS_ETH must be between 0 and 1 ETH');
+  }
   if (!dryRun && enableLiveWrites && !privateKey) throw new Error('PRIVATE_KEY is required when live writes are enabled');
   if (!dryRun && enableAutoRedeploy && !enableLiveWrites) throw new Error('ENABLE_AUTO_REDEPLOY requires ENABLE_LIVE_WRITES=true');
   if (!dryRun && enableAutoRedeploy && (!eip7702GuardAddress || !eip7702GuardVerified)) {
@@ -92,6 +126,14 @@ export function loadConfig() {
     dryRun,
     enableLiveWrites,
     enableAutoRedeploy,
+    autoTopupEnabled: envBool('AUTO_TOPUP_ENABLED', false),
+    autoTopupSwapEnabled,
+    autoTopupSwapPoolId,
+    autoTopupMaxSwapPriceImpactBps,
+    autoTopupMinIdleUsd,
+    autoTopupDustBps,
+    autoTopupMinIntervalSec,
+    topUpMinGasReserveWei,
     targetMode,
     targetSymbols,
     targetPoolIds,
@@ -118,6 +160,7 @@ export function loadConfig() {
     minRebalanceIntervalSec: envInt('MIN_REBALANCE_INTERVAL_SEC', 300),
     maxRebalancesPerHour: envInt('MAX_REBALANCES_PER_HOUR', 3),
     swapSlippageBps,
+    maxSwapPriceImpactBps,
     depositSlippageBps,
     withdrawSlippageBps,
     depositLiquidityReserveBps: envInt('DEPOSIT_LIQUIDITY_RESERVE_BPS', 10),
@@ -125,6 +168,8 @@ export function loadConfig() {
     permit2ExpirationSec: envInt('PERMIT2_EXPIRATION_SEC', 30 * 24 * 60 * 60),
     eip7702GuardAddress,
     eip7702GuardVerified,
+    eip7702GuardVerificationEnabled,
+    eip7702GuardVerifiedFor,
     claimBeforeWithdraw: envBool('CLAIM_BEFORE_WITHDRAW', true),
     allowZeroMinOut: envBool('ALLOW_ZERO_MIN_OUT', false),
     txDeadlineSec: envInt('TX_DEADLINE_SEC', 1200),

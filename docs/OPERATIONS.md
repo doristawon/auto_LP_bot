@@ -3,7 +3,7 @@
 ## 初次啟動
 
 ```bash
-npm install
+npm ci
 cp .env.example .env
 npm run once
 npm start
@@ -19,17 +19,11 @@ ENABLE_AUTO_REDEPLOY=false
 
 ## Dashboard
 
-### 2026-09-27 MOO/USDG 小額實盤紀錄
+### 安全操作摘要
 
-- 首次建倉指定池：`0x6b187fad6ca2dcb913f2451c5d5e24d3d77b9d09ce272c2c99f64dac672bc485`。`RANGE_PRESET=fables-tight` 依 Fables 前端的 Tight 規則（約 ±1%，以池子的 Tick 間距取整）計算；首次鏈上部位 Tick `320000–320400`。`TIGHT_WIDTH_BPS=120` 僅供 `custom-bps` 模式使用。截圖上的價格與 APR 是當時畫面，實際區間每次以最新鏈上 Tick 計算。
-- 小額首次建倉用 `20 USDG`。預檢可用 `npm run bootstrap:moo -- --amount-usdg=20`，`--execute` 會送出真實交易；腳本發現現有 MOO/USDG LP 時會拒絕重複建倉。本次 swap TX：`0x3211b233f100e10a0b6ad7681ce848ab69ad015659b23881d3c4e82e59298a7b`；deposit TX：`0x121e252f4199824f9fab0c9013f2a0f60ed4c9b2aa381575cd10093738882e57`。
-- Guard implementation：`0xEA894F3427949be7B2b89e20EF9fCdabb6bA2517`；wallet EIP-7702 delegation、`guardVersion`、`IMPLEMENTATION` 及真實區間內部位觸發的 `InRange` revert 均已核對。守護合約不會讓區間內 LP 被提領。
-- 錢包最早可見入金在區塊 `73275234`，掃描起點設為 `73275000`；RPC 限制單次 `eth_getLogs` 5,000 blocks，分段上限設為 5,000、最小 500。LP range candidates 已保存到錢包專屬 state，重啟後仍能接管。
-- 中控台網址 `http://127.0.0.1:18087`。綁定本機回環位址時不要求中控台權杖；若改綁外部網路介面，必須設定 `DASHBOARD_TOKEN`。排程工作 `AutoLPBotDashboard` 維持網站與監控程序；程序重啟會安全暫停新的再平衡，需要在中控台重新按「啟動」。
-- 首次區間外的真實 withdraw → swap → deposit 尚未發生；發生時必須核對三筆 receipt、舊 shares 歸零、新 shares 與本機帳務。若顯示 `recovery_required`，停止新的資產移動並按下文流程檢查。
+本手冊不記錄特定錢包的持倉、交易雜湊、區塊掃描起點或實盤金額。每個錢包的 state 與 ledger 使用獨立路徑；請透過本機 Dashboard 與鏈上 explorer 核對目前狀態。
 
-預設網址為 `http://127.0.0.1:8787`；若本機埠被佔用，請使用 `.env` 中 `DASHBOARD_PORT` 指定的網址。本工作目錄目前使用 `http://127.0.0.1:18087`。
-
+Dashboard 預設網址：`http://127.0.0.1:8787`。若本機埠被佔用，使用 `.env` 的 `DASHBOARD_PORT` 更新網址。
 中控台介面使用繁體中文，功能分頁如下：
 
 - **總覽**：資產價值、損益、LP 部位、執行狀態與安全閘門。
@@ -41,11 +35,11 @@ ENABLE_AUTO_REDEPLOY=false
 
 APR 更新、區間檢查與分數模擬可分別在各自分頁設定，設定保存在本機 `data/dashboard-settings.json`，適用於所有錢包。預設 APR 更新為 60 秒、區間檢查為 300 秒、分數模擬為 15 秒；各自允許範圍會顯示在欄位旁。
 
-池子分頁的「OOR 後再投入模式」可選擇自動挑選最高有效 APR 池，或用關鍵字搜尋後從 APR 排序下拉選單指定池。自動模式只接受新鮮 APR、未暫停、TVL 至少 `APR_POOL_MIN_TVL_USD`（預設 30,000 美元），且每項非零 Fables 登錄代幣餘額都能預先報價的候選池。跨池再投入會先檢查來源部位仍在區間外、所有兌換路徑可用並完成報價；任一條件不成立就保留原 LP，不先提領。符合 OOR 政策撤池後，將已登錄 Fables 代幣餘額兌換並以 Fables Tight 區間投入，保留無法投入的零頭及原生 ETH Gas 餘額。
+池子分頁的「OOR 後再投入模式」可選擇自動挑選最高有效 APR 池，或用關鍵字搜尋後從 APR 排序下拉選單指定池。自動模式只接受新鮮 APR、未暫停且 TVL 至少 `APR_POOL_MIN_TVL_USD`（預設 30,000 美元）的候選池。目前跨池實盤缺少提領前的完整兌幣後存入模擬，因此會在提領前安全阻擋並保留原 LP；預演的資金範圍限於來源與目的池交易對及提領預估，不包含無關代幣。既有 LP 仍在區間內時，同池補倉可直接存入錢包中的交易對餘額；若依下方設定明確開啟單池換幣，且完整順序模擬通過，才會換幣後補倉。資產比例不符、費用超限或 Gas 保留不足時，餘額會留在錢包。
 
 設定 `PERSIST_RUNTIME_CREDENTIALS=true` 後，成功驗證的自訂 RPC 與目前錢包私鑰／地址會原子寫入本機 `.env`，並將檔案 ACL 限定為目前使用者、SYSTEM 與系統管理員；`.env` 必須維持 Git 忽略。助記詞不會保存，僅在匯入時推導並保存私鑰。API 與日誌不回傳憑證。匯入／切換錢包會強制預演、關閉鏈上寫入與自動重新部署，並暫停執行；每次程序重啟也都會保持暫停，需確認啟動條件後按下大按鈕。每個錢包使用獨立狀態與帳務紀錄。
 
-自訂 RPC 會先驗證實際 `eth_chainId` 為 4663，並保留官方公開 RPC 作讀取備援。池級 APR 沿用 Fables 公開估算公式：過去 24 小時手續費 × 365 ÷ 目前 TVL；它不是此錢包的實際報酬。Fables 統計來源暫時無法使用時，鏈上監控仍會繼續，缺少資料的 APR 會留白。
+自訂 RPC 會先驗證實際 `eth_chainId` 為 4663，並保留官方公開 RPC 作讀取備援。池級 APR 沿用 Fables 公開估算公式：過去 24 小時手續費 × 365 ÷ 目前 TVL；它不是此錢包的實際報酬。Fables 統計來源暫時無法使用時，RPC 的鏈上部位監控與帳務仍可讀取，但 APR 會留白，依 APR 選跨池再投入目標會 fail closed；官方 Points 與費用佐證也可能暫時不可用。
 
 控制項：
 
@@ -78,6 +72,14 @@ Manual control **不能**繞過：
 7. receipt-reconciled executor state machine
 
 Dashboard 僅綁定 `127.0.0.1` 時不需要 `DASHBOARD_TOKEN`，符合本機部署用途。若 `DASHBOARD_HOST` 改成非 loopback 位址，才必須設定權杖。
+
+## 區間內閒置餘額加倉
+
+`AUTO_TOPUP_ENABLED=true` 會把目前唯一、仍在區間內的 LP 交易對閒置代幣投入原區間，保留 `AUTO_TOPUP_DUST_BPS` 零頭與 `AUTO_TOPUP_MIN_GAS_ETH` Gas。預設不換幣；若要處理比例不符的餘額，須另外設定 `AUTO_TOPUP_SWAP_ENABLED=true`、**單一** `AUTO_TOPUP_SWAP_POOL_ID` 及該池的 `AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS`。一般再平衡仍受獨立的 `MAX_SWAP_PRICE_IMPACT_BPS` 限制。
+
+執行 `npm run preflight:topup` 可唯讀預演目前唯一 LP 的授權、換幣、存入與模擬後 Tick。機器人會在任何交易前模擬完整順序；授權完成後再用最新池價與已上鏈的授權重跑「換幣→存入」模擬。任一步失敗即不送出換幣，退回不換幣加倉或記錄失敗。鏈上狀態仍可能在模擬與成交間改變；若換幣已成交而存入失敗，journal 進入 `recovery_required` 並暫停後續自動交易。
+
+Points 全池歷史資料在背景分段回補；回補未追上鏈頭前，中控台只提供暫估分數，不標示為完整預測，且不延遲 LP 監控。
 
 建議先跑 24 小時以上 dry-run，確認：
 

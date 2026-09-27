@@ -18,7 +18,7 @@ const pool = {
   },
   token0: { address: '0x0000000000000000000000000000000000000011', symbol: 'T0', decimals: 18 },
   token1: { address: '0x0000000000000000000000000000000000000022', symbol: 'T1', decimals: 18 },
-  state: { tick: 1100, sqrtPriceX96: getSqrtPriceAtTick(1100), paused: false }
+  state: { tick: 1100, sqrtPriceX96: getSqrtPriceAtTick(1100), paused: false, liquidity: 1n }
 };
 const position = {
   id: '0x' + '11'.repeat(32),
@@ -35,17 +35,17 @@ function createHarness({ failSwap = false } = {}) {
   const settings = new Map();
   const balances = [
     { raw0: 10_000_000_000_000_000_000n, raw1: 10_000_000_000_000_000_000n },
-    { raw0: 110_000_000_000_000_000_000n, raw1: 10_000_000_000_000_000_000n },
-    // Exact-input mock: executor asks to swap 52.747082710266113281 T0 at 1:1.
-    { raw0: 57_252_917_289_733_886_719n, raw1: 62_747_082_710_266_113_281n }
+    { raw0: 110_000_000_000_000_000_000n, raw1: 10_000_000_000_000_000_000n }
   ];
   let balanceIndex = 0;
+  let postSwapBalance = null;
+  let lastSwapQuote = null;
   const state = {
     getSetting(key, fallback) { return settings.has(key) ? settings.get(key) : fallback; },
     setSetting(key, value) { settings.set(key, value); }
   };
   const fables = {
-    async readPoolState() { return { tick: 1100, sqrtPriceX96: getSqrtPriceAtTick(1100), paused: false }; },
+    async readPoolState() { return { tick: 1100, sqrtPriceX96: getSqrtPriceAtTick(1100), paused: false, liquidity: 1n }; },
     async readRangeKey() {
       return {
         exists: true,
@@ -84,20 +84,28 @@ function createHarness({ failSwap = false } = {}) {
   executor.assertLiveReady = async () => {};
   executor.assertNoUnfinishedExecution = () => {};
   executor.assertPlanStillOutOfRange = async (plan) => {
-    plan.pool.state = { tick: 1100, sqrtPriceX96: getSqrtPriceAtTick(1100), paused: false };
+    plan.pool.state = { tick: 1100, sqrtPriceX96: getSqrtPriceAtTick(1100), paused: false, liquidity: 1n };
     return plan.pool.state;
   };
-  executor.readRawPairBalances = async () => balances[Math.min(balanceIndex++, balances.length - 1)];
+  executor.readRawPairBalances = async () => {
+    if (balanceIndex < balances.length) return balances[balanceIndex++];
+    return postSwapBalance || balances.at(-1);
+  };
   executor.readPositionShares = async (_pool, rangeId) => rangeId === position.id ? 0n : 5_000_000_000_000_000n;
   executor.ensureSwapAllowances = async () => {};
   executor.ensureHookAllowance = async () => {};
   executor.quoter = {
     async quoteExactInputSingleRaw(_pool, tokenIn, rawAmountIn, slippageBps) {
       rawAmountIn = BigInt(rawAmountIn);
+      const sqrt = getSqrtPriceAtTick(1100);
+      const q192 = 1n << 192n;
+      const rawAmountOut = tokenIn === 0
+        ? rawAmountIn * sqrt * sqrt / q192
+        : rawAmountIn * q192 / (sqrt * sqrt);
       return {
         rawAmountIn: rawAmountIn.toString(),
-        rawAmountOut: rawAmountIn.toString(),
-        minRawAmountOut: (rawAmountIn * BigInt(10000 - slippageBps) / 10000n).toString(),
+        rawAmountOut: rawAmountOut.toString(),
+        minRawAmountOut: (rawAmountOut * BigInt(10000 - slippageBps) / 10000n).toString(),
         tokenIn: tokenIn === 0 ? pool.token0.address : pool.token1.address,
         tokenOut: tokenIn === 0 ? pool.token1.address : pool.token0.address,
         zeroForOne: tokenIn === 0
@@ -106,6 +114,7 @@ function createHarness({ failSwap = false } = {}) {
   };
   executor.router = {
     buildV4ExactInputSingle({ quote, deadline }) {
+      lastSwapQuote = quote;
       return { router: '0x0000000000000000000000000000000000000099', data: '0x1234', value: 0n, quote, deadline };
     },
     async simulateV4ExactInputSingle() { return '0x'; }
@@ -116,6 +125,14 @@ function createHarness({ failSwap = false } = {}) {
     const hash = '0x' + sent.toString(16).padStart(64, '0');
     if (onSent) onSent(hash);
     if (failSwap && label === 'v4SwapExactInputSingle') throw new Error('mock swap failure');
+    if (label === 'v4SwapExactInputSingle') {
+      const before = balances.at(-1);
+      const input = BigInt(lastSwapQuote.rawAmountIn);
+      const output = BigInt(lastSwapQuote.rawAmountOut);
+      postSwapBalance = lastSwapQuote.zeroForOne
+        ? { raw0: before.raw0 - input, raw1: before.raw1 + output }
+        : { raw0: before.raw0 + output, raw1: before.raw1 - input };
+    }
     return {
       hash,
       status: 1,

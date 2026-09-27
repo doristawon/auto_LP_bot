@@ -10,7 +10,7 @@ const BASE = {
 };
 
 function withEnv(extra, fn) {
-  const keys = new Set([...Object.keys(BASE), ...Object.keys(extra), 'TARGET_POOL_IDS', 'TARGET_SYMBOLS', 'TARGET_MODE', 'SWAP_SLIPPAGE_BPS', 'PRIVATE_KEY', 'EIP7702_GUARD_ADDRESS', 'EIP7702_GUARD_VERIFIED', 'DASHBOARD_MANUAL_CONTROL_ENABLED', 'POINTS_GLOBAL_SWAP_SCAN_ENABLED', 'RPC_REQUEST_TIMEOUT_MS']);
+  const keys = new Set([...Object.keys(BASE), ...Object.keys(extra), 'TARGET_POOL_IDS', 'TARGET_SYMBOLS', 'TARGET_MODE', 'SWAP_SLIPPAGE_BPS', 'MAX_SWAP_PRICE_IMPACT_BPS', 'AUTO_TOPUP_SWAP_ENABLED', 'AUTO_TOPUP_SWAP_POOL_ID', 'AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS', 'PRIVATE_KEY', 'EIP7702_GUARD_ADDRESS', 'EIP7702_GUARD_VERIFIED', 'EIP7702_GUARD_VERIFIED_FOR', 'DASHBOARD_MANUAL_CONTROL_ENABLED', 'POINTS_GLOBAL_SWAP_SCAN_ENABLED', 'RPC_REQUEST_TIMEOUT_MS']);
   const previous = Object.fromEntries([...keys].map((k) => [k, process.env[k]]));
   try {
     for (const key of keys) delete process.env[key];
@@ -67,6 +67,21 @@ test('invalid swap slippage fails closed', () => {
   );
 });
 
+test('top-up swap cost override is bound to one explicitly selected pool', () => {
+  const poolId = '0x' + 'ab'.repeat(32);
+  const config = withEnv({
+    AUTO_TOPUP_SWAP_ENABLED: 'true',
+    AUTO_TOPUP_SWAP_POOL_ID: poolId,
+    MAX_SWAP_PRICE_IMPACT_BPS: '200',
+    AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS: '350'
+  }, loadConfig);
+  assert.equal(config.maxSwapPriceImpactBps, 200);
+  assert.equal(config.autoTopupMaxSwapPriceImpactBps, 350);
+  assert.equal(config.autoTopupSwapPoolId, poolId);
+  assert.throws(() => withEnv({ AUTO_TOPUP_SWAP_ENABLED: 'true' }, loadConfig), /requires AUTO_TOPUP_SWAP_POOL_ID/);
+  assert.throws(() => withEnv({ AUTO_TOPUP_SWAP_POOL_ID: 'not-a-pool' }, loadConfig), /pool bytes32 ID/);
+});
+
 test('live auto-redeploy requires the atomic guard to be configured and canary-verified', () => {
   assert.throws(
     () => withEnv({
@@ -78,6 +93,24 @@ test('live auto-redeploy requires the atomic guard to be configured and canary-v
     }, () => loadConfig()),
     /EIP-7702 atomic OOR guard/
   );
+});
+
+test('guard verification applies only to the wallet that passed its canary', () => {
+  const guard = '0x00000000000000000000000000000000000000aa';
+  const otherWallet = '0x00000000000000000000000000000000000000bb';
+  const matching = withEnv({ EIP7702_GUARD_ADDRESS: guard,
+    EIP7702_GUARD_VERIFIED: 'true', EIP7702_GUARD_VERIFIED_FOR: BASE.WALLET_ADDRESS }, loadConfig);
+  assert.equal(matching.eip7702GuardVerified, true);
+  const mismatched = withEnv({ EIP7702_GUARD_ADDRESS: guard,
+    EIP7702_GUARD_VERIFIED: 'true', EIP7702_GUARD_VERIFIED_FOR: otherWallet }, loadConfig);
+  assert.equal(mismatched.eip7702GuardVerified, false);
+  const unbound = withEnv({ EIP7702_GUARD_ADDRESS: guard,
+    EIP7702_GUARD_VERIFIED: 'true' }, loadConfig);
+  assert.equal(unbound.eip7702GuardVerified, false);
+  const disabled = withEnv({ EIP7702_GUARD_ADDRESS: guard,
+    EIP7702_GUARD_VERIFIED: 'false', EIP7702_GUARD_VERIFIED_FOR: BASE.WALLET_ADDRESS }, loadConfig);
+  assert.equal(disabled.eip7702GuardVerificationEnabled, false);
+  assert.equal(disabled.eip7702GuardVerified, false);
 });
 
 

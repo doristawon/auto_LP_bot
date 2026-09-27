@@ -4,6 +4,7 @@ import {
   Wallet,
   formatUnits,
   id,
+  keccak256,
   zeroPadValue
 } from 'ethers';
 import {
@@ -20,23 +21,32 @@ import {
 } from '../constants.js';
 import { UniversalRouterAdapter } from './universal-router.js';
 import { V4QuoterAdapter } from './quoter.js';
-import { buildExactBalancedSwapPlan } from '../execution/exact-rebalance.js';
+import { buildExactBalancedSwapPlan, quotePriceImpactBps } from '../execution/exact-rebalance.js';
+import { simulateSequentialCalls } from '../execution/sequential-simulation.js';
 import {
   MAX_UINT128,
   buildExactDepositPlan,
   buildExactWithdrawBounds
 } from '../math/v4-fixed.js';
-import { buildTargetRange, isLpOutOfRange } from '../math/ticks.js';
+import { buildTargetRange, isLpInRange, isLpOutOfRange } from '../math/ticks.js';
 import { outOfRangeExcursionPct } from '../strategy.js';
-import { buildV4PathKeys, chooseInvestmentAnchor } from '../execution/investment-target.js';
+import {
+  buildCrossPoolFundingScope,
+  buildV4PathKeys,
+  chooseInvestmentAnchor
+} from '../execution/investment-target.js';
 import { log } from '../logger.js';
 
 const erc20Interface = new Interface(ERC20_ABI);
 const permit2Interface = new Interface(PERMIT2_ABI);
 const guardInterface = new Interface(EIP7702_GUARD_ABI);
+const swapEventInterface = new Interface([
+  'event Swap(bytes32 indexed id,address indexed sender,int128 amount0,int128 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint24 fee)'
+]);
 const depositedTopic = id(DEPOSITED_EVENT).toLowerCase();
-const MAX_UINT256 = (1n << 256n) - 1n;
-const MAX_UINT160 = (1n << 160n) - 1n;
+const TOP_UP_DEPOSIT_GAS_LIMIT = 1_200_000n;
+const TOP_UP_APPROVAL_GAS_RESERVE = 300_000n;
+const TOP_UP_SWAP_GAS_LIMIT = 1_500_000n;
 
 export class RebalanceExecutor {
   constructor(readProvider, writeProvider, config, fables, ledger, getUsdPrice, state = null) {
@@ -55,16 +65,16 @@ export class RebalanceExecutor {
   async execute(plan) {
     await this.assertPlanStillOutOfRange(plan, 'executor-entry');
 
+    const destinationPool = plan.destinationPool || plan.pool;
+    if (String(destinationPool.id).toLowerCase() !== String(plan.pool.id).toLowerCase()) {
+      return this.executeCrossPool(plan, destinationPool);
+    }
+
     if (this.config.dryRun || !this.config.enableLiveWrites) {
       const payload = serializablePlan(plan);
       this.ledger.append('rebalance.dry_run', payload);
       log('info', 'rebalance.dry_run', payload);
       return { status: 'dry-run' };
-    }
-
-    const destinationPool = plan.destinationPool || plan.pool;
-    if (String(destinationPool.id).toLowerCase() !== String(plan.pool.id).toLowerCase()) {
-      return this.executeCrossPool(plan, destinationPool);
     }
 
     await this.assertLiveReady(plan);
@@ -91,13 +101,21 @@ export class RebalanceExecutor {
       journal = this.patchJournal(journal, {
         preBalancesRaw: stringifyRawBalances(preBalances)
       });
+      const approvalState = await this.fables.readPoolState(plan.pool);
+      const approvalBounds = buildExactWithdrawBounds({
+        sqrtPriceX96: approvalState.sqrtPriceX96,
+        tickLower: plan.position.tickLower,
+        tickUpper: plan.position.tickUpper,
+        liquidity: plan.position.shares,
+        slippageBps: this.config.withdrawSlippageBps
+      });
 
       // Prepare every approval path before principal is withdrawn. If a meme token
       // rejects approve/Permit2, fail while the LP is still intact.
-      await this.ensureSwapAllowances(plan.pool.token0, MAX_UINT160);
-      await this.ensureSwapAllowances(plan.pool.token1, MAX_UINT160);
-      await this.ensureHookAllowance(plan.pool.token0, plan.pool.key.hooks, MAX_UINT128);
-      await this.ensureHookAllowance(plan.pool.token1, plan.pool.key.hooks, MAX_UINT128);
+      await this.ensureSwapAllowances(plan.pool.token0, approvalBounds.expected0 + BigInt(plan.position.owed0 || 0n));
+      await this.ensureSwapAllowances(plan.pool.token1, approvalBounds.expected1 + BigInt(plan.position.owed1 || 0n));
+      await this.ensureHookAllowance(plan.pool.token0, plan.pool.key.hooks, approvalBounds.expected0 + BigInt(plan.position.owed0 || 0n));
+      await this.ensureHookAllowance(plan.pool.token1, plan.pool.key.hooks, approvalBounds.expected1 + BigInt(plan.position.owed1 || 0n));
       journal = this.patchJournal(journal, { phase: 'approvals_ready' });
 
       // Approvals can consume blocks; re-check OOR only after all non-capital-moving
@@ -192,7 +210,8 @@ export class RebalanceExecutor {
         sqrtPriceX96: postWithdrawState.sqrtPriceX96,
         tickLower: targetAfterWithdraw.tickLower,
         tickUpper: targetAfterWithdraw.tickUpper,
-        slippageBps: this.config.swapSlippageBps
+        slippageBps: this.config.swapSlippageBps,
+        maxPriceImpactBps: this.config.maxSwapPriceImpactBps ?? 200
       });
       journal = this.patchJournal(journal, {
         targetAfterWithdraw,
@@ -203,16 +222,17 @@ export class RebalanceExecutor {
       if (swapPlan.direction !== 'none') {
         const inputToken = swapPlan.tokenIn === 0 ? plan.pool.token0 : plan.pool.token1;
         await this.ensureSwapAllowances(inputToken, swapPlan.rawAmountIn);
+        const executableSwapPlan = await this.refreshSingleSwapQuote(plan.pool, swapPlan, 'immediately-before-swap');
 
         const swapDeadline = this.deadline();
         const request = this.router.buildV4ExactInputSingle({
           pool: plan.pool,
-          quote: swapPlan.quote,
+          quote: executableSwapPlan.quote,
           deadline: swapDeadline
         });
         await this.router.simulateV4ExactInputSingle({
           pool: plan.pool,
-          quote: swapPlan.quote,
+          quote: executableSwapPlan.quote,
           deadline: swapDeadline,
           from: this.config.walletAddress
         });
@@ -229,10 +249,11 @@ export class RebalanceExecutor {
         });
         phase = 'swap_confirmed';
         postSwapBalances = await this.readRawPairBalances(plan.pool);
-        this.assertSwapReceiptBalances(plan.pool, swapPlan, beforeSwap, postSwapBalances);
+        this.assertSwapReceiptBalances(plan.pool, executableSwapPlan, beforeSwap, postSwapBalances);
         journal = this.patchJournal(journal, {
           phase,
           tx: { ...journal.tx, swap: swapReceipt.hash || journal.tx.swap },
+          swapPlan: serializeSwapPlan(executableSwapPlan),
           postSwapBalancesRaw: stringifyRawBalances(postSwapBalances)
         });
       } else {
@@ -378,7 +399,7 @@ export class RebalanceExecutor {
         target: finalTarget
       };
     } catch (error) {
-      const afterCapitalMoved = [
+      const afterCapitalMoved = error.code === 'BROADCAST_OUTCOME_UNCERTAIN' || [
         'withdraw_sent',
         'withdraw_confirmed',
         'swap_sent',
@@ -405,452 +426,521 @@ export class RebalanceExecutor {
     }
   }
 
-  async executeCrossPool(plan, destinationPool) {
-    const sourcePool = plan.pool;
-    await this.assertLiveReady(plan);
-    await this.assertLiveReady({ ...plan, pool: destinationPool });
+  async topUpPoolPosition({
+    pool,
+    position,
+    dustBps = 0,
+    minGasReserveWei = this.config.topUpMinGasReserveWei
+  }) {
+    const liveWrites = this.config.enableLiveWrites && !this.config.dryRun;
+    const swapEnabledForPool = this.config.autoTopupSwapEnabled === true
+      && String(pool?.id || '').toLowerCase() === String(this.config.autoTopupSwapPoolId || '').toLowerCase();
+    const topUpMaxPriceImpactBps = swapEnabledForPool
+      ? this.config.autoTopupMaxSwapPriceImpactBps
+      : this.config.maxSwapPriceImpactBps ?? 200;
+    if (!Number.isInteger(Number(dustBps)) || Number(dustBps) < 0 || Number(dustBps) >= 10_000) {
+      throw new Error('Top-up dustBps must be an integer from 0 through 9999');
+    }
+    if (!pool?.token0 || !pool?.token1 || !position?.id) {
+      throw new Error('Top-up requires a pool and one identified LP position');
+    }
+    if (
+      pool.token0.address.toLowerCase() === ZERO_ADDRESS
+      || pool.token1.address.toLowerCase() === ZERO_ADDRESS
+    ) {
+      throw new Error('Native-token top-up is not enabled');
+    }
     this.assertNoUnfinishedExecution();
+
+    let validation = await this.validateTopUpPosition(pool, position, 'top-up-entry');
+    this.assertTokenPrices(pool);
+    const initialBalances = await this.readRawPairBalances(pool);
+    const dustRaw = {
+      raw0: initialBalances.raw0 * BigInt(dustBps) / 10_000n,
+      raw1: initialBalances.raw1 * BigInt(dustBps) / 10_000n
+    };
+    const funding = {
+      raw0: initialBalances.raw0 - dustRaw.raw0,
+      raw1: initialBalances.raw1 - dustRaw.raw1
+    };
+    if (funding.raw0 < 0n || funding.raw1 < 0n) throw new Error('Top-up dust exceeds wallet pair balances');
+    if (funding.raw0 === 0n && funding.raw1 === 0n) {
+      return { status: 'skipped', reason: 'no pair-token balance remains after dust reserve', poolId: pool.id, positionId: position.id };
+    }
+
+    let swapPlan = { direction: 'not-quoted', tokenIn: null, tokenOut: null, rawAmountIn: 0n, quote: null };
+    let swapQuoteError = null;
+    if (!liveWrites || swapEnabledForPool) {
+      try {
+        swapPlan = await buildExactBalancedSwapPlan({
+          pool,
+          quoter: this.quoter,
+          rawAmount0: funding.raw0,
+          rawAmount1: funding.raw1,
+          sqrtPriceX96: validation.state.sqrtPriceX96,
+          tickLower: Number(position.tickLower),
+          tickUpper: Number(position.tickUpper),
+          slippageBps: this.config.swapSlippageBps,
+          maxPriceImpactBps: topUpMaxPriceImpactBps
+        });
+      } catch (error) { swapQuoteError = error.message; }
+    }
+    // Build the live-safe fallback from the inventory that already exists in
+    // the wallet. The optional swap projection is informational only: no swap
+    // may be broadcast until the projected post-swap deposit can be simulated
+    // with an RPC state override and then re-simulated against actual balances.
+    let swapProjectedInventory = { ...funding };
+    if (swapPlan.direction !== 'none' && swapPlan.direction !== 'not-quoted') {
+      const amountOut = BigInt(swapPlan.quote.minRawAmountOut);
+      if (swapPlan.tokenIn === 0) {
+        swapProjectedInventory = { raw0: funding.raw0 - swapPlan.rawAmountIn, raw1: funding.raw1 + amountOut };
+      } else {
+        swapProjectedInventory = { raw0: funding.raw0 + amountOut, raw1: funding.raw1 - swapPlan.rawAmountIn };
+      }
+    }
+    let optionalSwapDepositPlan = null;
+    let optionalSwapDepositPlanError = null;
+    let optionalSwapPreview = null;
+    try {
+      if (swapPlan.direction === 'none' || swapPlan.direction === 'not-quoted') throw new Error('No optional swap projection available');
+      const swapApprovals = await this.buildTopUpApprovalRequests(
+        pool, swapPlan, { amount0Max: 0n, amount1Max: 0n }
+      );
+      optionalSwapPreview = await this.simulateTopUpSwapPreview({
+        pool, approvalRequests: swapApprovals, swapPlan
+      });
+      if (!isLpInRange(optionalSwapPreview.tick, Number(position.tickLower), Number(position.tickUpper))) {
+        throw new Error('Simulated swap moves the original LP out of range');
+      }
+      if (optionalSwapPreview.balances.raw0 < swapProjectedInventory.raw0 + dustRaw.raw0
+        || optionalSwapPreview.balances.raw1 < swapProjectedInventory.raw1 + dustRaw.raw1) {
+        throw new Error('Simulated swap balances are below the conservative minOut inventory');
+      }
+      optionalSwapDepositPlan = buildExactDepositPlan({
+        rawAmount0: swapProjectedInventory.raw0,
+        rawAmount1: swapProjectedInventory.raw1,
+        sqrtPriceX96: optionalSwapPreview.sqrtPriceX96,
+        tickLower: Number(position.tickLower),
+        tickUpper: Number(position.tickUpper),
+        slippageBps: this.config.depositSlippageBps,
+        liquidityReserveBps: this.config.depositLiquidityReserveBps
+      });
+      this.assertValidDeposit(optionalSwapDepositPlan, 'Projected top-up deposit liquidity is invalid');
+    } catch (error) {
+      optionalSwapDepositPlanError = error.message;
+    }
+    let depositPlan;
+    let depositOnlyError = null;
+    try {
+      depositPlan = buildExactDepositPlan({
+        rawAmount0: funding.raw0,
+        rawAmount1: funding.raw1,
+        sqrtPriceX96: validation.state.sqrtPriceX96,
+        tickLower: Number(position.tickLower),
+        tickUpper: Number(position.tickUpper),
+        slippageBps: this.config.depositSlippageBps,
+        liquidityReserveBps: this.config.depositLiquidityReserveBps
+      });
+    } catch (error) {
+      depositOnlyError = error.message;
+    }
+    if (depositPlan) this.assertValidDeposit(depositPlan, 'Top-up deposit-only liquidity is invalid');
+    if (!depositPlan && !optionalSwapDepositPlan) {
+      return {
+        status: 'skipped',
+        reason: `Current pair balances cannot form a positive deposit: ${depositOnlyError || optionalSwapDepositPlanError}`,
+        poolId: pool.id,
+        positionId: position.id
+      };
+    }
+    const expectedInventory = { ...funding };
+    const initialUsd = this.valuePairBalances(pool, funding);
+    const preview = {
+      poolId: pool.id,
+      pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+      positionId: position.id,
+      range: { tickLower: Number(position.tickLower), tickUpper: Number(position.tickUpper) },
+      currentTick: validation.state.tick,
+      walletBalancesRaw: stringifyRawBalances(initialBalances),
+      dustRaw: stringifyRawBalances(dustRaw),
+      fundingRaw: stringifyRawBalances(funding),
+      fundingUsd: initialUsd,
+      swapPolicy: swapEnabledForPool
+        ? 'swap only after sequential approve + swap + deposit simulation'
+        : 'deposit-only; optional swap is disabled',
+      swapPlan: serializeSwapPlan(swapPlan),
+      swapQuoteError,
+      projectedInventoryRaw: stringifyRawBalances(expectedInventory),
+      depositPlan: depositPlan ? serializeDepositPlan(depositPlan) : null,
+      depositOnlyError,
+      optionalSwapProjection: {
+        inventoryRaw: stringifyRawBalances(swapProjectedInventory),
+        simulatedTick: optionalSwapPreview?.tick ?? null,
+        depositPlan: optionalSwapDepositPlan ? serializeDepositPlan(optionalSwapDepositPlan) : null,
+        depositPlanError: optionalSwapDepositPlanError
+      }
+    };
+
+    if (!liveWrites) {
+      let fullSwapSimulation = false;
+      if (swapEnabledForPool
+        && swapPlan.direction !== 'none' && swapPlan.direction !== 'not-quoted'
+        && optionalSwapDepositPlan) {
+        try {
+          const approvals = await this.buildTopUpApprovalRequests(pool, swapPlan, optionalSwapDepositPlan);
+          const simulation = await this.simulateTopUpSequence({
+            pool, position, approvalRequests: approvals,
+            swapPlan, depositPlan: optionalSwapDepositPlan
+          });
+          preview.swapSimulation = {
+            status: 'full-sequence-simulated',
+            calls: simulation.callCount,
+            priceImpactBps: swapPlan.priceImpactBps
+          };
+          preview.depositSimulation = {
+            status: 'post-swap-deposit-simulated',
+            liquidity: simulation.depositEvent.liquidity.toString()
+          };
+          fullSwapSimulation = true;
+        } catch (error) {
+          preview.swapSimulation = { status: 'blocked', reason: error.message };
+        }
+      }
+      try {
+        if (!fullSwapSimulation) {
+          if (!depositPlan) throw new Error('Deposit-only fallback is unavailable for this wallet inventory');
+          if (!preview.swapSimulation) {
+            preview.swapSimulation = {
+              status: swapQuoteError ? 'quote-unavailable' : swapEnabledForPool ? 'not-required' : 'disabled'
+            };
+          }
+          const previewDepositData = this.fables.encodeDeposit(
+            pool,
+            { tickLower: Number(position.tickLower), tickUpper: Number(position.tickUpper) },
+            depositPlan.liquidity,
+            depositPlan.amount0Max,
+            depositPlan.amount1Max,
+            this.deadline()
+          );
+          await this.readProvider.call({
+            from: this.config.walletAddress,
+            to: pool.key.hooks,
+            data: previewDepositData,
+            value: 0n
+          });
+          preview.depositSimulation = { status: 'deposit-only-simulated', liquidity: depositPlan.liquidity.toString() };
+        }
+      } catch (error) {
+        const blocked = { ...preview, status: 'blocked', reason: `Top-up preflight simulation failed: ${error.message}` };
+        this.ledger.append('rebalance.top_up_dry_run_blocked', blocked);
+        return { status: 'blocked', reason: blocked.reason, plan: blocked };
+      }
+      const dryRun = { ...preview, status: 'dry-run' };
+      this.ledger.append('rebalance.top_up_dry_run', dryRun);
+      log('info', 'rebalance.top_up_dry_run', {
+        poolId: pool.id,
+        positionId: position.id,
+        swapStatus: dryRun.swapSimulation?.status || null,
+        depositStatus: dryRun.depositSimulation?.status || null
+      });
+      return { status: 'dry-run', plan: dryRun };
+    }
+
+    if (this.config.autoTopupEnabled !== true) throw new Error('AUTO_TOPUP_ENABLED is not enabled');
+    if (!this.config.enableAutoRedeploy) throw new Error('ENABLE_AUTO_REDEPLOY is not enabled');
+    if (!this.signer) throw new Error('PRIVATE_KEY is missing');
+    if (this.signer.address.toLowerCase() !== this.config.walletAddress.toLowerCase()) {
+      throw new Error('PRIVATE_KEY does not match WALLET_ADDRESS');
+    }
+    if (this.state?.getSetting('executionPaused', false)) throw new Error('Execution is paused');
+    await this.assertGasGuard();
+    const reserveWei = BigInt(minGasReserveWei || 0n);
+    if (reserveWei <= 0n) throw new Error('A positive top-up native gas reserve is required');
+
+    let executableSwapPlan = null;
+    if (swapEnabledForPool
+      && swapPlan.direction !== 'none' && swapPlan.direction !== 'not-quoted'
+      && optionalSwapDepositPlan) {
+      try {
+        const proposedApprovals = await this.buildTopUpApprovalRequests(pool, swapPlan, optionalSwapDepositPlan);
+        await this.simulateTopUpSequence({
+          pool, position, approvalRequests: proposedApprovals,
+          swapPlan, depositPlan: optionalSwapDepositPlan
+        });
+        executableSwapPlan = swapPlan;
+        depositPlan = optionalSwapDepositPlan;
+        preview.swapSimulation = { status: 'full-sequence-preflighted', priceImpactBps: swapPlan.priceImpactBps };
+      } catch (error) {
+        preview.swapSimulation = { status: 'blocked; deposit-only fallback', reason: error.message };
+      }
+    }
+    if (!depositPlan) throw new Error('Full swap simulation failed and deposit-only fallback is unavailable');
+    preview.depositPlan = serializeDepositPlan(depositPlan);
+
     let phase = 'prepared';
     let journal = {
-      id: String(Date.now()) + ':' + sourcePool.id + ':' + plan.position.id + ':' + destinationPool.id,
+      id: `top-up:${Date.now()}:${pool.id}:${position.id}`,
+      kind: 'liquidity_top_up',
       phase,
       startedAt: Date.now(),
-      poolId: sourcePool.id,
-      destinationPoolId: destinationPool.id,
-      pair: sourcePool.token0.symbol + '/' + sourcePool.token1.symbol,
-      destinationPair: destinationPool.token0.symbol + '/' + destinationPool.token1.symbol,
-      oldPosition: {
-        id: plan.position.id,
-        tickLower: plan.position.tickLower,
-        tickUpper: plan.position.tickUpper,
-        shares: plan.position.shares.toString()
+      poolId: pool.id,
+      pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+      position: {
+        id: position.id,
+        tickLower: Number(position.tickLower),
+        tickUpper: Number(position.tickUpper),
+        sharesBefore: validation.shares.toString()
       },
-      tx: { withdraw: null, swaps: [], deposit: null }
+      capitalScope: {
+        source: 'wallet pair balances only',
+        walletBalancesRaw: stringifyRawBalances(initialBalances),
+        dustBps: Number(dustBps),
+        dustRaw: stringifyRawBalances(dustRaw),
+        maxSpendRaw: stringifyRawBalances(funding),
+        maxSpendUsd: initialUsd
+      },
+      swapPolicy: executableSwapPlan ? 'sequentially-simulated-swap' : 'deposit-only',
+      tx: { swap: null, deposit: null }
     };
     this.saveJournal(journal);
-    let trackedTokens = [];
+
     try {
-      if (plan.investmentTargetMode === 'apr-highest') {
-        const stats = plan.destinationStats || {};
-        const statsAge = Date.now() - Number(plan.destinationStatsObservedAt || 0);
-        const maxStatsAge = Math.max(5 * 60 * 1000, Number(this.config.marketRefreshMs || 60_000) * 3);
-        if (
-          !Number.isFinite(Number(stats.aprPct))
-          || Number(stats.aprPct) <= 0
-          || !Number.isFinite(Number(stats.fees24hUsd))
-          || Number(stats.fees24hUsd) <= 0
-          || !Number.isFinite(Number(stats.tvlUsd))
-          || Number(stats.tvlUsd) < Number(this.config.aprPoolMinTvlUsd || 30_000)
-          || statsAge < 0
-          || statsAge > maxStatsAge
-        ) {
-          throw new Error('最高 APR 池資料已過期或未達 TVL／手續費門檻，保留原 LP');
-        }
-      }
-      const routePools = plan.routingPools || [sourcePool, destinationPool];
-      const tokenByAddress = new Map();
-      for (const token of [
-        sourcePool.token0,
-        sourcePool.token1,
-        destinationPool.token0,
-        destinationPool.token1,
-        ...(plan.routingTokens || [])
-      ]) {
-        tokenByAddress.set(token.address.toLowerCase(), token);
-      }
-      trackedTokens = [...tokenByAddress.values()];
-      if ([sourcePool, destinationPool].some((pool) =>
-        pool.token0.address.toLowerCase() === ZERO_ADDRESS
-        || pool.token1.address.toLowerCase() === ZERO_ADDRESS
-      )) {
-        throw new Error('Cross-pool reinvestment does not support native-token pools');
-      }
-
-      const currentSource = await this.assertPlanStillOutOfRange(plan, 'cross-pool-preflight');
-      const initialDestinationState = await this.fables.readPoolState(destinationPool);
-      if (initialDestinationState.paused || initialDestinationState.liquidity <= 0n) {
-        throw new Error('再投入池目前已暫停或沒有可用流動性');
-      }
-      destinationPool.state = initialDestinationState;
-      const withdrawBounds = buildExactWithdrawBounds({
-        sqrtPriceX96: currentSource.sqrtPriceX96,
-        tickLower: plan.position.tickLower,
-        tickUpper: plan.position.tickUpper,
-        liquidity: plan.position.shares,
-        slippageBps: this.config.withdrawSlippageBps
+      const approvalRequests = await this.buildTopUpApprovalRequests(
+        pool,
+        executableSwapPlan || { direction: 'none' },
+        depositPlan
+      );
+      const feeOverrides = await this.getPinnedFeeOverrides();
+      const maxFeePerGas = feeCap(feeOverrides);
+      if (maxFeePerGas <= 0n) throw new Error('Cannot determine a native gas fee for top-up preflight');
+      // Some ERC-20s require allowance=0 before a new nonzero approve. Estimating
+      // the later approval against today's state would revert before the reset
+      // transaction has mined, so reserve conservatively and estimate each
+      // transaction only when its turn arrives.
+      const approvalGasLimit = TOP_UP_APPROVAL_GAS_RESERVE * BigInt(approvalRequests.length);
+      const routerGasLimit = executableSwapPlan ? TOP_UP_SWAP_GAS_LIMIT : 0n;
+      const depositGasLimit = TOP_UP_DEPOSIT_GAS_LIMIT;
+      await this.assertTopUpGasBudget({
+        reserveWei,
+        maxFeePerGas,
+        futureGasLimit: approvalGasLimit + routerGasLimit + depositGasLimit,
+        phase: 'approval-and-execution-preflight'
       });
-      if (!this.config.allowZeroMinOut && withdrawBounds.expected0 > 0n && withdrawBounds.amount0Min === 0n) {
-        throw new Error('withdraw amount0Min resolved to zero for non-zero expected principal');
-      }
-      if (!this.config.allowZeroMinOut && withdrawBounds.expected1 > 0n && withdrawBounds.amount1Min === 0n) {
-        throw new Error('withdraw amount1Min resolved to zero for non-zero expected principal');
-      }
 
-      const beforeTokens = await this.readRawTokenBalances(trackedTokens);
-      const sourceTokenAddresses = new Set([
-        sourcePool.token0.address.toLowerCase(),
-        sourcePool.token1.address.toLowerCase(),
-        destinationPool.token0.address.toLowerCase(),
-        destinationPool.token1.address.toLowerCase()
-      ]);
-      const requiredTokens = trackedTokens.filter((token) =>
-        sourceTokenAddresses.has(token.address.toLowerCase())
-        || (beforeTokens.get(token.address.toLowerCase()) || 0n) > 0n
-      );
-      const anchorPlan = chooseInvestmentAnchor(requiredTokens, destinationPool, routePools);
-      const estimatedAmounts = new Map(beforeTokens);
-      estimatedAmounts.set(
-        sourcePool.token0.address.toLowerCase(),
-        (estimatedAmounts.get(sourcePool.token0.address.toLowerCase()) || 0n) + withdrawBounds.expected0
-      );
-      estimatedAmounts.set(
-        sourcePool.token1.address.toLowerCase(),
-        (estimatedAmounts.get(sourcePool.token1.address.toLowerCase()) || 0n) + withdrawBounds.expected1
-      );
-      const routePreflight = [];
-      for (const token of trackedTokens) {
-        const address = token.address.toLowerCase();
-        if (address === anchorPlan.anchor.address.toLowerCase()) continue;
-        const amount = estimatedAmounts.get(address) || 0n;
-        if (amount <= 0n) continue;
-        const route = anchorPlan.routes.get(address);
-        if (!route?.length) throw new Error('錢包資產缺少通往再投入池的 Fables 兌換路徑');
-        const quote = await this.quoter.quoteExactInputPathRaw(
-          route, token, amount, this.config.swapSlippageBps
-        );
-        if (BigInt(quote.minRawAmountOut) <= 0n) throw new Error('兌換路徑的最低輸出量為零，拒絕先撤 LP');
-        routePreflight.push({
-          token: token.address,
-          amountIn: amount.toString(),
-          tokenOut: quote.tokenOut,
-          minAmountOut: quote.minRawAmountOut,
-          poolIds: route.map((pool) => pool.id)
+      for (const request of approvalRequests) {
+        await this.sendVerifiedTx({
+          label: request.label,
+          to: request.tx.to,
+          data: request.tx.data,
+          value: request.tx.value || 0n,
+          feeOverrides
         });
-        await this.ensureSwapAllowances(token, amount);
       }
-      await this.ensureSwapAllowances(anchorPlan.anchor, MAX_UINT128);
-      await this.ensureHookAllowance(destinationPool.token0, destinationPool.key.hooks, MAX_UINT128);
-      await this.ensureHookAllowance(destinationPool.token1, destinationPool.key.hooks, MAX_UINT128);
-      const latestSource = await this.assertPlanStillOutOfRange(plan, 'cross-pool-pre-withdraw');
-      const latestDestination = await this.fables.readPoolState(destinationPool);
-      if (latestDestination.paused || latestDestination.liquidity <= 0n) {
-        throw new Error('再投入池在預檢後已暫停或沒有可用流動性');
-      }
-      destinationPool.state = latestDestination;
-      journal = this.patchJournal(journal, {
-        phase: 'withdraw_preflighted',
-        destinationAnchor: anchorPlan.anchor.address,
-        routes: routePreflight,
-        beforeTrackedBalancesRaw: Object.fromEntries([...beforeTokens].map(([key, value]) => [key, value.toString()])),
-        withdraw: {
-          expected0: withdrawBounds.expected0.toString(),
-          expected1: withdrawBounds.expected1.toString(),
-          amount0Min: withdrawBounds.amount0Min.toString(),
-          amount1Min: withdrawBounds.amount1Min.toString(),
-          tick: latestSource.tick
-        }
-      });
-
-      const withdrawDeadline = this.deadline();
-      const guardedData = guardInterface.encodeFunctionData('guardedWithdrawAndClaim', [
-        [
-          sourcePool.key.currency0,
-          sourcePool.key.currency1,
-          sourcePool.key.fee,
-          sourcePool.key.tickSpacing,
-          sourcePool.key.hooks
-        ],
-        plan.position.tickLower,
-        plan.position.tickUpper,
-        BigInt(plan.position.shares),
-        this.config.walletAddress,
-        withdrawBounds.amount0Min,
-        withdrawBounds.amount1Min,
-        BigInt(withdrawDeadline),
-        this.config.fablesWalk
-      ]);
-      const withdrawReceipt = await this.sendVerifiedTx({
-        label: 'guardedWithdrawAndClaim:' + sourcePool.token0.symbol + '/' + sourcePool.token1.symbol,
-        to: this.config.walletAddress,
-        data: guardedData,
-        value: 0n,
-        onSent: (hash) => {
-          phase = 'withdraw_sent';
-          journal = this.patchJournal(journal, { phase, tx: { ...journal.tx, withdraw: hash } });
-        }
-      });
-      phase = 'withdraw_confirmed';
+      phase = 'approvals_ready';
       journal = this.patchJournal(journal, {
         phase,
-        tx: { ...journal.tx, withdraw: withdrawReceipt.hash || journal.tx.withdraw }
+        approvals: approvalRequests.map(({ label }) => ({ label }))
       });
-      const oldShares = await this.readPositionShares(sourcePool, plan.position.id);
-      if (oldShares !== 0n) throw new Error('Old LP shares remain after full cross-pool withdraw: ' + oldShares);
+      await this.assertGasGuard(feeOverrides);
 
-      const inventory = await this.readRawTokenBalances(trackedTokens);
-      const swapRecords = [];
-      for (const token of trackedTokens) {
-        const tokenAddress = token.address.toLowerCase();
-        if (tokenAddress === anchorPlan.anchor.address.toLowerCase()) continue;
-        const amountIn = inventory.get(tokenAddress) || 0n;
-        if (amountIn <= 0n) continue;
-        const route = anchorPlan.routes.get(tokenAddress);
-        if (!route?.length) throw new Error('撤出後錢包資產缺少可用兌換路徑');
-        const quote = await this.quoter.quoteExactInputPathRaw(
-          route, token, amountIn, this.config.swapSlippageBps
+      validation = await this.validateTopUpPosition(pool, position, 'top-up-pre-swap');
+      const afterApprovals = await this.readRawPairBalances(pool);
+      if (afterApprovals.raw0 !== initialBalances.raw0 || afterApprovals.raw1 !== initialBalances.raw1) {
+        throw new Error('Pair-token wallet balances changed during top-up approvals; refusing stale plan');
+      }
+      let postExecutionBalances = afterApprovals;
+      if (executableSwapPlan) {
+        await this.assertExactHookAllowance(pool.token0, pool.key.hooks, depositPlan.amount0Max);
+        await this.assertExactHookAllowance(pool.token1, pool.key.hooks, depositPlan.amount1Max);
+        const latestSwapPlan = await this.refreshSingleSwapQuote(
+          pool, executableSwapPlan, 'top-up-immediately-before-swap', topUpMaxPriceImpactBps
         );
-        if (BigInt(quote.minRawAmountOut) <= 0n) throw new Error('兌換最低輸出量為零');
-        const request = await this.router.simulateV4ExactInputPath({
-          route, tokenIn: token, quote, deadline: this.deadline(), from: this.config.walletAddress
+        if (BigInt(latestSwapPlan.quote.rawAmountIn) !== executableSwapPlan.rawAmountIn
+          || BigInt(latestSwapPlan.quote.minRawAmountOut) < BigInt(executableSwapPlan.quote.minRawAmountOut)
+          || String(latestSwapPlan.quote.tokenIn).toLowerCase() !== String(executableSwapPlan.quote.tokenIn).toLowerCase()
+          || String(latestSwapPlan.quote.tokenOut).toLowerCase() !== String(executableSwapPlan.quote.tokenOut).toLowerCase()) {
+          throw new Error('Top-up swap quote worsened or changed route during approvals');
+        }
+        // This second simulation uses the mined allowances and latest pool
+        // state. A failed deposit stops the swap before any pair funds move.
+        const sequence = await this.simulateTopUpSequence({
+          pool, position, approvalRequests: [], swapPlan: latestSwapPlan, depositPlan
         });
-        const beforeInput = await this.readRawTokenBalance(token);
-        const beforeOutput = await this.readRawTokenBalance(anchorPlan.anchor);
+        await this.assertTopUpGasBudget({
+          reserveWei,
+          maxFeePerGas,
+          futureGasLimit: TOP_UP_SWAP_GAS_LIMIT + TOP_UP_DEPOSIT_GAS_LIMIT,
+          phase: 'before-swap'
+        });
         phase = 'swap_preflighted';
         journal = this.patchJournal(journal, {
           phase,
-          pendingSwap: { tokenIn: token.address, tokenOut: anchorPlan.anchor.address, poolIds: request.path }
+          swapPlan: serializeSwapPlan(latestSwapPlan),
+          sequentialSimulationCalls: sequence.callCount
         });
-        await this.ensureSwapAllowances(token, amountIn);
         const swapReceipt = await this.sendVerifiedTx({
-          label: 'v4MultiHopSwap:' + token.symbol + '->' + anchorPlan.anchor.symbol,
-          to: request.router,
-          data: request.data,
-          value: request.value,
+          label: 'v4TopUpSwapExactInputSingle',
+          to: sequence.swapRequest.router,
+          data: sequence.swapRequest.data,
+          value: sequence.swapRequest.value,
+          feeOverrides,
           onSent: (hash) => {
             phase = 'swap_sent';
-            journal = this.patchJournal(journal, {
-              phase,
-              tx: { ...journal.tx, swaps: [...journal.tx.swaps, hash] }
-            });
+            journal = this.patchJournal(journal, { phase, tx: { ...journal.tx, swap: hash } });
           }
         });
-        const afterInput = await this.readRawTokenBalance(token);
-        const afterOutput = await this.readRawTokenBalance(anchorPlan.anchor);
-        const spent = beforeInput - afterInput;
-        const received = afterOutput - beforeOutput;
-        if (spent !== amountIn) throw new Error('Multi-hop swap spent an unexpected input amount');
-        if (received < BigInt(quote.minRawAmountOut)) throw new Error('Multi-hop swap output was below the quoted minimum');
-        inventory.set(tokenAddress, afterInput);
-        inventory.set(anchorPlan.anchor.address.toLowerCase(), afterOutput);
         phase = 'swap_confirmed';
-        const swapRecord = {
-          tokenIn: token.address,
-          tokenOut: anchorPlan.anchor.address,
-          amountIn: amountIn.toString(),
-          amountOut: received.toString(),
-          poolIds: route.map((pool) => pool.id),
-          hash: swapReceipt.hash
-        };
-        swapRecords.push(swapRecord);
+        postExecutionBalances = await this.readRawPairBalances(pool);
+        this.assertSwapReceiptBalances(pool, latestSwapPlan, afterApprovals, postExecutionBalances);
         journal = this.patchJournal(journal, {
           phase,
-          tx: { ...journal.tx, swaps: [...journal.tx.swaps.slice(0, -1), swapReceipt.hash || journal.tx.swaps.at(-1)] },
-          completedSwap: swapRecord,
-          swapsCompleted: swapRecords
+          tx: { ...journal.tx, swap: swapReceipt.hash || journal.tx.swap },
+          postSwapBalancesRaw: stringifyRawBalances(postExecutionBalances)
         });
+      } else {
+        const refreshedDepositPlan = buildExactDepositPlan({
+          rawAmount0: funding.raw0,
+          rawAmount1: funding.raw1,
+          sqrtPriceX96: validation.state.sqrtPriceX96,
+          tickLower: Number(position.tickLower),
+          tickUpper: Number(position.tickUpper),
+          slippageBps: this.config.depositSlippageBps,
+          liquidityReserveBps: this.config.depositLiquidityReserveBps
+        });
+        this.assertValidDeposit(refreshedDepositPlan, 'Refreshed top-up deposit-only liquidity is invalid');
+        await this.assertExactHookAllowance(pool.token0, pool.key.hooks, refreshedDepositPlan.amount0Max);
+        await this.assertExactHookAllowance(pool.token1, pool.key.hooks, refreshedDepositPlan.amount1Max);
+        depositPlan = refreshedDepositPlan;
       }
 
-      let destinationBalances = await this.readRawPairBalances(destinationPool);
-      const destinationStateBeforeBalance = await this.fables.readPoolState(destinationPool);
-      if (destinationStateBeforeBalance.paused || destinationStateBeforeBalance.liquidity <= 0n) {
-        throw new Error('再投入池在兌換後已暫停或流動性不足');
+      validation = await this.validateTopUpPosition(pool, position, 'top-up-pre-deposit');
+      const postApprovalBalances = await this.readRawPairBalances(pool);
+      if (postApprovalBalances.raw0 !== postExecutionBalances.raw0
+        || postApprovalBalances.raw1 !== postExecutionBalances.raw1) {
+        throw new Error('Pair-token wallet balances changed before top-up deposit; refusing to spend unplanned funds');
       }
-      destinationPool.state = destinationStateBeforeBalance;
-      let targetRange = buildTargetRange(
-        destinationStateBeforeBalance.tick,
-        destinationPool.key.tickSpacing,
-        this.config.tightWidthBps,
-        this.config.rangePreset
-      );
-      const anchorIsToken0 = anchorPlan.anchor.address.toLowerCase() === destinationPool.token0.address.toLowerCase();
-      const anchorIsToken1 = anchorPlan.anchor.address.toLowerCase() === destinationPool.token1.address.toLowerCase();
-      if (!anchorIsToken0 && !anchorIsToken1) throw new Error('再投入錨定資產不屬於目標池');
-      let balancePlan = await buildExactBalancedSwapPlan({
-        pool: destinationPool,
-        quoter: this.quoter,
-        rawAmount0: destinationBalances.raw0,
-        rawAmount1: destinationBalances.raw1,
-        sqrtPriceX96: destinationStateBeforeBalance.sqrtPriceX96,
-        tickLower: targetRange.tickLower,
-        tickUpper: targetRange.tickUpper,
-        slippageBps: this.config.swapSlippageBps
-      });
-      if (balancePlan.direction !== 'none') {
-        const inputToken = balancePlan.tokenIn === 0 ? destinationPool.token0 : destinationPool.token1;
-        await this.ensureSwapAllowances(inputToken, balancePlan.rawAmountIn);
-        const quote = balancePlan.quote;
-        const request = await this.router.simulateV4ExactInputSingle({
-          pool: destinationPool, quote, deadline: this.deadline(), from: this.config.walletAddress
-        });
-        const beforeSwap = destinationBalances;
-        phase = 'balance_swap_preflighted';
-        journal = this.patchJournal(journal, { phase, balanceSwap: {
-          tokenIn: quote.tokenIn, tokenOut: quote.tokenOut, amountIn: quote.rawAmountIn, minAmountOut: quote.minRawAmountOut
-        } });
-        const balanceReceipt = await this.sendVerifiedTx({
-          label: 'v4BalanceSwap:' + quote.symbolIn + '->' + quote.symbolOut,
-          to: request.router,
-          data: request.data,
-          value: request.value,
-          onSent: (hash) => {
-            phase = 'swap_sent';
-            journal = this.patchJournal(journal, {
-              phase,
-              tx: { ...journal.tx, swaps: [...journal.tx.swaps, hash] }
-            });
-          }
-        });
-        destinationBalances = await this.readRawPairBalances(destinationPool);
-        this.assertSwapReceiptBalances(destinationPool, balancePlan, beforeSwap, destinationBalances);
-        phase = 'swap_confirmed';
-        journal = this.patchJournal(journal, {
-          phase,
-          tx: { ...journal.tx, swaps: [...journal.tx.swaps.slice(0, -1), balanceReceipt.hash || journal.tx.swaps.at(-1)] }
+      const actualInventory = {
+        raw0: postApprovalBalances.raw0 - dustRaw.raw0,
+        raw1: postApprovalBalances.raw1 - dustRaw.raw1
+      };
+      if (actualInventory.raw0 < 0n || actualInventory.raw1 < 0n) {
+        throw new Error('Top-up pair balance fell below the retained dust reserve');
+      }
+      if (executableSwapPlan) {
+        if (BigInt(depositPlan.amount0Max) > actualInventory.raw0
+          || BigInt(depositPlan.amount1Max) > actualInventory.raw1) {
+          throw new Error('Post-swap inventory is below the sequentially simulated deposit caps');
+        }
+      } else {
+        depositPlan = buildExactDepositPlan({
+          rawAmount0: actualInventory.raw0,
+          rawAmount1: actualInventory.raw1,
+          sqrtPriceX96: validation.state.sqrtPriceX96,
+          tickLower: Number(position.tickLower),
+          tickUpper: Number(position.tickUpper),
+          slippageBps: this.config.depositSlippageBps,
+          liquidityReserveBps: this.config.depositLiquidityReserveBps
         });
       }
-
-      let destinationState = await this.fables.readPoolState(destinationPool);
-      if (destinationState.paused || destinationState.liquidity <= 0n) {
-        throw new Error('再投入池在存入前已暫停或流動性不足');
-      }
-      destinationPool.state = destinationState;
-      targetRange = buildTargetRange(
-        destinationState.tick,
-        destinationPool.key.tickSpacing,
-        this.config.tightWidthBps,
-        this.config.rangePreset
-      );
-      let exactDeposit = buildExactDepositPlan({
-        rawAmount0: destinationBalances.raw0,
-        rawAmount1: destinationBalances.raw1,
-        sqrtPriceX96: destinationState.sqrtPriceX96,
-        tickLower: targetRange.tickLower,
-        tickUpper: targetRange.tickUpper,
-        slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.config.depositLiquidityReserveBps
-      });
-      if (exactDeposit.liquidity <= 0n || exactDeposit.liquidity > MAX_UINT128) {
-        throw new Error('再投入池的 Tight 區間建倉數量無效');
-      }
-      await this.ensureHookAllowance(destinationPool.token0, destinationPool.key.hooks, exactDeposit.amount0Max);
-      await this.ensureHookAllowance(destinationPool.token1, destinationPool.key.hooks, exactDeposit.amount1Max);
-      destinationState = await this.fables.readPoolState(destinationPool);
-      if (destinationState.paused || destinationState.liquidity <= 0n) {
-        throw new Error('再投入池在存入前已暫停或流動性不足');
-      }
-      destinationPool.state = destinationState;
-      targetRange = buildTargetRange(
-        destinationState.tick,
-        destinationPool.key.tickSpacing,
-        this.config.tightWidthBps,
-        this.config.rangePreset
-      );
-      destinationBalances = await this.readRawPairBalances(destinationPool);
-      exactDeposit = buildExactDepositPlan({
-        rawAmount0: destinationBalances.raw0,
-        rawAmount1: destinationBalances.raw1,
-        sqrtPriceX96: destinationState.sqrtPriceX96,
-        tickLower: targetRange.tickLower,
-        tickUpper: targetRange.tickUpper,
-        slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.config.depositLiquidityReserveBps
-      });
-      if (exactDeposit.liquidity <= 0n || exactDeposit.liquidity > MAX_UINT128) {
-        throw new Error('重新計算後的 Tight 區間建倉數量無效');
-      }
+      this.assertValidDeposit(depositPlan, 'Recomputed top-up deposit liquidity is invalid');
+      await this.assertExactHookAllowance(pool.token0, pool.key.hooks, depositPlan.amount0Max);
+      await this.assertExactHookAllowance(pool.token1, pool.key.hooks, depositPlan.amount1Max);
       const depositDeadline = this.deadline();
       const depositData = this.fables.encodeDeposit(
-        destinationPool,
-        targetRange,
-        exactDeposit.liquidity,
-        exactDeposit.amount0Max,
-        exactDeposit.amount1Max,
+        pool,
+        { tickLower: Number(position.tickLower), tickUpper: Number(position.tickUpper) },
+        depositPlan.liquidity,
+        depositPlan.amount0Max,
+        depositPlan.amount1Max,
         depositDeadline
       );
+      await this.readProvider.call({
+        from: this.config.walletAddress,
+        to: pool.key.hooks,
+        data: depositData,
+        value: 0n
+      });
+      const depositGas = BigInt(await this.signer.estimateGas({
+        to: pool.key.hooks,
+        data: depositData,
+        value: 0n,
+        from: this.config.walletAddress,
+        ...feeOverrides
+      }));
+      await this.assertTopUpGasBudget({
+        reserveWei,
+        maxFeePerGas,
+        futureGasLimit: depositGas * 120n / 100n,
+        phase: 'before-deposit'
+      });
       phase = 'deposit_preflighted';
       journal = this.patchJournal(journal, {
         phase,
-        finalTarget: targetRange,
-        exactDeposit: serializeDepositPlan(exactDeposit),
-        destinationBalancesRaw: stringifyRawBalances(destinationBalances),
-        swapsCompleted: swapRecords
+        depositPlan: serializeDepositPlan(depositPlan),
+        inventoryRaw: stringifyRawBalances(actualInventory),
+        finalTarget: { tickLower: Number(position.tickLower), tickUpper: Number(position.tickUpper) }
       });
       const depositReceipt = await this.sendVerifiedTx({
-        label: 'fablesDeposit:' + destinationPool.token0.symbol + '/' + destinationPool.token1.symbol,
-        to: destinationPool.key.hooks,
+        label: 'fablesTopUpDeposit',
+        to: pool.key.hooks,
         data: depositData,
         value: 0n,
+        feeOverrides,
         onSent: (hash) => {
           phase = 'deposit_sent';
           journal = this.patchJournal(journal, { phase, tx: { ...journal.tx, deposit: hash } });
         }
       });
       phase = 'deposit_confirmed';
-      const depositEvent = this.findWalletDepositEvent(destinationPool, depositReceipt);
-      if (!depositEvent) throw new Error('再投入交易缺少目標池的 Deposited 事件');
-      const mintedRange = await this.fables.readRangeKey(destinationPool, depositEvent.rangeId);
+      const depositEvent = this.findWalletDepositEvent(pool, depositReceipt);
+      if (!depositEvent || depositEvent.rangeId.toLowerCase() !== position.id.toLowerCase()) {
+        throw new Error('Top-up receipt did not increase the identified original range');
+      }
+      const mintedRange = await this.fables.readRangeKey(pool, depositEvent.rangeId);
       if (
         !mintedRange.exists
-        || !samePoolKeyLocal(mintedRange.key, destinationPool.key)
-        || Number(mintedRange.tickLower) !== targetRange.tickLower
-        || Number(mintedRange.tickUpper) !== targetRange.tickUpper
-      ) throw new Error('再投入交易建立了非預期的 PoolKey 或 Tight 區間');
-      const newShares = await this.readPositionShares(destinationPool, depositEvent.rangeId);
-      if (newShares <= 0n) throw new Error('再投入交易已確認，但目標池沒有鑄出 LP 份額');
-      if (await this.readPositionShares(sourcePool, plan.position.id) !== 0n) {
-        throw new Error('再投入完成後，原 OOR LP 份額仍存在');
+        || !samePoolKeyLocal(mintedRange.key, pool.key)
+        || Number(mintedRange.tickLower) !== Number(position.tickLower)
+        || Number(mintedRange.tickUpper) !== Number(position.tickUpper)
+      ) {
+        throw new Error('Top-up receipt range does not match the original PoolKey and ticks');
       }
-
+      const sharesAfter = await this.readPositionShares(pool, position.id);
+      if (sharesAfter <= validation.shares) throw new Error('Top-up confirmed but original LP shares did not increase');
+      const balancesAfterDeposit = await this.readRawPairBalances(pool);
+      if (balancesAfterDeposit.raw0 < dustRaw.raw0 || balancesAfterDeposit.raw1 < dustRaw.raw1) {
+        throw new Error('Top-up consumed the configured retained dust reserve');
+      }
       journal = this.patchJournal(journal, {
         phase: 'completed',
         completedAt: Date.now(),
         tx: { ...journal.tx, deposit: depositReceipt.hash || journal.tx.deposit },
-        newPosition: {
-          poolId: destinationPool.id,
-          rangeId: depositEvent.rangeId,
-          liquidity: depositEvent.liquidity.toString(),
-          shares: newShares.toString(),
-          tickLower: targetRange.tickLower,
-          tickUpper: targetRange.tickUpper
-        }
+        sharesAfter: sharesAfter.toString(),
+        liquidityAdded: depositEvent.liquidity.toString(),
+        balancesAfterRaw: stringifyRawBalances(balancesAfterDeposit)
       });
       this.clearJournal();
-      this.ledger.append('rebalance.cross_pool_completed', {
-        sourcePoolId: sourcePool.id,
-        sourcePair: journal.pair,
-        destinationPoolId: destinationPool.id,
-        destinationPair: journal.destinationPair,
-        oldPositionId: plan.position.id,
-        newPositionId: depositEvent.rangeId,
-        withdrawHash: journal.tx.withdraw,
-        swapHashes: journal.tx.swaps,
-        depositHash: journal.tx.deposit,
-        target: targetRange,
-        aprPct: plan.destinationStats?.aprPct ?? null,
-        tvlUsd: plan.destinationStats?.tvlUsd ?? null
-      });
-      return {
+      const result = {
         status: 'completed',
-        sourcePoolId: sourcePool.id,
-        destinationPoolId: destinationPool.id,
-        withdrawHash: journal.tx.withdraw,
-        swapHashes: journal.tx.swaps,
+        poolId: pool.id,
+        positionId: position.id,
+        swapHash: journal.tx.swap,
         depositHash: journal.tx.deposit,
-        newPositionId: depositEvent.rangeId,
-        target: targetRange
+        sharesBefore: validation.shares.toString(),
+        sharesAfter: sharesAfter.toString(),
+        liquidityAdded: depositEvent.liquidity.toString(),
+        dustRetainedRaw: stringifyRawBalances(dustRaw),
+        balancesAfterRaw: stringifyRawBalances(balancesAfterDeposit)
       };
+      this.ledger.append('rebalance.top_up_completed', result);
+      return result;
     } catch (error) {
-      const afterCapitalMoved = [
-        'withdraw_sent', 'withdraw_confirmed', 'swap_preflighted', 'swap_sent',
-        'swap_confirmed', 'balance_swap_preflighted', 'deposit_preflighted',
-        'deposit_sent', 'deposit_confirmed'
+      const capitalMayHaveMoved = error.code === 'BROADCAST_OUTCOME_UNCERTAIN' || [
+        'swap_sent', 'swap_confirmed', 'deposit_sent', 'deposit_confirmed'
       ].includes(phase);
-      if (afterCapitalMoved) {
+      if (capitalMayHaveMoved) {
         let balances = null;
-        try {
-          const current = await this.readRawTokenBalances(trackedTokens);
-          balances = Object.fromEntries([...current].map(([key, value]) => [key, value.toString()]));
-        } catch {}
+        try { balances = stringifyRawBalances(await this.readRawPairBalances(pool)); } catch {}
         journal = this.patchJournal(journal, {
           phase: 'recovery_required',
           failedAt: Date.now(),
@@ -863,6 +953,485 @@ export class RebalanceExecutor {
       }
       throw error;
     }
+  }
+
+  async validateTopUpPosition(pool, position, phase) {
+    if (!Number.isInteger(Number(position.tickLower)) || !Number.isInteger(Number(position.tickUpper))) {
+      throw new Error('Top-up position ticks are invalid');
+    }
+    const state = await this.fables.readPoolState(pool);
+    if (state.paused !== false || BigInt(state.liquidity || 0) <= 0n) {
+      throw new Error(`Top-up blocked: pool is paused or liquidity is unavailable at ${phase}`);
+    }
+    if (!isLpInRange(state.tick, Number(position.tickLower), Number(position.tickUpper))) {
+      throw new Error(`Top-up blocked: original range is out of range at tick ${state.tick}`);
+    }
+    const range = await this.fables.readRangeKey(pool, position.id);
+    if (
+      !range.exists
+      || !samePoolKeyLocal(range.key, pool.key)
+      || Number(range.tickLower) !== Number(position.tickLower)
+      || Number(range.tickUpper) !== Number(position.tickUpper)
+    ) {
+      throw new Error('Top-up position id does not identify the requested original PoolKey and ticks');
+    }
+    const shares = await this.readPositionShares(pool, position.id);
+    if (shares <= 0n || shares !== BigInt(position.shares)) {
+      throw new Error('Top-up position shares are missing or stale');
+    }
+    return { state, shares };
+  }
+
+  assertTokenPrices(pool) {
+    for (const token of [pool.token0, pool.token1]) {
+      if (!Number.isInteger(Number(token.decimals)) || Number(token.decimals) < 0 || Number(token.decimals) > 36) {
+        throw new Error(`Reliable ${token.symbol} decimals are unavailable`);
+      }
+      const price = Number(this.getUsdPrice?.(token.address));
+      if (!Number.isFinite(price) || price <= 0) {
+        throw new Error(`Reliable USD price for ${token.symbol} is unavailable`);
+      }
+    }
+  }
+
+  valuePairBalances(pool, balances) {
+    const amount0 = Number(formatUnits(BigInt(balances.raw0), Number(pool.token0.decimals)));
+    const amount1 = Number(formatUnits(BigInt(balances.raw1), Number(pool.token1.decimals)));
+    const value = amount0 * Number(this.getUsdPrice(pool.token0.address))
+      + amount1 * Number(this.getUsdPrice(pool.token1.address));
+    if (!Number.isFinite(value) || value < 0) throw new Error('Top-up wallet pair USD value is invalid');
+    return value;
+  }
+
+  assertValidDeposit(plan, message) {
+    if (
+      !plan
+      || BigInt(plan.liquidity) <= 0n
+      || BigInt(plan.liquidity) > MAX_UINT128
+      || BigInt(plan.amount0Max) > MAX_UINT128
+      || BigInt(plan.amount1Max) > MAX_UINT128
+    ) throw new Error(message);
+  }
+
+  async simulateTopUpSwapPreview({ pool, approvalRequests, swapPlan }) {
+    if (!swapPlan?.quote || swapPlan.direction === 'none') {
+      throw new Error('A priced swap is required for the post-swap pool preview');
+    }
+    const swapRequest = this.router.buildV4ExactInputSingle({
+      pool, quote: swapPlan.quote, deadline: this.deadline()
+    });
+    const calls = [
+      ...approvalRequests.map(({ tx }) => ({
+        to: tx.to, data: tx.data, value: tx.value || 0n,
+        gasLimit: Number(TOP_UP_APPROVAL_GAS_RESERVE)
+      })),
+      {
+        to: swapRequest.router, data: swapRequest.data, value: swapRequest.value,
+        gasLimit: Number(TOP_UP_SWAP_GAS_LIMIT)
+      },
+      ...[pool.token0, pool.token1].map((token) => ({
+        to: token.address,
+        data: erc20Interface.encodeFunctionData('balanceOf', [this.config.walletAddress]),
+        value: 0n,
+        gasLimit: 100_000
+      }))
+    ];
+    const results = await simulateSequentialCalls(this.writeProvider, {
+      walletAddress: this.config.walletAddress,
+      chainId: this.config.chainId,
+      calls
+    });
+    const swapResult = results[approvalRequests.length];
+    let postSwapState = null;
+    for (const entry of swapResult.logs || []) {
+      try {
+        const parsed = swapEventInterface.parseLog(entry);
+        if (String(parsed.args.id).toLowerCase() === pool.id.toLowerCase()) {
+          postSwapState = {
+            tick: Number(parsed.args.tick),
+            sqrtPriceX96: BigInt(parsed.args.sqrtPriceX96)
+          };
+        }
+      } catch {}
+    }
+    if (!postSwapState || postSwapState.sqrtPriceX96 <= 0n) {
+      throw new Error('Simulated V4 swap did not emit the destination pool price');
+    }
+    const raw0 = BigInt(erc20Interface.decodeFunctionResult('balanceOf', results.at(-2).returnData)[0]);
+    const raw1 = BigInt(erc20Interface.decodeFunctionResult('balanceOf', results.at(-1).returnData)[0]);
+    return { ...postSwapState, balances: { raw0, raw1 }, callCount: results.length };
+  }
+
+  async simulateTopUpSequence({ pool, position, approvalRequests, swapPlan, depositPlan }) {
+    if (!swapPlan || swapPlan.direction === 'none' || !swapPlan.quote) {
+      throw new Error('A priced swap is required for sequential top-up simulation');
+    }
+    const deadline = this.deadline();
+    const swapRequest = this.router.buildV4ExactInputSingle({
+      pool, quote: swapPlan.quote, deadline
+    });
+    const depositData = this.fables.encodeDeposit(
+      pool,
+      { tickLower: Number(position.tickLower), tickUpper: Number(position.tickUpper) },
+      depositPlan.liquidity,
+      depositPlan.amount0Max,
+      depositPlan.amount1Max,
+      deadline
+    );
+    const calls = [
+      ...approvalRequests.map(({ tx }) => ({
+        to: tx.to, data: tx.data, value: tx.value || 0n,
+        gasLimit: Number(TOP_UP_APPROVAL_GAS_RESERVE)
+      })),
+      {
+        to: swapRequest.router, data: swapRequest.data, value: swapRequest.value,
+        gasLimit: Number(TOP_UP_SWAP_GAS_LIMIT)
+      },
+      {
+        to: pool.key.hooks, data: depositData, value: 0n,
+        gasLimit: Number(TOP_UP_DEPOSIT_GAS_LIMIT)
+      }
+    ];
+    const results = await simulateSequentialCalls(this.writeProvider, {
+      walletAddress: this.config.walletAddress,
+      chainId: this.config.chainId,
+      calls
+    });
+    const depositEvent = this.findWalletDepositEvent(pool, results.at(-1));
+    if (!depositEvent || depositEvent.rangeId.toLowerCase() !== position.id.toLowerCase()
+      || depositEvent.liquidity <= 0n) {
+      throw new Error('Sequential simulation did not mint the identified original LP range');
+    }
+    return { swapRequest, depositData, depositEvent, callCount: results.length };
+  }
+
+  async buildTopUpApprovalRequests(pool, swapPlan, depositPlan) {
+    const requests = [];
+    const swapAmountByAddress = new Map();
+    if (swapPlan.direction !== 'none') {
+      const tokenIn = swapPlan.tokenIn === 0 ? pool.token0 : pool.token1;
+      swapAmountByAddress.set(tokenIn.address.toLowerCase(), BigInt(swapPlan.rawAmountIn));
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const add = (label, to, data) => requests.push({
+      label,
+      tx: { to, data, value: 0n, from: this.config.walletAddress }
+    });
+
+    for (const [index, token] of [pool.token0, pool.token1].entries()) {
+      const address = token.address.toLowerCase();
+      const swapAmount = swapAmountByAddress.get(address) || 0n;
+      if (swapAmount > 0n) {
+        const tokenContract = new Contract(token.address, ERC20_ABI, this.readProvider);
+        const erc20Allowance = BigInt(await tokenContract.allowance(this.config.walletAddress, PERMIT2));
+        if (erc20Allowance !== swapAmount) {
+          if (erc20Allowance > 0n) add(`approve:${token.symbol}:permit2:reset`, token.address, erc20Interface.encodeFunctionData('approve', [PERMIT2, 0n]));
+          add(`approve:${token.symbol}:permit2`, token.address, erc20Interface.encodeFunctionData('approve', [PERMIT2, swapAmount]));
+        }
+        const permit2 = new Contract(PERMIT2, PERMIT2_ABI, this.readProvider);
+        const allowance = await permit2.allowance(this.config.walletAddress, token.address, UNISWAP_UNIVERSAL_ROUTER_212);
+        if (BigInt(allowance.amount) !== swapAmount || Number(allowance.expiration) <= now + this.config.txDeadlineSec) {
+          const expiration = now + this.config.permit2ExpirationSec;
+          if (BigInt(allowance.amount) > 0n) {
+            add(`permit2:${token.symbol}:router:reset`, PERMIT2, permit2Interface.encodeFunctionData('approve', [
+              token.address,
+              UNISWAP_UNIVERSAL_ROUTER_212,
+              0n,
+              expiration
+            ]));
+          }
+          add(`permit2:${token.symbol}:router`, PERMIT2, permit2Interface.encodeFunctionData('approve', [
+            token.address,
+            UNISWAP_UNIVERSAL_ROUTER_212,
+            swapAmount,
+            expiration
+          ]));
+        }
+      }
+
+      const depositAmount = index === 0 ? BigInt(depositPlan.amount0Max) : BigInt(depositPlan.amount1Max);
+      if (depositAmount > 0n) {
+        const tokenContract = new Contract(token.address, ERC20_ABI, this.readProvider);
+        const allowance = BigInt(await tokenContract.allowance(this.config.walletAddress, pool.key.hooks));
+        if (allowance !== depositAmount) {
+          if (allowance > 0n) add(`approve:${token.symbol}:hook:reset`, token.address, erc20Interface.encodeFunctionData('approve', [pool.key.hooks, 0n]));
+          add(`approve:${token.symbol}:hook`, token.address, erc20Interface.encodeFunctionData('approve', [pool.key.hooks, depositAmount]));
+        }
+      }
+    }
+    return requests;
+  }
+
+  async assertTopUpGasBudget({ reserveWei, maxFeePerGas, futureGasLimit, phase }) {
+    reserveWei = BigInt(reserveWei);
+    maxFeePerGas = BigInt(maxFeePerGas);
+    futureGasLimit = BigInt(futureGasLimit);
+    if (reserveWei <= 0n || maxFeePerGas <= 0n || futureGasLimit < 0n) {
+      throw new Error('Top-up gas reserve inputs are invalid');
+    }
+    const nativeBalance = BigInt(await this.readProvider.getBalance(this.config.walletAddress));
+    const estimatedCost = futureGasLimit * maxFeePerGas;
+    if (nativeBalance < estimatedCost + reserveWei) {
+      throw new Error(
+        `Top-up gas reserve is insufficient at ${phase}: wallet ${nativeBalance}, `
+        + `estimated future fees ${estimatedCost}, required reserve ${reserveWei}`
+      );
+    }
+    return { nativeBalance, estimatedCost, reserveWei };
+  }
+
+  async previewCrossPoolExecution(plan, destinationPool) {
+    const sourcePool = plan.pool;
+    const routePools = plan.routingPools || [sourcePool, destinationPool];
+    let trackedTokens = [];
+    try {
+      const sourceState = await this.assertPlanStillOutOfRange(plan, 'cross-pool-dry-run');
+      const destinationState = await this.fables.readPoolState(destinationPool);
+      if (destinationState.paused !== false || destinationState.liquidity <= 0n) {
+        throw new Error('Destination pool is paused or has no active liquidity');
+      }
+      if ([sourcePool, destinationPool].some((pool) =>
+        pool.token0.address.toLowerCase() === ZERO_ADDRESS || pool.token1.address.toLowerCase() === ZERO_ADDRESS
+      )) throw new Error('Cross-pool preview does not support native-token pools');
+
+      trackedTokens = uniquePairTokens(sourcePool, destinationPool);
+      const beforeBalances = await this.readRawTokenBalances(trackedTokens);
+      const withdrawBounds = buildExactWithdrawBounds({
+        sqrtPriceX96: sourceState.sqrtPriceX96,
+        tickLower: plan.position.tickLower,
+        tickUpper: plan.position.tickUpper,
+        liquidity: plan.position.shares,
+        slippageBps: this.config.withdrawSlippageBps
+      });
+      const dustRawByAddress = plan.dustRawByAddress || {};
+      const fundingScope = buildCrossPoolFundingScope({
+        sourcePool,
+        destinationPool,
+        walletBalances: beforeBalances,
+        expectedWithdraw: withdrawBounds,
+        dustRawByAddress
+      });
+      const destinationAddresses = new Set([destinationPool.token0.address.toLowerCase(), destinationPool.token1.address.toLowerCase()]);
+      const conversionAssets = fundingScope.filter((entry) =>
+        [sourcePool.token0.address.toLowerCase(), sourcePool.token1.address.toLowerCase()].includes(entry.address)
+        && !destinationAddresses.has(entry.address)
+        && entry.maxSpendRaw > 0n
+      );
+      const anchorPlan = conversionAssets.length
+        ? chooseInvestmentAnchor(conversionAssets.map((entry) => entry.token), destinationPool, routePools, 1)
+        : { anchor: destinationPool.token0, routes: new Map(), score: 0 };
+      const projectedInventory = new Map(fundingScope.map((entry) => [entry.address, entry.maxSpendRaw]));
+      const routePreflight = [];
+      for (const entry of conversionAssets) {
+        const route = anchorPlan.routes.get(entry.address);
+        const quote = await this.quoteDirectRoute(route, entry.token, entry.maxSpendRaw);
+        let simulation = { status: 'capital-locked-until-withdraw' };
+        const walletRaw = beforeBalances.get(entry.address) || 0n;
+        const simAmount = walletRaw > entry.dustRaw ? walletRaw - entry.dustRaw : 0n;
+        if (simAmount > 0n) {
+          const simQuote = simAmount === entry.maxSpendRaw
+            ? quote
+            : await this.quoteDirectRoute(route, entry.token, simAmount);
+          try {
+            const request = this.router.buildV4ExactInputSingle({ pool: route[0], quote: simQuote, deadline: this.deadline() });
+            await this.router.simulateV4ExactInputSingle({ pool: route[0], quote: simQuote, deadline: request.deadline, from: this.config.walletAddress });
+            simulation = { status: 'simulated', amountInRaw: simAmount.toString() };
+          } catch (error) {
+            simulation = { status: 'failed', amountInRaw: simAmount.toString(), error: error.message };
+          }
+        }
+        routePreflight.push({
+          token: entry.token.address,
+          walletRaw: entry.walletRaw.toString(),
+          expectedWithdrawRaw: entry.withdrawRaw.toString(),
+          dustRaw: entry.dustRaw.toString(),
+          maxSpendRaw: entry.maxSpendRaw.toString(),
+          tokenOut: quote.tokenOut,
+          rawAmountOut: quote.rawAmountOut,
+          minRawAmountOut: quote.minRawAmountOut,
+          poolIds: route.map((pool) => pool.id),
+          routerSimulation: simulation
+        });
+        const anchorAddress = anchorPlan.anchor.address.toLowerCase();
+        projectedInventory.set(entry.address, 0n);
+        projectedInventory.set(anchorAddress, (projectedInventory.get(anchorAddress) || 0n) + BigInt(quote.minRawAmountOut));
+      }
+
+      let destinationBalances = {
+        raw0: projectedInventory.get(destinationPool.token0.address.toLowerCase()) || 0n,
+        raw1: projectedInventory.get(destinationPool.token1.address.toLowerCase()) || 0n
+      };
+      const targetRange = buildTargetRange(
+        destinationState.tick,
+        destinationPool.key.tickSpacing,
+        this.config.tightWidthBps,
+        this.config.rangePreset
+      );
+      let balancePlan = await buildExactBalancedSwapPlan({
+        pool: destinationPool,
+        quoter: this.quoter,
+        rawAmount0: destinationBalances.raw0,
+        rawAmount1: destinationBalances.raw1,
+        sqrtPriceX96: destinationState.sqrtPriceX96,
+        tickLower: targetRange.tickLower,
+        tickUpper: targetRange.tickUpper,
+        slippageBps: this.config.swapSlippageBps,
+        maxPriceImpactBps: this.config.maxSwapPriceImpactBps ?? 200
+      });
+      let balanceSimulation = { status: 'not-required' };
+      if (balancePlan.direction !== 'none') {
+        const request = this.router.buildV4ExactInputSingle({ pool: destinationPool, quote: balancePlan.quote, deadline: this.deadline() });
+        const inputAddress = balancePlan.tokenIn === 0 ? destinationPool.token0.address.toLowerCase() : destinationPool.token1.address.toLowerCase();
+        const walletRaw = beforeBalances.get(inputAddress) || 0n;
+        const scopedRaw = balancePlan.tokenIn === 0 ? destinationBalances.raw0 : destinationBalances.raw1;
+        if (walletRaw >= scopedRaw && scopedRaw > 0n) {
+          try {
+            await this.router.simulateV4ExactInputSingle({ pool: destinationPool, quote: balancePlan.quote, deadline: request.deadline, from: this.config.walletAddress });
+            balanceSimulation = { status: 'simulated', amountInRaw: balancePlan.rawAmountIn.toString() };
+          } catch (error) {
+            balanceSimulation = { status: 'failed', amountInRaw: balancePlan.rawAmountIn.toString(), error: error.message };
+          }
+        } else {
+          balanceSimulation = { status: 'capital-locked-until-withdraw' };
+        }
+        const output = BigInt(balancePlan.quote.minRawAmountOut);
+        if (balancePlan.tokenIn === 0) destinationBalances = { raw0: destinationBalances.raw0 - balancePlan.rawAmountIn, raw1: destinationBalances.raw1 + output };
+        else destinationBalances = { raw0: destinationBalances.raw0 + output, raw1: destinationBalances.raw1 - balancePlan.rawAmountIn };
+      }
+      const depositPlan = buildExactDepositPlan({
+        rawAmount0: destinationBalances.raw0,
+        rawAmount1: destinationBalances.raw1,
+        sqrtPriceX96: destinationState.sqrtPriceX96,
+        tickLower: targetRange.tickLower,
+        tickUpper: targetRange.tickUpper,
+        slippageBps: this.config.depositSlippageBps,
+        liquidityReserveBps: this.config.depositLiquidityReserveBps
+      });
+      this.assertValidDeposit(depositPlan, 'Cross-pool dry-run deposit liquidity is invalid');
+      const output = {
+        status: 'dry-run',
+        sourcePoolId: sourcePool.id,
+        sourcePair: `${sourcePool.token0.symbol}/${sourcePool.token1.symbol}`,
+        destinationPoolId: destinationPool.id,
+        destinationPair: `${destinationPool.token0.symbol}/${destinationPool.token1.symbol}`,
+        positionId: plan.position.id,
+        capitalScope: {
+          policy: 'source-and-destination-pair-wallet-balances plus source-withdrawal-delta',
+          tokens: fundingScope.map((entry) => ({
+            address: entry.address,
+            symbol: entry.token.symbol,
+            walletSource: entry.walletSource,
+            walletRaw: entry.walletRaw.toString(),
+            expectedWithdrawRaw: entry.withdrawRaw.toString(),
+            dustRaw: entry.dustRaw.toString(),
+            maxSpendRaw: entry.maxSpendRaw.toString()
+          }))
+        },
+        anchor: { address: anchorPlan.anchor.address, symbol: anchorPlan.anchor.symbol },
+        routes: routePreflight,
+        balanceSwap: balancePlan.direction === 'none' ? null : {
+          plan: serializeSwapPlan(balancePlan),
+          routerSimulation: balanceSimulation
+        },
+        targetRange,
+        destinationInventoryRaw: stringifyRawBalances(destinationBalances),
+        depositPlan: serializeDepositPlan(depositPlan),
+        preflight: {
+          sourceOutOfRange: true,
+          destinationActive: true,
+          multiHopEnabled: false
+        }
+      };
+      this.ledger.append('rebalance.cross_pool_dry_run', output);
+      log('info', 'rebalance.cross_pool_dry_run', output);
+      return { status: 'dry-run', plan: output };
+    } catch (error) {
+      const blocked = {
+        status: 'blocked',
+        sourcePoolId: sourcePool.id,
+        destinationPoolId: destinationPool.id,
+        positionId: plan.position.id,
+        capitalScope: 'source-and-destination-pair-wallet-balances plus source-withdrawal-delta',
+        reason: error.message
+      };
+      this.ledger.append('rebalance.cross_pool_dry_run_blocked', blocked);
+      return { status: 'blocked', reason: error.message, plan: blocked };
+    }
+  }
+
+  async quoteDirectRoute(route, tokenIn, amountIn) {
+    if (!Array.isArray(route) || route.length !== 1) {
+      throw new Error('Multi-hop reinvestment is disabled until Universal Router calldata has independent evidence');
+    }
+    const routePool = route[0];
+    amountIn = BigInt(amountIn);
+    if (amountIn <= 0n || amountIn > MAX_UINT128) {
+      throw new Error('Direct route amount is outside the router uint128 input bounds');
+    }
+    const address = tokenIn.address.toLowerCase();
+    const token0 = routePool.token0.address.toLowerCase();
+    const token1 = routePool.token1.address.toLowerCase();
+    if (address !== token0 && address !== token1) throw new Error('Direct route token is not in the selected pool');
+    const state = await this.fables.readPoolState(routePool);
+    if (state.paused !== false || BigInt(state.liquidity || 0) <= 0n) {
+      throw new Error('Direct route pool is paused or has no active liquidity');
+    }
+    const quote = await this.quoter.quoteExactInputSingleRaw(routePool, address === token0 ? 0 : 1, amountIn, this.config.swapSlippageBps);
+    if (BigInt(quote.rawAmountIn) !== BigInt(amountIn) || BigInt(quote.minRawAmountOut) <= 0n) {
+      throw new Error('Direct route quote is invalid or has zero minimum output');
+    }
+    const impactBps = this.assertQuotePriceImpact(routePool, quote, BigInt(amountIn), state);
+    return { ...quote, priceImpactBps: Number(impactBps) };
+  }
+
+  assertQuotePriceImpact(pool, quote, rawAmountIn, state, maxOverrideBps = null) {
+    const inputAddress = String(quote.tokenIn || '').toLowerCase();
+    const tokenInIndex = inputAddress === String(pool.token0.address).toLowerCase()
+      ? 0
+      : inputAddress === String(pool.token1.address).toLowerCase()
+        ? 1
+        : -1;
+    if (tokenInIndex < 0) throw new Error('Swap quote input token does not belong to the quoted pool');
+    const impactBps = quotePriceImpactBps(rawAmountIn, BigInt(quote.rawAmountOut), tokenInIndex, state.sqrtPriceX96);
+    const maxImpactBps = BigInt(maxOverrideBps ?? this.config.maxSwapPriceImpactBps ?? 200);
+    if (impactBps > maxImpactBps) {
+      throw new Error(`Swap price impact ${impactBps} bps exceeds ${maxImpactBps} bps`);
+    }
+    return impactBps;
+  }
+
+  async refreshSingleSwapQuote(pool, swapPlan, phase, maxOverrideBps = null) {
+    const state = await this.fables.readPoolState(pool);
+    if (state.paused !== false || BigInt(state.liquidity || 0) <= 0n) {
+      throw new Error(`Swap pool is paused or illiquid at ${phase}`);
+    }
+    const quote = await this.quoter.quoteExactInputSingleRaw(
+      pool,
+      swapPlan.tokenIn,
+      swapPlan.rawAmountIn,
+      this.config.swapSlippageBps
+    );
+    const impactBps = this.assertQuotePriceImpact(pool, quote, swapPlan.rawAmountIn, state, maxOverrideBps);
+    return { ...swapPlan, quote: { ...quote, priceImpactBps: Number(impactBps) }, priceImpactBps: Number(impactBps), poolState: state };
+  }
+
+  async executeCrossPool(plan, destinationPool) {
+    const preview = await this.previewCrossPoolExecution(plan, destinationPool);
+    if (this.config.dryRun || !this.config.enableLiveWrites) return preview;
+
+    // The available RPC path cannot simulate a deposit against balances that
+    // would only exist after a withdrawal, and no state override is configured.
+    // Keep the complete plan for review, but never withdraw first and discover
+    // an unsimulatable swap/deposit afterwards.
+    const reason = 'Live cross-pool execution is blocked until the complete post-withdraw swap and deposit can be simulated before withdrawal';
+    const blockedPlan = {
+      ...(preview.plan || {}),
+      status: 'blocked',
+      liveWriteGate: 'post-withdraw-state-simulation-unavailable',
+      reason
+    };
+    this.ledger.append('rebalance.cross_pool_live_blocked', blockedPlan);
+    return { status: 'blocked', reason, plan: blockedPlan };
   }
 
   async readRawTokenBalances(tokens) {
@@ -1012,10 +1581,12 @@ export class RebalanceExecutor {
   }
 
   async ensureSwapAllowances(token, rawAmountIn) {
+    rawAmountIn = BigInt(rawAmountIn);
+    if (rawAmountIn <= 0n) return;
     if (token.address.toLowerCase() === ZERO_ADDRESS) throw new Error('Native input is not enabled');
     const tokenContract = new Contract(token.address, ERC20_ABI, this.readProvider);
     let erc20Allowance = BigInt(await tokenContract.allowance(this.config.walletAddress, PERMIT2));
-    if (erc20Allowance < rawAmountIn) {
+    if (erc20Allowance !== rawAmountIn) {
       if (erc20Allowance > 0n) {
         await this.sendVerifiedTx({
           label: `approve:${token.symbol}:permit2:reset`,
@@ -1027,11 +1598,11 @@ export class RebalanceExecutor {
       await this.sendVerifiedTx({
         label: `approve:${token.symbol}:permit2`,
         to: token.address,
-        data: erc20Interface.encodeFunctionData('approve', [PERMIT2, MAX_UINT256]),
+        data: erc20Interface.encodeFunctionData('approve', [PERMIT2, rawAmountIn]),
         value: 0n
       });
       erc20Allowance = BigInt(await tokenContract.allowance(this.config.walletAddress, PERMIT2));
-      if (erc20Allowance < rawAmountIn) throw new Error('ERC20 -> Permit2 allowance did not update');
+      if (erc20Allowance !== rawAmountIn) throw new Error('ERC20 -> Permit2 allowance did not update to the exact requested amount');
     }
 
     const permit2 = new Contract(PERMIT2, PERMIT2_ABI, this.readProvider);
@@ -1041,15 +1612,23 @@ export class RebalanceExecutor {
       UNISWAP_UNIVERSAL_ROUTER_212
     );
     const now = Math.floor(Date.now() / 1000);
-    if (BigInt(allowance.amount) < rawAmountIn || Number(allowance.expiration) <= now + this.config.txDeadlineSec) {
+    if (BigInt(allowance.amount) !== rawAmountIn || Number(allowance.expiration) <= now + this.config.txDeadlineSec) {
       const expiration = now + this.config.permit2ExpirationSec;
+      if (BigInt(allowance.amount) > 0n) {
+        await this.sendVerifiedTx({
+          label: `permit2:${token.symbol}:router:reset`,
+          to: PERMIT2,
+          data: permit2Interface.encodeFunctionData('approve', [token.address, UNISWAP_UNIVERSAL_ROUTER_212, 0n, expiration]),
+          value: 0n
+        });
+      }
       await this.sendVerifiedTx({
         label: `permit2:${token.symbol}:router`,
         to: PERMIT2,
         data: permit2Interface.encodeFunctionData('approve', [
           token.address,
           UNISWAP_UNIVERSAL_ROUTER_212,
-          MAX_UINT160,
+          rawAmountIn,
           expiration
         ]),
         value: 0n
@@ -1059,8 +1638,8 @@ export class RebalanceExecutor {
         token.address,
         UNISWAP_UNIVERSAL_ROUTER_212
       );
-      if (BigInt(updated.amount) < rawAmountIn || Number(updated.expiration) <= now + this.config.txDeadlineSec) {
-        throw new Error('Permit2 -> Universal Router allowance did not update');
+      if (BigInt(updated.amount) !== rawAmountIn || Number(updated.expiration) <= now + this.config.txDeadlineSec) {
+        throw new Error('Permit2 -> Universal Router allowance did not update to the exact requested amount');
       }
     }
   }
@@ -1071,7 +1650,7 @@ export class RebalanceExecutor {
     if (token.address.toLowerCase() === ZERO_ADDRESS) throw new Error('Native Fables deposits are not enabled');
     const tokenContract = new Contract(token.address, ERC20_ABI, this.readProvider);
     let allowance = BigInt(await tokenContract.allowance(this.config.walletAddress, hookAddress));
-    if (allowance >= rawAmount) return;
+    if (allowance === rawAmount) return;
     if (allowance > 0n) {
       await this.sendVerifiedTx({
         label: `approve:${token.symbol}:hook:reset`,
@@ -1085,11 +1664,21 @@ export class RebalanceExecutor {
       to: token.address,
       // Fables deposit amount caps are uint128. Never grant a dynamic hook
       // more ERC20 allowance than the ABI can actually consume per deposit.
-      data: erc20Interface.encodeFunctionData('approve', [hookAddress, MAX_UINT128]),
+      data: erc20Interface.encodeFunctionData('approve', [hookAddress, rawAmount]),
       value: 0n
     });
     allowance = BigInt(await tokenContract.allowance(this.config.walletAddress, hookAddress));
-    if (allowance < rawAmount) throw new Error(`${token.symbol} -> Fables hook allowance did not update`);
+    if (allowance !== rawAmount) throw new Error(`${token.symbol} -> Fables hook allowance did not update to the exact requested amount`);
+  }
+
+  async assertExactHookAllowance(token, hookAddress, rawAmount) {
+    rawAmount = BigInt(rawAmount);
+    if (rawAmount === 0n) return;
+    const tokenContract = new Contract(token.address, ERC20_ABI, this.readProvider);
+    const allowance = BigInt(await tokenContract.allowance(this.config.walletAddress, hookAddress));
+    if (allowance !== rawAmount) {
+      throw new Error(`${token.symbol} -> Fables hook allowance differs from the preflighted exact amount; refusing deposit`);
+    }
   }
 
   assertSwapReceiptBalances(pool, swapPlan, before, after) {
@@ -1122,25 +1711,114 @@ export class RebalanceExecutor {
     };
   }
 
-  async sendVerifiedTx({ label, to, data, value = 0n, onSent = null }) {
-    await this.assertGasGuard();
-    const request = { to, data, value: BigInt(value) };
+  async getPinnedFeeOverrides(preferred = null) {
+    const feeData = preferred || await this.writeProvider.getFeeData();
+    const maxFeePerGas = feeData.maxFeePerGas == null ? 0n : BigInt(feeData.maxFeePerGas);
+    const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas == null ? 0n : BigInt(feeData.maxPriorityFeePerGas);
+    if (maxFeePerGas > 0n && maxPriorityFeePerGas > 0n && maxPriorityFeePerGas <= maxFeePerGas) {
+      return { maxFeePerGas, maxPriorityFeePerGas };
+    }
+    const gasPrice = feeData.gasPrice == null ? 0n : BigInt(feeData.gasPrice);
+    if (gasPrice > 0n) return { gasPrice };
+    throw new Error('Fee data is unavailable or incomplete; refusing to build a transaction');
+  }
+
+  async assertWriteChainId() {
+    const expected = BigInt(this.config.chainId || 0);
+    if (expected <= 0n || !this.writeProvider?.send) {
+      throw new Error('Configured chainId or raw eth_chainId RPC method is unavailable');
+    }
+    const rawChainId = await this.writeProvider.send('eth_chainId', []);
+    const actual = BigInt(rawChainId);
+    if (actual !== expected) {
+      throw new Error(`Write RPC chainId mismatch: configured ${expected}, raw eth_chainId ${actual}`);
+    }
+    return actual;
+  }
+
+  async sendVerifiedTx({ label, to, data, value = 0n, onSent = null, feeOverrides = null }) {
+    const fees = await this.getPinnedFeeOverrides(feeOverrides);
+    await this.assertGasGuard(fees);
+    const chainId = BigInt(this.config.chainId || 0);
+    if (chainId <= 0n) throw new Error('Configured chainId is unavailable');
+    const request = { to, data, value: BigInt(value), chainId: Number(chainId), ...fees };
     await this.readProvider.call({ ...request, from: this.config.walletAddress });
-    const gasEstimate = await this.signer.estimateGas(request);
-    const tx = await this.signer.sendTransaction({
+    const gasEstimate = await this.signer.estimateGas({ ...request, from: this.config.walletAddress });
+    const populated = await this.signer.populateTransaction({
       ...request,
       gasLimit: gasEstimate * 120n / 100n
     });
-    this.ledger.append('tx.sent', { label, hash: tx.hash, to, gasEstimate: gasEstimate.toString() });
-    if (onSent) onSent(tx.hash);
-    const receipt = await tx.wait(this.config.confirmations);
-    if (!receipt || receipt.status !== 1) throw new Error(`${label} failed: ${tx.hash}`);
-    const gasPrice = receipt.gasPrice || tx.gasPrice || 0n;
+    const rawTransaction = await this.signer.signTransaction(populated);
+    const hash = keccak256(rawTransaction);
+    await this.assertWriteChainId();
+    this.ledger.append('tx.broadcast_pending', {
+      label,
+      hash,
+      to,
+      gasEstimate: gasEstimate.toString(),
+      nonce: populated.nonce,
+      chainId: chainId.toString(),
+      feeOverrides: jsonSafe(fees)
+    });
+
+    let defaultJournal = null;
+    if (onSent) {
+      // Persist the expected hash before contacting the RPC. A node can accept
+      // the signed transaction even if its broadcast response later rejects.
+      onSent(hash);
+    } else if (this.state) {
+      const active = this.state.getSetting('activeRebalanceExecution', null);
+      if (active?.phase && !['completed', 'failed'].includes(active.phase)) {
+        defaultJournal = { id: active.id, previousPhase: active.phase };
+        this.saveJournal({
+          ...active,
+          phase: 'tx_broadcast_pending',
+          pendingTx: { label, hash, to, previousPhase: active.phase }
+        });
+      }
+    }
+
+    let tx;
+    try {
+      tx = await this.writeProvider.broadcastTransaction(rawTransaction);
+    } catch (error) {
+      this.markUncertainBroadcast({ label, hash, to, error, defaultJournal });
+      const uncertain = new Error(`${label} broadcast outcome is uncertain for ${hash}: ${error.message}`);
+      uncertain.code = 'BROADCAST_OUTCOME_UNCERTAIN';
+      uncertain.txHash = hash;
+      throw uncertain;
+    }
+    if (String(tx.hash).toLowerCase() !== hash.toLowerCase()) {
+      const error = new Error('RPC returned a transaction hash different from the signed payload');
+      this.markUncertainBroadcast({ label, hash, to, error, defaultJournal, returnedHash: tx.hash });
+      const uncertain = new Error(`${label} broadcast returned an unexpected hash; expected ${hash}, got ${tx.hash}`);
+      uncertain.code = 'BROADCAST_OUTCOME_UNCERTAIN';
+      uncertain.txHash = hash;
+      throw uncertain;
+    }
+    this.ledger.append('tx.sent', { label, hash, to, gasEstimate: gasEstimate.toString() });
+
+    let receipt;
+    try {
+      receipt = await tx.wait(this.config.confirmations);
+    } catch (error) {
+      this.markUncertainBroadcast({ label, hash, to, error, defaultJournal, stage: 'receipt-wait' });
+      const uncertain = new Error(`${label} receipt outcome is uncertain for ${hash}: ${error.message}`);
+      uncertain.code = 'BROADCAST_OUTCOME_UNCERTAIN';
+      uncertain.txHash = hash;
+      throw uncertain;
+    }
+    if (!receipt || receipt.status !== 1) {
+      this.restoreBroadcastJournal(defaultJournal, { label, hash, status: 'reverted' });
+      throw new Error(`${label} failed: ${tx.hash}`);
+    }
+    this.restoreBroadcastJournal(defaultJournal, { label, hash, status: 'confirmed' });
+    const gasPrice = receipt.gasPrice || tx.gasPrice || fees.maxFeePerGas || fees.gasPrice || 0n;
     const gasEth = Number(formatUnits(receipt.gasUsed * gasPrice, 18));
     const ethUsd = Number(this.getUsdPrice?.(ZERO_ADDRESS) || 0);
     this.ledger.append('tx.confirmed', {
       label,
-      hash: tx.hash,
+      hash,
       blockNumber: receipt.blockNumber,
       gasUsed: receipt.gasUsed.toString(),
       gasPriceWei: gasPrice.toString(),
@@ -1150,13 +1828,47 @@ export class RebalanceExecutor {
     return receipt;
   }
 
-  async assertGasGuard() {
-    const feeData = await this.writeProvider.getFeeData();
-    const gasPrice = feeData.maxFeePerGas || feeData.gasPrice;
-    if (!gasPrice) return;
-    const maxWei = BigInt(Math.floor(Number(this.config.maxGasGwei) * 1e9));
+  markUncertainBroadcast({ label, hash, to, error, defaultJournal, returnedHash = null, stage = 'broadcast' }) {
+    this.ledger.append('tx.broadcast_uncertain', {
+      label,
+      hash,
+      returnedHash,
+      to,
+      stage,
+      error: error.message
+    });
+    if (!this.state) return;
+    const active = this.state.getSetting('activeRebalanceExecution', null);
+    if (!active || !defaultJournal || active.id !== defaultJournal.id) return;
+    this.saveJournal({
+      ...active,
+      phase: 'recovery_required',
+      failedAt: Date.now(),
+      error: error.message,
+      pendingTx: { label, hash, to, stage, outcome: 'uncertain' }
+    });
+  }
+
+  restoreBroadcastJournal(defaultJournal, { label, hash, status }) {
+    if (!this.state || !defaultJournal) return;
+    const active = this.state.getSetting('activeRebalanceExecution', null);
+    if (!active || active.id !== defaultJournal.id || active.pendingTx?.hash !== hash) return;
+    this.saveJournal({
+      ...active,
+      phase: defaultJournal.previousPhase,
+      pendingTx: null,
+      lastApprovalTx: { label, hash, status }
+    });
+  }
+
+  async assertGasGuard(feeOverrides = null) {
+    const fees = await this.getPinnedFeeOverrides(feeOverrides);
+    const gasPrice = feeCap(fees);
+    const maxGasGwei = Number(this.config.maxGasGwei);
+    if (!Number.isFinite(maxGasGwei) || maxGasGwei <= 0) throw new Error('MAX_GAS_GWEI is unavailable or invalid');
+    const maxWei = BigInt(Math.floor(maxGasGwei * 1e9));
     if (gasPrice > maxWei) {
-      throw new Error(`Gas guard: ${formatUnits(gasPrice, 'gwei')} gwei > ${this.config.maxGasGwei} gwei`);
+      throw new Error(`Gas guard: ${formatUnits(gasPrice, 'gwei')} gwei > ${maxGasGwei} gwei`);
     }
   }
 
@@ -1216,6 +1928,48 @@ function positiveOperationDelta(before, after) {
     raw0: delta.raw0 > 0n ? delta.raw0 : 0n,
     raw1: delta.raw1 > 0n ? delta.raw1 : 0n
   };
+}
+function uniquePairTokens(...pools) {
+  const tokens = new Map();
+  for (const pool of pools) {
+    for (const token of [pool?.token0, pool?.token1]) {
+      if (token?.address) tokens.set(String(token.address).toLowerCase(), token);
+    }
+  }
+  return [...tokens.values()];
+}
+function serializeFundingEntry(entry) {
+  return {
+    address: entry.address,
+    symbol: entry.token.symbol,
+    walletSource: entry.walletSource,
+    walletRaw: entry.walletRaw.toString(),
+    withdrawRaw: entry.withdrawRaw.toString(),
+    dustRaw: entry.dustRaw.toString(),
+    maxSpendRaw: entry.maxSpendRaw.toString()
+  };
+}
+function applySwapBudget(balances, swapPlan, useMinimumOutput = true) {
+  const result = { raw0: BigInt(balances.raw0), raw1: BigInt(balances.raw1) };
+  if (!swapPlan || swapPlan.direction === 'none') return result;
+  const input = BigInt(swapPlan.rawAmountIn);
+  const output = BigInt(useMinimumOutput ? swapPlan.quote.minRawAmountOut : swapPlan.quote.rawAmountOut);
+  if (input <= 0n || output <= 0n) throw new Error('Swap budget plan has invalid input/output');
+  if (swapPlan.tokenIn === 0) {
+    if (input > result.raw0) throw new Error('Swap budget exceeds scoped token0 capital');
+    result.raw0 -= input;
+    result.raw1 += output;
+  } else if (swapPlan.tokenIn === 1) {
+    if (input > result.raw1) throw new Error('Swap budget exceeds scoped token1 capital');
+    result.raw1 -= input;
+    result.raw0 += output;
+  } else {
+    throw new Error('Swap budget has an invalid input token index');
+  }
+  return result;
+}
+function feeCap(feeOverrides) {
+  return BigInt(feeOverrides?.maxFeePerGas ?? feeOverrides?.gasPrice ?? 0n);
 }
 function stringifyRawBalances(value) {
   return { raw0: value.raw0.toString(), raw1: value.raw1.toString() };

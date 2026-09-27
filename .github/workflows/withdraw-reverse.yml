@@ -18,16 +18,36 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
+      - run: npm ci
+      - name: Check optional wallet secret
+        id: wallet
+        env:
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
+        run: |
+          if [[ -n "$WALLET_ADDRESS" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Wallet history analysis skipped: WALLET_ADDRESS secret is not configured."
+          fi
       - name: Reverse real Fables withdraw transactions
+        if: steps.wallet.outputs.configured == 'true'
         env:
           RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
-          WALLET_ADDRESS: "0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF"
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
           TARGET_MODE: "wallet-active"
           DATA_DIR: "./data"
           STATE_FILE: "./state/reverse-state.json"
-        run: node src/tools/reverse-withdraw.js
-      - uses: actions/upload-artifact@v4
-        with:
-          name: withdraw-reverse
-          path: data/withdraw-reverse/
+        run: |
+          if node src/tools/reverse-withdraw.js > "$RUNNER_TEMP/withdraw-reverse.log" 2>&1; then
+            status=0
+          else
+            status=$?
+          fi
+          rm -f "$RUNNER_TEMP/withdraw-reverse.log"
+          rm -rf data/withdraw-reverse
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Wallet history analysis failed; wallet-specific diagnostics were withheld."
+            exit "$status"
+          fi
+          echo "Wallet history analysis completed; wallet-specific results were not published."

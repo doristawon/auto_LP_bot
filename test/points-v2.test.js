@@ -82,6 +82,7 @@ test('points v2 predicts from fee share when denominator and user coverage are c
   const state = fakeState({
     actualPointsBaseline: 1000,
     actualPointsBaselineAt: new Date(day).toISOString(),
+    pointsOfficial: { wallet: '', lpPoints: 1000, referralPoints: 0, settledAt: day },
     pointsUserTrackingStartedAtV2: day
   });
   const ledger = fakeLedger([
@@ -89,7 +90,7 @@ test('points v2 predicts from fee share when denominator and user coverage are c
     event(day + 120_000, 'points.global_swap_fee', { feeUsd: 100, priced: true })
   ]);
   const tracker = new PointsTracker({ actualPointsBaseline: 0, actualPointsBaselineAt: '' }, ledger, state);
-  const snap = tracker.snapshot(day + 12 * 60 * 60 * 1000);
+  const snap = tracker.snapshot({ atMs: day + 12 * 60 * 60 * 1000, force: true });
   const expected = dailyPointBudget(day) * 0.1;
   assert.equal(snap.status, 'ready');
   assert.ok(Math.abs(snap.projectedCurrentDay - expected) < 1e-9);
@@ -102,6 +103,7 @@ test('points v2 refuses exact prediction if any global swap is unpriced', () => 
   const state = fakeState({
     actualPointsBaseline: 1000,
     actualPointsBaselineAt: new Date(day).toISOString(),
+    pointsOfficial: { wallet: '', lpPoints: 1000, referralPoints: 0, settledAt: day },
     pointsUserTrackingStartedAtV2: day
   });
   const ledger = fakeLedger([
@@ -110,7 +112,7 @@ test('points v2 refuses exact prediction if any global swap is unpriced', () => 
     event(day + 180_000, 'points.global_swap_fee', { feeUsd: null, priced: false })
   ]);
   const tracker = new PointsTracker({ actualPointsBaseline: 0, actualPointsBaselineAt: '' }, ledger, state);
-  const snap = tracker.snapshot(day + 12 * 60 * 60 * 1000);
+  const snap = tracker.snapshot({ atMs: day + 12 * 60 * 60 * 1000, force: true });
   assert.equal(snap.status, 'incomplete-denominator');
   assert.equal(snap.estimatedTotal, null);
   assert.ok(snap.provisionalEstimatedTotal > 1000);
@@ -122,6 +124,7 @@ test('official checkpoint reconciles the previous completed campaign day', () =>
   const state = fakeState({
     actualPointsBaseline: 50_000,
     actualPointsBaselineAt: new Date(day1).toISOString(),
+    pointsOfficial: { wallet: '', lpPoints: 50_000, referralPoints: 0, settledAt: day1 },
     pointsUserTrackingStartedAtV2: day1
   });
   const ledger = fakeLedger([
@@ -135,6 +138,53 @@ test('official checkpoint reconciles the previous completed campaign day', () =>
   assert.equal(result.reconciliation.coverageComplete, true);
   assert.ok(Math.abs(result.reconciliation.predictedDelta - predicted) < 1e-9);
   assert.ok(Math.abs(result.reconciliation.errorPoints + 25) < 1e-9);
+});
+
+test('manual baseline stays separate from official checkpoint and prediction start', () => {
+  const day = Date.parse('2026-09-25T02:00:00Z');
+  const state = fakeState({
+    actualPointsBaseline: 900,
+    actualPointsBaselineAt: new Date(day).toISOString(),
+    pointsUserTrackingStartedAtV2: day
+  });
+  const ledger = fakeLedger([]);
+  const tracker = new PointsTracker({ actualPointsBaseline: 0 }, ledger, state);
+  const predictionStart = tracker.predictionStartMs(day + 18 * 60 * 60 * 1000);
+  assert.equal(state.getSetting('actualPointsBaseline'), 0);
+  assert.equal(state.getSetting('manualPointsBaseline'), 900);
+  assert.equal(predictionStart, latestCompletedPointsBoundaryMs(day + 18 * 60 * 60 * 1000));
+
+  tracker.setManualBaseline(1_250, new Date(day + 10 * 60 * 60 * 1000).toISOString());
+  const beforeOfficialUpdate = tracker.snapshot({ atMs: day + 12 * 60 * 60 * 1000, force: true });
+  assert.equal(beforeOfficialUpdate.actualBaseline, 0);
+  assert.equal(beforeOfficialUpdate.manualBaseline, 1_250);
+  assert.equal(beforeOfficialUpdate.predictionStartAt, new Date(predictionStart).toISOString());
+
+  tracker.setActualBaseline(1_100, new Date(day + 24 * 60 * 60 * 1000).toISOString());
+  const afterOfficialUpdate = tracker.snapshot({ atMs: day + 25 * 60 * 60 * 1000, force: true });
+  assert.equal(afterOfficialUpdate.actualBaseline, 1_100);
+  assert.equal(afterOfficialUpdate.manualBaseline, 1_250);
+});
+
+test('snapshot reuses cached simulation unless force is explicitly requested', () => {
+  const day = Date.parse('2026-09-25T02:00:00Z');
+  const state = fakeState({
+    actualPointsBaseline: 1000,
+    actualPointsBaselineAt: new Date(day).toISOString(),
+    pointsOfficial: { wallet: '', lpPoints: 1000, referralPoints: 0, settledAt: day },
+    pointsUserTrackingStartedAtV2: day
+  });
+  const ledger = fakeLedger([]);
+  const originalAll = ledger.all;
+  let allCalls = 0;
+  ledger.all = () => { allCalls += 1; return originalAll(); };
+  const tracker = new PointsTracker({ pointsSimulationIntervalMs: 60_000 }, ledger, state);
+  tracker.snapshot({ atMs: day + 12 * 60 * 60 * 1000, force: true });
+  const callsAfterFirstSimulation = allCalls;
+  tracker.snapshot();
+  assert.equal(allCalls, callsAfterFirstSimulation);
+  tracker.snapshot({ force: true });
+  assert.ok(allCalls > callsAfterFirstSimulation);
 });
 
 function event(ts, type, extra = {}) {

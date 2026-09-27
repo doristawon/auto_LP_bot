@@ -29,34 +29,71 @@ export class PointsTracker {
     this.cachedSnapshot = null;
     this.lastSimulationAt = 0;
 
-    if (this.state.getSetting('actualPointsBaseline', null) == null && config.actualPointsBaseline > 0) {
-      const rawAt = config.actualPointsBaselineAt
-        ? Date.parse(config.actualPointsBaselineAt)
-        : latestCompletedPointsBoundaryMs(Date.now());
-      const atMs = normalizedBoundary(rawAt);
-      this.state.setSetting('actualPointsBaseline', config.actualPointsBaseline);
-      this.state.setSetting('actualPointsBaselineAt', new Date(atMs).toISOString());
-    }
+    this.migratePointBaselines(config);
 
-    const storedBaseline = Number(this.state.getSetting('actualPointsBaseline', 0) || 0);
+  }
+
+  migratePointBaselines(config) {
+    const storedOfficial = this.state.getSetting('pointsOfficial', null);
+    const officialWallet = String(storedOfficial?.wallet || '').toLowerCase();
+    const configuredWallet = String(config.walletAddress || '').toLowerCase();
+    const walletMatches = !officialWallet || !configuredWallet || officialWallet === configuredWallet;
+    const officialPoints = Number(storedOfficial?.lpPoints || 0) + Number(storedOfficial?.referralPoints || 0);
+    const officialAtMs = timestampMs(storedOfficial?.settledAt);
+    const hasOfficialBaseline = walletMatches
+      && Number.isFinite(officialPoints)
+      && officialPoints >= 0
+      && Number.isFinite(officialAtMs)
+      && officialAtMs > 0;
+    const storedBaselineRaw = this.state.getSetting('actualPointsBaseline', 0);
+    const storedBaseline = Number(storedBaselineRaw || 0);
     const storedAtRaw = this.state.getSetting('actualPointsBaselineAt', null);
-    if (storedBaseline > 0 && storedAtRaw) {
-      const parsed = Date.parse(storedAtRaw);
-      if (Number.isFinite(parsed)) {
-        const normalized = normalizedBoundary(parsed);
-        if (normalized !== parsed) {
-          const normalizedIso = new Date(normalized).toISOString();
-          this.state.setSetting('actualPointsBaselineAt', normalizedIso);
-          this.ledger.append('points.baseline_migrated_v2', {
-            points: storedBaseline,
-            previousAt: storedAtRaw,
-            normalizedAt: normalizedIso,
-            reason: 'campaign day is anchored at 02:00 UTC'
-          }, Date.now());
-        }
+    let manualBaseline = this.state.getSetting('manualPointsBaseline', null);
+    let manualAt = this.state.getSetting('manualPointsBaselineAt', null);
+
+    if (manualBaseline == null) {
+      if (hasOfficialBaseline && storedBaselineRaw != null && storedBaseline !== officialPoints
+        && (storedBaseline > 0 || storedAtRaw != null)) {
+        manualBaseline = storedBaseline;
+        manualAt = storedAtRaw || null;
+      } else if (storedBaseline > 0 && !hasOfficialBaseline) {
+        manualBaseline = storedBaseline;
+        manualAt = storedAtRaw || null;
+      } else if (Number(config.actualPointsBaseline) > 0) {
+        manualBaseline = Number(config.actualPointsBaseline);
+        manualAt = config.actualPointsBaselineAt || null;
+      }
+      if (manualBaseline != null) {
+        this.state.setSetting('manualPointsBaseline', manualBaseline);
+        this.state.setSetting('manualPointsBaselineAt', manualAt || new Date().toISOString());
       }
     }
 
+    if (hasOfficialBaseline) {
+      const normalizedAt = new Date(normalizedBoundary(officialAtMs)).toISOString();
+      if (storedBaseline !== officialPoints || storedAtRaw !== normalizedAt) {
+        this.state.setSetting('actualPointsBaseline', officialPoints);
+        this.state.setSetting('actualPointsBaselineAt', normalizedAt);
+        this.state.setSetting('pointsLastReconciliation', null);
+        this.ledger.append('points.official_baseline_restored', {
+          points: officialPoints,
+          at: normalizedAt,
+          reason: 'restore authoritative official settlement after local baseline override'
+        });
+      }
+      return;
+    }
+
+    if (storedBaseline !== 0 || storedAtRaw != null) {
+      this.state.setSetting('actualPointsBaseline', 0);
+      this.state.setSetting('actualPointsBaselineAt', null);
+      this.state.setSetting('pointsLastReconciliation', null);
+      this.ledger.append('points.legacy_baseline_moved_to_manual', {
+        points: storedBaseline,
+        previousAt: storedAtRaw,
+        reason: 'legacy local baseline is display fallback only; it is not an official checkpoint'
+      });
+    }
   }
 
   noteUserTrackingStarted(at = Date.now()) {
@@ -87,6 +124,24 @@ export class PointsTracker {
     // completed campaign boundary instead of pretending it can reconstruct the
     // whole campaign from an incomplete local ledger.
     return latestCompletedPointsBoundaryMs(nowMs);
+  }
+
+  setManualBaseline(points, at = null) {
+    const value = Number(points);
+    if (!Number.isFinite(value) || value < 0) throw new Error('Manual points baseline must be a non-negative number');
+    const requestedMs = at == null ? Date.now() : timestampMs(at);
+    if (!Number.isFinite(requestedMs) || requestedMs <= 0) throw new Error('Manual points baseline timestamp is invalid');
+    const iso = new Date(requestedMs).toISOString();
+    this.state.setSetting('manualPointsBaseline', value);
+    this.state.setSetting('manualPointsBaselineAt', iso);
+    this.ledger.append('points.manual_baseline', {
+      points: value,
+      at: iso,
+      requestedAt: at == null ? null : String(at),
+      affectsPredictionStart: false
+    }, requestedMs);
+    this.invalidate();
+    return { points: value, at: iso, source: 'manual-fallback' };
   }
 
   setActualBaseline(points, at = null) {
@@ -243,20 +298,24 @@ export class PointsTracker {
     }
   }
 
-  snapshot(nowMs = Date.now()) {
-    const options = nowMs && typeof nowMs === 'object' ? nowMs : {};
+  snapshot(options = {}) {
+    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+      throw new TypeError('snapshot expects an options object');
+    }
     const atMs = Number.isFinite(Number(options.atMs)) ? Number(options.atMs) : Date.now();
-    const simulationAtMs = typeof nowMs === 'number' && Number.isFinite(nowMs) ? Number(nowMs) : atMs;
-    const force = options.force === true || typeof nowMs === 'number';
+    const force = options.force === true;
     const simulationIntervalMs = Math.max(5_000, Number(this.config.pointsSimulationIntervalMs) || 15_000);
     if (!force && this.cachedSnapshot && Date.now() - this.lastSimulationAt < simulationIntervalMs) {
       return this.withEvidence(this.cachedSnapshot, atMs);
     }
-    nowMs = simulationAtMs;
+    const nowMs = atMs;
     const actualBaseline = Number(this.state.getSetting('actualPointsBaseline', 0) || 0);
     const baselineAtRaw = this.state.getSetting('actualPointsBaselineAt', null);
     const baselineAtMs = baselineAtRaw ? Date.parse(baselineAtRaw) : 0;
     const predictionStartMs = this.predictionStartMs(nowMs);
+    const globalScanProgress = this.state.getSetting('pointsGlobalScanProgress', null);
+    const globalBackfillComplete = this.config.pointsGlobalSwapScanEnabled !== true
+      || globalScanProgress?.complete === true;
     const trackingStartedAt = Number(this.state.getSetting('pointsUserTrackingStartedAtV2', 0) || 0);
     const coverageBroken = this.state.getSetting('pointsUserCoverageBrokenV2', null);
     const coverageBrokenAt = Number(coverageBroken?.at || 0);
@@ -306,13 +365,14 @@ export class PointsTracker {
     }
 
     const provisionalEstimatedDelta = provisionalSettledDelta + provisionalCurrentDay;
-    const exactEstimatedDelta = hasIncomplete
+    const exactEstimatedDelta = hasIncomplete || !globalBackfillComplete
       ? null
       : settledEstimatedDelta + (projectedCurrentDay || 0);
 
     let status = 'ready';
     if (!(actualBaseline > 0) || !(baselineAtMs > 0)) status = 'needs-official-baseline';
     else if (totalGlobalSwaps === 0) status = 'waiting-for-global-swaps';
+    else if (!globalBackfillComplete) status = 'backfilling-global-swaps';
     else if (totalUnpricedSwaps > 0) status = 'incomplete-denominator';
     else if (!userCoverageGloballyComplete) status = 'incomplete-user-coverage';
     else if (hasIncomplete) status = 'incomplete-coverage';
@@ -330,6 +390,8 @@ export class PointsTracker {
       status,
       actualBaseline,
       actualBaselineAt: baselineAtRaw,
+      manualBaseline: this.state.getSetting('manualPointsBaseline', null),
+      manualBaselineAt: this.state.getSetting('manualPointsBaselineAt', null),
       predictionStartAt: new Date(predictionStartMs).toISOString(),
       userTrackingStartedAt: trackingStartedAt > 0 ? new Date(trackingStartedAt).toISOString() : null,
       userCoverageBrokenAt: coverageBrokenAt > 0 ? new Date(coverageBrokenAt).toISOString() : null,
@@ -342,6 +404,7 @@ export class PointsTracker {
       provisionalEstimatedTotal,
       nextDistributionAt,
       globalSwapCount: totalGlobalSwaps,
+      globalScanProgress,
       unpricedGlobalSwapCount: totalUnpricedSwaps,
       denominatorCoveragePct: totalGlobalSwaps > 0
         ? (totalGlobalSwaps - totalUnpricedSwaps) / totalGlobalSwaps * 100
@@ -442,6 +505,13 @@ function emptyBucket(dayStart) {
 function normalizedBoundary(timestampMs) {
   const value = Number.isFinite(Number(timestampMs)) ? Number(timestampMs) : Date.now();
   return pointsBoundaryAtOrBefore(value);
+}
+
+function timestampMs(value) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return numeric;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : NaN;
 }
 
 function finiteNumber(value) {

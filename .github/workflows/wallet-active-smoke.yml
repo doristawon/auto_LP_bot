@@ -20,37 +20,29 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
-      - name: Seed last verified wallet topology checkpoint
+      - run: npm ci
+      - name: Check optional wallet and discovery configuration
+        id: wallet
+        env:
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
+          DISCOVERY_FROM_BLOCK: ${{ vars.WALLET_POOL_DISCOVERY_FROM_BLOCK }}
+        run: |
+          if [[ -n "$WALLET_ADDRESS" && "$DISCOVERY_FROM_BLOCK" =~ ^[0-9]+$ ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Wallet active smoke skipped: required repository settings are not configured."
+          fi
+      - name: Initialize empty wallet topology state
+        if: steps.wallet.outputs.configured == 'true'
         run: |
           mkdir -p state data
-          cat > state/smoke-state.json <<'JSON'
-          {
-            "positions": {},
-            "rebalanceHistory": [],
-            "cursors": {
-              "walletPoolDiscovery": 71121690
-            },
-            "settings": {
-              "walletRangeCandidates": [
-                "0x08e52564bad99e05a694b4809f397edca417a080|0x0886b49f36cd984af8045717bbbd1d8c26eedb1cee360963420ad0e9f5b8bf72",
-                "0x08e52564bad99e05a694b4809f397edca417a080|0x250d40538dca9aea1f90cbf9cdbd883203c028274d591b0246a6df7af2961b26"
-              ],
-              "activeWalletPoolIds": [
-                "0x31608601d541e868706aa557558a4d4f99c57e6dd13bd3362edcf05d00a16212",
-                "0x6b187fad6ca2dcb913f2451c5d5e24d3d77b9d09ce272c2c99f64dac672bc485"
-              ],
-              "activeWalletRangeKeys": [
-                "0x08e52564bad99e05a694b4809f397edca417a080|0x0886b49f36cd984af8045717bbbd1d8c26eedb1cee360963420ad0e9f5b8bf72",
-                "0x08e52564bad99e05a694b4809f397edca417a080|0x250d40538dca9aea1f90cbf9cdbd883203c028274d591b0246a6df7af2961b26"
-              ]
-            }
-          }
-          JSON
-      - name: Run production bot once against real wallet TX
+          printf '%s\n' '{"positions":{},"rebalanceHistory":[],"cursors":{},"settings":{}}' > state/smoke-state.json
+      - name: Run production bot once in wallet-active dry-run mode
+        if: steps.wallet.outputs.configured == 'true'
         env:
           RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
-          WALLET_ADDRESS: "0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF"
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
           TARGET_MODE: "wallet-active"
           TARGET_SYMBOLS: ""
           TARGET_POOL_IDS: ""
@@ -58,38 +50,44 @@ jobs:
           ENABLE_LIVE_WRITES: "false"
           ENABLE_AUTO_REDEPLOY: "false"
           LOG_FROM_BLOCK: "44000000"
-          WALLET_POOL_DISCOVERY_FROM_BLOCK: "71121689"
+          WALLET_POOL_DISCOVERY_FROM_BLOCK: ${{ vars.WALLET_POOL_DISCOVERY_FROM_BLOCK }}
           REORG_LOOKBACK_BLOCKS: "64"
           MANUAL_TOPOLOGY_COOLDOWN_SEC: "120"
           FEE_LOG_FROM_BLOCK: "999999999"
           POINTS_GLOBAL_SWAP_SCAN_ENABLED: "false"
           DATA_DIR: "./data"
           STATE_FILE: "./state/smoke-state.json"
-        run: npm run once
+        run: |
+          if npm run once > "$RUNNER_TEMP/wallet-active-bot.log" 2>&1; then
+            rm -f "$RUNNER_TEMP/wallet-active-bot.log"
+            echo "Wallet-active dry-run completed."
+          else
+            status=$?
+            rm -f "$RUNNER_TEMP/wallet-active-bot.log"
+            echo "::error::Wallet-active dry-run failed; wallet-specific diagnostics were withheld."
+            exit "$status"
+          fi
       - name: Independently verify current wallet-active topology
+        if: steps.wallet.outputs.configured == 'true'
         env:
           RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
-          WALLET_ADDRESS: "0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF"
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
           TARGET_MODE: "wallet-active"
-          WALLET_POOL_DISCOVERY_FROM_BLOCK: "71121689"
-          VERIFY_FROM_BLOCK: "71121689"
+          WALLET_POOL_DISCOVERY_FROM_BLOCK: ${{ vars.WALLET_POOL_DISCOVERY_FROM_BLOCK }}
+          VERIFY_FROM_BLOCK: ${{ vars.WALLET_POOL_DISCOVERY_FROM_BLOCK }}
           STATE_FILE: "./state/smoke-state.json"
-        run: node src/tools/verify-wallet-topology.js
-      - name: Show dynamic topology result
+        run: |
+          if node src/tools/verify-wallet-topology.js > "$RUNNER_TEMP/wallet-topology-verify.log" 2>&1; then
+            rm -f "$RUNNER_TEMP/wallet-topology-verify.log"
+            echo "Wallet topology verification completed."
+          else
+            status=$?
+            rm -f "$RUNNER_TEMP/wallet-topology-verify.log"
+            echo "::error::Wallet topology verification failed; wallet-specific diagnostics were withheld."
+            exit "$status"
+          fi
+      - name: Remove wallet-specific smoke data
         if: always()
         run: |
-          echo "=== STATE ==="
-          cat state/smoke-state.json || true
-          echo "=== SNAPSHOT ==="
-          cat data/latest-snapshot.json || true
-          echo "=== EVENTS ==="
-          tail -n 100 data/events.jsonl || true
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: wallet-active-smoke
-          path: |
-            state/smoke-state.json
-            data/latest-snapshot.json
-            data/events.jsonl
-          if-no-files-found: warn
+          rm -f state/smoke-state.json
+          rm -rf data

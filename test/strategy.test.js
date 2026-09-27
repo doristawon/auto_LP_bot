@@ -116,6 +116,39 @@ test('deep OOR requires two consecutive 5-minute evaluations', () => {
   assert.equal(second.rebalanceReason, 'deep_oor_confirmed');
 });
 
+test('shallow max wait cannot bypass a longer deep-confirmation policy', () => {
+  const t0 = 2_500_000;
+  const base = {
+    currentTick: 1051,
+    tickSpacing: 10,
+    position: { tickLower: 900, tickUpper: 1000 },
+    widthBps: 120,
+    checkIntervalMs: M5,
+    shallowThresholdPct: 0.5,
+    maxWaitMs: 10 * 60 * 1000,
+    deepConfirmationsRequired: 4,
+    outOfRangeSince: t0,
+    cooldownUntil: 0
+  };
+  const beforeFourth = evaluatePosition({
+    ...base,
+    nowMs: t0 + 10 * 60 * 1000,
+    lastEvaluationAt: t0 + M5,
+    deepConfirmationsSeen: 2
+  });
+  assert.equal(beforeFourth.deepConfirmations, 3);
+  assert.equal(beforeFourth.shouldRebalance, false);
+
+  const fourth = evaluatePosition({
+    ...base,
+    nowMs: t0 + 15 * 60 * 1000,
+    lastEvaluationAt: beforeFourth.evaluatedAt,
+    deepConfirmationsSeen: beforeFourth.deepConfirmations
+  });
+  assert.equal(fourth.shouldRebalance, true);
+  assert.equal(fourth.rebalanceReason, 'deep_oor_confirmed');
+});
+
 test('single deep spike that becomes shallow resets deep confirmations but keeps OOR timer', () => {
   const common = {
     tickSpacing: 10,

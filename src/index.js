@@ -11,12 +11,20 @@ const dashboard = new DashboardServer(config, bot, bot.ledger, bot.points);
 const once = process.argv.includes('--once');
 const dashboardOnly = process.argv.includes('--dashboard-only');
 
+let shutdownPromise = null;
 for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.on(signal, async () => {
-    log('info', 'bot.stopping', { signal });
-    bot.stop();
-    await dashboard.stop();
-    process.exit(0);
+  process.on(signal, () => {
+    if (shutdownPromise) return;
+    shutdownPromise = (async () => {
+      log('info', 'bot.stopping', { signal });
+      bot.stop();
+      await bot.waitForCycleIdle();
+      await dashboard.stop();
+      log('info', 'bot.stopped', { signal });
+    })().catch((error) => {
+      log('error', 'bot.shutdown_failed', { error: error.stack || error.message });
+      process.exitCode = 1;
+    });
   });
 }
 

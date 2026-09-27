@@ -18,10 +18,31 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
+      - run: npm ci
+      - name: Check optional wallet secret
+        id: wallet
+        env:
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
+        run: |
+          if [[ -n "$WALLET_ADDRESS" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Wallet-specific probe skipped: WALLET_ADDRESS secret is not configured."
+          fi
       - name: Scan Robinhood Chain for EIP-7702 type-4 transactions
+        if: steps.wallet.outputs.configured == 'true'
         env:
           RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
-          WALLET_ADDRESS: "0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF"
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
           EIP7702_PROBE_BLOCKS: "1000"
-        run: npm run probe:7702
+        run: |
+          if npm run probe:7702 > "$RUNNER_TEMP/eip7702-probe.log" 2>&1; then
+            rm -f "$RUNNER_TEMP/eip7702-probe.log"
+            echo "EIP-7702 probe completed; wallet-specific output was withheld."
+          else
+            status=$?
+            rm -f "$RUNNER_TEMP/eip7702-probe.log"
+            echo "::error::EIP-7702 probe failed; wallet-specific diagnostics were withheld."
+            exit "$status"
+          fi

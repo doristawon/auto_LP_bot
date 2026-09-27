@@ -22,10 +22,50 @@ import { DEFAULT_RPC_URL, ZERO_ADDRESS } from './constants.js';
 import { isLpOutOfRange } from './math/ticks.js';
 import { buildExactWithdrawBounds } from './math/v4-fixed.js';
 import { HOOK_ABI } from './abi.js';
-import { log, registerSensitiveValues } from './logger.js';
+import { log, registerSensitiveValues, sanitize } from './logger.js';
 
 const hookInterface = new Interface(HOOK_ABI);
 const transferTopic = id('Transfer(address,address,uint256)').toLowerCase();
+const REBALANCE_FAILURE_BASE_MS = 60_000;
+const REBALANCE_FAILURE_MAX_MS = 30 * 60_000;
+
+function rebalanceFailureKey(pool, position) {
+  return `${String(pool.id).toLowerCase()}:${String(position.id).toLowerCase()}`;
+}
+
+function rebalanceFailureMap(state) {
+  const saved = state.getSetting('rebalanceFailureBackoffs', {});
+  return saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+}
+
+function recordRebalanceFailure(state, ledger, pool, position, reason) {
+  const now = Date.now();
+  const key = rebalanceFailureKey(pool, position);
+  const previous = rebalanceFailureMap(state)[key];
+  const count = previous && now - Number(previous.updatedAt || 0) < 24 * 60 * 60_000
+    ? Math.min(32, Number(previous.count || 0) + 1)
+    : 1;
+  const delayMs = Math.min(REBALANCE_FAILURE_MAX_MS,
+    REBALANCE_FAILURE_BASE_MS * 2 ** Math.min(count - 1, 5));
+  const entry = { poolId: pool.id, positionId: position.id, count, updatedAt: now,
+    nextRetryAt: now + delayMs, reason: sanitize(String(reason || 'unknown failure')) };
+  const recent = Object.fromEntries(Object.entries(rebalanceFailureMap(state))
+    .filter(([, item]) => now - Number(item?.updatedAt || 0) < 24 * 60 * 60_000));
+  recent[key] = entry;
+  state.setSetting('rebalanceFailureBackoffs', recent);
+  ledger.append('rebalance.backoff', entry);
+  if (count === 3) ledger.append('rebalance.needs_attention', entry);
+  return entry;
+}
+
+function clearRebalanceFailure(state, pool, position) {
+  const key = rebalanceFailureKey(pool, position);
+  const saved = rebalanceFailureMap(state);
+  if (!(key in saved)) return;
+  const next = { ...saved };
+  delete next[key];
+  state.setSetting('rebalanceFailureBackoffs', next);
+}
 
 export class AutoLpBot {
   constructor(config) {
@@ -35,7 +75,7 @@ export class AutoLpBot {
       poolIds: [...(config.targetPoolIds || [])],
       symbols: [...(config.targetSymbols || [])]
     };
-    registerSensitiveValues([...(config.rpcUrls || []), config.privateKey || '']);
+    registerSensitiveValues([...(config.rpcUrls || []), config.privateKey || '', config.blockscoutApiKey || '']);
     this.baseDataDir = config.dataDir;
     this.baseStateFile = config.stateFile;
     this.preferenceState = new StateStore(path.join(this.baseDataDir, 'dashboard-settings.json'));
@@ -72,6 +112,7 @@ export class AutoLpBot {
     this.snapshot = this.ledger.readSnapshot();
     this.running = false;
     this.cycleActive = false;
+    this.globalPointScanPromise = null;
     this.pointsSimulationTimer = null;
     this.blockTimeCache = new Map();
     this.executor = new RebalanceExecutor(
@@ -126,6 +167,12 @@ export class AutoLpBot {
     const recoveryRequired = activeExecution?.phase === 'recovery_required';
     const terminalExecution = new Set(['completed', 'failed']);
     const executionBusy = Boolean(activeExecution?.phase && !terminalExecution.has(activeExecution.phase));
+    const executionUpdatedAt = Number(activeExecution?.updatedAt || activeExecution?.startedAt || 0);
+    const staleExecution = executionBusy && executionUpdatedAt > 0
+      && Date.now() - executionUpdatedAt > Math.max(5 * 60_000, this.config.rpcRequestTimeoutMs * 2);
+    const rebalanceBackoffs = Object.values(rebalanceFailureMap(this.state))
+      .filter((entry) => Date.now() < Number(entry?.nextRetryAt || 0));
+    const rebalanceNeedsAttention = rebalanceBackoffs.some((entry) => Number(entry.count || 0) >= 3);
     const liveReady = !this.config.dryRun
       && this.config.enableLiveWrites
       && this.config.enableAutoRedeploy
@@ -189,6 +236,8 @@ export class AutoLpBot {
       dryRun: this.config.dryRun,
       liveWrites: this.config.enableLiveWrites,
       autoRedeploy: this.config.enableAutoRedeploy,
+      autoTopupEnabled: this.config.autoTopupEnabled,
+      autoTopupSwapEnabled: this.config.autoTopupSwapEnabled,
       executionPaused: this.executionPaused,
       cycleActive: this.cycleActive,
       signerConfigured,
@@ -203,6 +252,9 @@ export class AutoLpBot {
       activeRebalanceExecution: activeExecution,
       recoveryRequired,
       executionBusy,
+      staleExecution,
+      rebalanceBackoffs,
+      rebalanceNeedsAttention,
       topologyCooldownUntil,
       liveReady,
       startReadiness: { ready: startBlockers.length === 0, blockers: startBlockers },
@@ -210,9 +262,19 @@ export class AutoLpBot {
         maxGasGwei: this.config.maxGasGwei,
         withdrawSlippageBps: this.config.withdrawSlippageBps,
         swapSlippageBps: this.config.swapSlippageBps,
+        maxSwapPriceImpactBps: this.config.maxSwapPriceImpactBps,
         depositSlippageBps: this.config.depositSlippageBps,
         minRebalanceIntervalSec: this.config.minRebalanceIntervalSec,
         maxRebalancesPerHour: this.config.maxRebalancesPerHour
+      },
+      topup: {
+        enabled: this.config.autoTopupEnabled,
+        swapEnabled: this.config.autoTopupSwapEnabled,
+        swapPoolId: this.config.autoTopupSwapPoolId || null,
+        maxSwapPriceImpactBps: this.config.autoTopupMaxSwapPriceImpactBps,
+        minIdleUsd: this.config.autoTopupMinIdleUsd,
+        dustBps: this.config.autoTopupDustBps,
+        minIntervalSec: this.config.autoTopupMinIntervalSec
       },
       strategy: {
         absoluteInRangeHold: true,
@@ -303,7 +365,8 @@ export class AutoLpBot {
     }, { enabled: this.config.persistRuntimeCredentials });
 
     this.config.rpcUrls = urls;
-    registerSensitiveValues([...urls, ...[...this.walletProfiles.values()].map((profile) => profile.privateKey)]);
+    registerSensitiveValues([...urls, ...[...this.walletProfiles.values()].map((profile) => profile.privateKey),
+      this.config.blockscoutApiKey || '']);
     this.providers = nextProviders;
     this.rpcHealth = health;
     this.fables = new FablesAdapter(this.providers.readProvider, this.config);
@@ -354,7 +417,8 @@ export class AutoLpBot {
     this.walletProfiles.set(address.toLowerCase(), profile);
     registerSensitiveValues([
       ...(this.config.rpcUrls || []),
-      ...[...this.walletProfiles.values()].map((item) => item.privateKey)
+      ...[...this.walletProfiles.values()].map((item) => item.privateKey),
+      this.config.blockscoutApiKey || ''
     ]);
     this.activateWalletProfile(profile);
     return { ok: true, address, status: this.walletImportState.status };
@@ -411,7 +475,7 @@ export class AutoLpBot {
         minTvlUsd: this.config.aprPoolMinTvlUsd
       })
       : [];
-    const currentPosition = (this.snapshot?.portfolio?.positions || []).find((position) => Number(position.shares) > 0);
+    const currentPosition = (this.snapshot?.portfolio?.positions || []).find((position) => BigInt(position.shares || 0) > 0n);
     const sourcePool = currentPosition
       ? this.market.pools.find((pool) => pool.id.toLowerCase() === String(currentPosition.poolId).toLowerCase())
       : null;
@@ -554,8 +618,18 @@ export class AutoLpBot {
   }
 
   activateWalletProfile(profile) {
+    // The old wallet's background points scan retains its own state/ledger.
+    // A newly selected wallet may start its own independent scan.
+    this.globalPointScanPromise = null;
     this.config.walletAddress = profile.address;
     this.config.privateKey = profile.privateKey || '';
+    if (this.config.persistRuntimeCredentials) {
+      this.config.eip7702GuardVerificationEnabled = process.env.EIP7702_GUARD_VERIFIED?.toLowerCase() === 'true';
+      this.config.eip7702GuardVerifiedFor = process.env.EIP7702_GUARD_VERIFIED_FOR || '';
+    }
+    this.config.eip7702GuardVerified = Boolean(this.config.eip7702GuardVerificationEnabled)
+      && Boolean(this.config.eip7702GuardVerifiedFor)
+      && this.config.eip7702GuardVerifiedFor.toLowerCase() === profile.address.toLowerCase();
     this.config.dryRun = true;
     this.config.enableLiveWrites = false;
     this.config.enableAutoRedeploy = false;
@@ -656,14 +730,21 @@ export class AutoLpBot {
     const latestBlock = await this.providers.readProvider.getBlockNumber();
     const discovered = await this.fables.discoverAllPools();
     const pools = await this.fables.hydratePoolStates(discovered);
-    const prices = buildUsdPriceMap(pools, this.config.usdgAddress);
     let fablesStats = null;
     try { fablesStats = await fetchFablesPoolStats(); }
     catch (error) { log('warn', 'fables.stats_unavailable', { error: error.message }); }
+    const prices = buildUsdPriceMap(pools, this.config.usdgAddress, { fablesStats });
     this.market = { refreshedAt: Date.now(), pools, prices, latestBlock, fablesStats };
     if (this.config.pointsGlobalSwapScanEnabled !== false) {
-      log('info', 'points.global_scan_started', { block: latestBlock, pools: pools.length });
-      await this.scanGlobalPointFees(pools, latestBlock);
+      if (!this.globalPointScanPromise) {
+        log('info', 'points.global_scan_started', { block: latestBlock, pools: pools.length });
+        const scan = this.scanGlobalPointFees(pools, latestBlock)
+          .catch((error) => log('warn', 'points.global_scan_failed', { error: error.message }))
+          .finally(() => {
+            if (this.globalPointScanPromise === scan) this.globalPointScanPromise = null;
+          });
+        this.globalPointScanPromise = scan;
+      }
     } else {
       log('info', 'points.global_scan_skipped', { reason: 'POINTS_GLOBAL_SWAP_SCAN_ENABLED=false' });
     }
@@ -764,6 +845,7 @@ export class AutoLpBot {
           dryRun: this.config.dryRun,
           liveWrites: this.config.enableLiveWrites,
           autoRedeploy: this.config.enableAutoRedeploy,
+          autoTopupEnabled: this.config.autoTopupEnabled,
           executionPaused: this.executionPaused,
           lastAction: this.state.getSetting('lastAction', null),
           targetMode: this.config.targetMode,
@@ -802,6 +884,7 @@ export class AutoLpBot {
       for (const { pool, position } of pendingRebalances) {
         await this.maybeRebalance(pool, position);
       }
+      if (!pendingRebalances.length) await this.maybeTopUpIdleBalance(targetPools, walletBalances);
       return snapshot;
     } finally {
       this.cycleActive = false;
@@ -1020,9 +1103,9 @@ export class AutoLpBot {
       lastRangeEvaluationAt: evaluation.evaluatedAt,
       nextRangeEvaluationAt: evaluation.nextEvaluationAt,
       cooldownActive: evaluation.cooldownActive,
-      shouldRebalance: !pool.state.paused && evaluation.shouldRebalance,
-      rebalanceReason: !pool.state.paused ? evaluation.rebalanceReason : null,
-      executionBlockedReason: pool.state.paused ? 'fables pool paused' : null,
+      shouldRebalance: pool.state?.paused === false && evaluation.shouldRebalance,
+      rebalanceReason: pool.state?.paused === false ? evaluation.rebalanceReason : null,
+      executionBlockedReason: pool.state?.paused === false ? null : 'fables pool paused or status unknown',
       target: evaluation.target
     });
     this.state.setPosition(stateKey, {
@@ -1045,9 +1128,9 @@ export class AutoLpBot {
       outOfRangeElapsedMin: evaluation.outOfRangeElapsedMs / 60000,
       deepConfirmations: evaluation.deepConfirmations,
       evaluationDue: evaluation.evaluationDue,
-      shouldRebalance: !pool.state.paused && evaluation.shouldRebalance,
-      rebalanceReason: !pool.state.paused ? evaluation.rebalanceReason : null,
-      executionBlockedReason: pool.state.paused ? 'fables pool paused' : null,
+      shouldRebalance: pool.state?.paused === false && evaluation.shouldRebalance,
+      rebalanceReason: pool.state?.paused === false ? evaluation.rebalanceReason : null,
+      executionBlockedReason: pool.state?.paused === false ? null : 'fables pool paused or status unknown',
       target: evaluation.target
     });
   }
@@ -1098,6 +1181,68 @@ export class AutoLpBot {
     }
   }
 
+  async maybeTopUpIdleBalance(targetPools, walletBalances) {
+    if (!this.config.autoTopupEnabled || this.executionPaused) return null;
+    if (!this.config.dryRun && (!this.config.enableLiveWrites || !this.config.enableAutoRedeploy
+      || !this.config.privateKey)) return null;
+    const journal = this.state.getSetting('activeRebalanceExecution', null);
+    if (journal?.phase && !['completed', 'failed'].includes(journal.phase)) return null;
+
+    const active = targetPools.flatMap((pool) => (pool.positions || [])
+      .filter((position) => BigInt(position.shares || 0) > 0n)
+      .map((position) => ({ pool, position })));
+    // Never guess which range should receive funds when this wallet owns several.
+    if (active.length !== 1) return null;
+    const { pool, position } = active[0];
+    if (pool.state?.paused !== false || position.outside !== false
+      || pool.state.tick < position.tickLower || pool.state.tick >= position.tickUpper) return null;
+    // APR rotation happens only after an OOR withdrawal. While this LP remains
+    // in range, idle pair tokens belong to its existing range.
+    const target = this.getInvestmentTargetSettings();
+    if (target.mode === 'specific-pool' && target.poolId !== pool.id.toLowerCase()) return null;
+    if (!['apr-highest', 'specific-pool'].includes(target.mode)) return null;
+
+    const tokenValues = [pool.token0, pool.token1].map((token) => {
+      const amount = Number(walletBalances[token.address.toLowerCase()]?.amount || 0);
+      const price = this.priceOf(token.address);
+      return Number.isFinite(amount) && amount >= 0 && Number.isFinite(price) && price > 0
+        ? amount * price : NaN;
+    });
+    if (!tokenValues.every((value) => Number.isFinite(value) && value >= 0)) return null;
+    const idleUsd = tokenValues[0] + tokenValues[1];
+    if (idleUsd < this.config.autoTopupMinIdleUsd) return null;
+
+    const now = Date.now();
+    const key = `${pool.id.toLowerCase()}:${position.id.toLowerCase()}`;
+    const stored = this.state.getSetting('autoTopupAttempts', {});
+    const attempts = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+    const previous = attempts[key];
+    if (previous && now - Number(previous.at || 0) < this.config.autoTopupMinIntervalSec * 1000) return null;
+    const next = Object.fromEntries(Object.entries(attempts)
+      .filter(([, entry]) => now - Number(entry?.at || 0) < 7 * 24 * 60 * 60_000));
+    next[key] = { at: now, idleUsd };
+    this.state.setSetting('autoTopupAttempts', next);
+
+    try {
+      const result = await this.executor.topUpPoolPosition({
+        pool, position, dustBps: this.config.autoTopupDustBps,
+        minGasReserveWei: this.config.topUpMinGasReserveWei
+      });
+      if (result?.status === 'completed') {
+        this.state.setSetting('lastAction', `top-up ${pool.token0.symbol}/${pool.token1.symbol}`);
+      }
+      return result;
+    } catch (error) {
+      const message = sanitize(error.message);
+      this.ledger.append('lp.topup_failed', { poolId: pool.id, positionId: position.id, idleUsd, error: message });
+      if (this.state.getSetting('activeRebalanceExecution', null)?.phase === 'recovery_required') {
+        this.setExecutionPaused(true, 'topup_recovery_required');
+      }
+      log('error', 'lp.topup_failed', { poolId: pool.id, positionId: position.id, error: message });
+      return { status: 'failed', error: message };
+    }
+  }
+
   async maybeRebalance(pool, position, options = {}) {
     const source = options.source || 'automatic';
     const throwOnFailure = Boolean(options.throwOnFailure);
@@ -1130,6 +1275,12 @@ export class AutoLpBot {
       return { status: 'blocked', reason: 'execution-paused' };
     }
 
+    const failureBackoff = rebalanceFailureMap(this.state)[rebalanceFailureKey(pool, position)];
+    if (failureBackoff && Date.now() < Number(failureBackoff.nextRetryAt || 0)) {
+      return { status: 'blocked', reason: 'rebalance-failure-backoff',
+        nextRetryAt: failureBackoff.nextRetryAt, consecutiveFailures: failureBackoff.count };
+    }
+
     const minIntervalMs = Math.max(0, Number(this.config.minRebalanceIntervalSec || 0) * 1000);
     if (minIntervalMs > 0) {
       const recentForInterval = this.state.recentRebalances(minIntervalMs);
@@ -1160,13 +1311,16 @@ export class AutoLpBot {
     try {
       destinationPool = this.resolveInvestmentTarget(pool);
     } catch (error) {
+      const backoff = recordRebalanceFailure(this.state, this.ledger, pool, position, error.message);
       this.ledger.append('rebalance.blocked', {
         positionId: position.id,
         poolId: pool.id,
         reason: 'investment target unavailable',
-        error: error.message
+        error: sanitize(error.message),
+        nextRetryAt: backoff.nextRetryAt
       });
-      return { status: 'blocked', reason: 'investment-target-unavailable', error: error.message };
+      return { status: 'blocked', reason: 'investment-target-unavailable',
+        error: sanitize(error.message), nextRetryAt: backoff.nextRetryAt };
     }
     const plan = {
       pool,
@@ -1201,6 +1355,8 @@ export class AutoLpBot {
 
       // Only a fully completed state machine may commit a rebalance to strategy state.
       if (result.status !== 'completed') {
+        recordRebalanceFailure(this.state, this.ledger, pool, position,
+          `executor returned ${String(result.status || 'unknown')}`);
         this.ledger.append('rebalance.uncommitted', {
           positionId: position.id,
           poolId: pool.id,
@@ -1210,6 +1366,7 @@ export class AutoLpBot {
         return result;
       }
 
+      clearRebalanceFailure(this.state, pool, position);
       const cooldownUntil = Date.now() + this.config.minRebalanceIntervalSec * 1000;
       this.state.setPosition(positionStateKey(pool, position), {
         cooldownUntil,
@@ -1230,7 +1387,9 @@ export class AutoLpBot {
       );
       return result;
     } catch (error) {
-      this.ledger.append('rebalance.failed', { positionId: position.id, poolId: pool.id, error: error.message });
+      const backoff = recordRebalanceFailure(this.state, this.ledger, pool, position, error.message);
+      this.ledger.append('rebalance.failed', { positionId: position.id, poolId: pool.id,
+        error: sanitize(error.message), nextRetryAt: backoff.nextRetryAt });
       const activeExecution = this.state.getSetting('activeRebalanceExecution', null);
       if (activeExecution?.phase === 'recovery_required') {
         this.setExecutionPaused(true, 'rebalance_recovery_required');
@@ -1243,7 +1402,7 @@ export class AutoLpBot {
       }
       log('error', 'rebalance.failed', { positionId: position.id, error: error.message, source });
       if (throwOnFailure) throw error;
-      return { status: 'failed', error: error.message };
+      return { status: 'failed', error: sanitize(error.message), nextRetryAt: backoff.nextRetryAt };
     }
   }
 
@@ -1252,7 +1411,7 @@ export class AutoLpBot {
     const outside = isLpOutOfRange(latestState.tick, position.tickLower, position.tickUpper);
     pool.state = latestState;
 
-    if (latestState.paused) {
+    if (latestState.paused !== false) {
       this.ledger.append('rebalance.blocked', {
         positionId: position.id,
         poolId: pool.id,
@@ -1329,31 +1488,48 @@ export class AutoLpBot {
   }
 
   async scanGlobalPointFees(pools, latestBlock) {
-    const desiredStartMs = this.points.predictionStartMs(Date.now());
-    const previousStartMs = Number(this.state.getSetting('pointsGlobalSwapScanStartMs', 0) || 0);
+    const state = this.state;
+    const points = this.points;
+    const fables = this.fables;
+    const ledger = this.ledger;
+    const config = { ...this.config };
+    // Backfill a bounded block window per market refresh. A new wallet can be
+    // hundreds of thousands of blocks behind; blocking startup on that entire
+    // history would leave the trading readiness scan unavailable for minutes.
+    const maxBlocksPerScan = 10_000;
+    const desiredStartMs = points.predictionStartMs(Date.now());
+    const previousStartMs = Number(state.getSetting('pointsGlobalSwapScanStartMs', 0) || 0);
     if (previousStartMs && desiredStartMs < previousStartMs) {
       // A user moved the official baseline backwards. Re-open the cursor so the
       // missing earlier campaign interval is backfilled; appendUnique keeps
       // already-known swaps idempotent.
-      this.state.setCursor('pointsGlobalSwapsV2', 0);
+      state.setCursor('pointsGlobalSwapsV2', 0);
     }
-    this.state.setSetting('pointsGlobalSwapScanStartMs', desiredStartMs);
+    state.setSetting('pointsGlobalSwapScanStartMs', desiredStartMs);
 
-    const startBlock = await this.blockAtOrAfterTimestamp(desiredStartMs, latestBlock);
-    const storedCursor = this.state.getCursor('pointsGlobalSwapsV2', 0);
+    const startBlock = await this.blockAtOrAfterTimestamp(desiredStartMs, latestBlock, state);
+    const storedCursor = state.getCursor('pointsGlobalSwapsV2', 0);
     const fromBlock = storedCursor > 0
-      ? Math.max(startBlock, storedCursor - this.config.reorgLookbackBlocks)
+      ? Math.max(startBlock, storedCursor - config.reorgLookbackBlocks)
       : startBlock;
     if (fromBlock > latestBlock) return;
+    const scannedThroughBlock = Math.min(latestBlock, fromBlock + maxBlocksPerScan - 1);
+    state.setSetting('pointsGlobalScanProgress', {
+      fromBlock, scannedThroughBlock, latestBlock, complete: false, inProgress: true, at: Date.now()
+    });
 
     let swaps;
     try {
-      swaps = await this.fables.scanGlobalSwaps(pools, fromBlock, latestBlock);
+      swaps = await fables.scanGlobalSwaps(pools, fromBlock, scannedThroughBlock);
     } catch (error) {
       log('warn', 'points.global_swap_scan_failed', {
         fromBlock,
-        latestBlock,
+        scannedThroughBlock,
         error: error.message
+      });
+      state.setSetting('pointsGlobalScanProgress', {
+        fromBlock, scannedThroughBlock, latestBlock, complete: false, inProgress: false,
+        error: error.message, at: Date.now()
       });
       return;
     }
@@ -1364,12 +1540,12 @@ export class AutoLpBot {
       const valuation = valueSwapFeeInUsd({
         pool: swap.pool,
         swap,
-        usdgAddress: this.config.usdgAddress
+        usdgAddress: config.usdgAddress
       });
       const ts = await this.blockTimestamp(swap.blockNumber);
       if (valuation.priced) priced += 1;
       else unpriced += 1;
-      this.ledger.appendUnique(
+      ledger.appendUnique(
         `points-swap:${swap.transactionHash}:${swap.index}`,
         'points.global_swap_fee',
         {
@@ -1394,24 +1570,30 @@ export class AutoLpBot {
         ts
       );
     }
-    this.state.setCursor('pointsGlobalSwapsV2', latestBlock + 1);
-    this.state.setSetting('pointsLastGlobalScan', {
+    state.setCursor('pointsGlobalSwapsV2', scannedThroughBlock + 1);
+    const complete = scannedThroughBlock >= latestBlock;
+    state.setSetting('pointsGlobalScanProgress', {
+      fromBlock, scannedThroughBlock, latestBlock, complete, inProgress: false, at: Date.now()
+    });
+    state.setSetting('pointsLastGlobalScan', {
       at: Date.now(),
       fromBlock,
       latestBlock,
+      scannedThroughBlock,
+      complete,
       swaps: swaps.length,
       priced,
       unpriced,
       desiredStartAt: new Date(desiredStartMs).toISOString()
     });
     if (swaps.length || unpriced) {
-      log('info', 'points.global_scan', { fromBlock, latestBlock, swaps: swaps.length, priced, unpriced });
+      log('info', 'points.global_scan', { fromBlock, scannedThroughBlock, latestBlock, complete, swaps: swaps.length, priced, unpriced });
     }
   }
 
-  async blockAtOrAfterTimestamp(timestampMs, latestBlock) {
+  async blockAtOrAfterTimestamp(timestampMs, latestBlock, state = this.state) {
     const cacheKey = `pointsBlockAtOrAfter:${timestampMs}`;
-    const cached = Number(this.state.getSetting(cacheKey, 0) || 0);
+    const cached = Number(state.getSetting(cacheKey, 0) || 0);
     if (cached > 0 && cached <= latestBlock) return cached;
 
     let low = 0;
@@ -1426,7 +1608,7 @@ export class AutoLpBot {
       if (Number(block.timestamp) * 1000 < timestampMs) low = mid + 1;
       else high = mid;
     }
-    this.state.setSetting(cacheKey, low);
+    state.setSetting(cacheKey, low);
     return low;
   }
 
@@ -1758,6 +1940,10 @@ export class AutoLpBot {
     this.running = false;
     if (this.pointsSimulationTimer) clearTimeout(this.pointsSimulationTimer);
     this.pointsSimulationTimer = null;
+  }
+
+  async waitForCycleIdle() {
+    while (this.cycleActive) await sleep(250);
   }
 }
 

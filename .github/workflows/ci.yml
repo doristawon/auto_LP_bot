@@ -11,7 +11,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
+      - run: npm ci
       - run: npm audit --omit=dev --audit-level=high
       - run: npm run check
       - run: npm run compile:guard

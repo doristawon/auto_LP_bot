@@ -83,7 +83,9 @@ export function evaluatePosition({
   const outOfRangeElapsedMs = Math.max(0, nowMs - nextOutOfRangeSince);
   const deepConfirmations = excursionPct > shallowThresholdPct ? deepConfirmationsSeen + 1 : 0;
   const deepConfirmed = deepConfirmations >= deepConfirmationsRequired;
-  const waitExpired = outOfRangeElapsedMs >= maxWaitMs;
+  // The max wait is the shallow-OOR escape hatch. A deep excursion must still
+  // meet its configured consecutive-confirmation requirement.
+  const waitExpired = excursionPct <= shallowThresholdPct && outOfRangeElapsedMs >= maxWaitMs;
   const shouldRebalance = !cooldownActive && (deepConfirmed || waitExpired);
   const rebalanceReason = shouldRebalance
     ? (waitExpired ? 'oor_max_wait_expired' : 'deep_oor_confirmed')

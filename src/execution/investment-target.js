@@ -86,6 +86,69 @@ export function chooseInvestmentAnchor(sourceTokens, destinationPool, pools, max
   return candidates[0];
 }
 
+export function buildCrossPoolFundingScope({
+  sourcePool,
+  destinationPool,
+  walletBalances,
+  expectedWithdraw = { raw0: 0n, raw1: 0n },
+  dustRawByAddress = {}
+}) {
+  const sourceAddresses = new Set([
+    sourcePool.token0.address.toLowerCase(),
+    sourcePool.token1.address.toLowerCase()
+  ]);
+  const destinationAddresses = new Set([
+    destinationPool.token0.address.toLowerCase(),
+    destinationPool.token1.address.toLowerCase()
+  ]);
+  const tokens = new Map();
+  for (const token of [
+    sourcePool.token0,
+    sourcePool.token1,
+    destinationPool.token0,
+    destinationPool.token1
+  ]) tokens.set(token.address.toLowerCase(), token);
+
+  const expectedWithdrawal = new Map([
+    [sourcePool.token0.address.toLowerCase(), BigInt(expectedWithdraw.raw0 || 0n)],
+    [sourcePool.token1.address.toLowerCase(), BigInt(expectedWithdraw.raw1 || 0n)]
+  ]);
+  const readDust = (address) => {
+    if (dustRawByAddress instanceof Map) return BigInt(dustRawByAddress.get(address) || 0n);
+    const entry = dustRawByAddress?.[address]
+      ?? dustRawByAddress?.[address.toLowerCase()]
+      ?? 0n;
+    return BigInt(entry);
+  };
+
+  return [...tokens.entries()].map(([address, token]) => {
+    const walletRaw = BigInt(walletBalances?.get(address) || 0n);
+    const withdrawRaw = expectedWithdrawal.get(address) || 0n;
+    const dustRaw = readDust(address);
+    if (walletRaw < 0n || withdrawRaw < 0n || dustRaw < 0n) {
+      throw new Error('Cross-pool capital amounts and dust must be non-negative');
+    }
+    const maxSpendRaw = walletRaw + withdrawRaw - dustRaw;
+    if (maxSpendRaw < 0n) throw new Error(`Dust exceeds available ${token.symbol} balance`);
+    const sourceWallet = sourceAddresses.has(address);
+    const destinationWallet = destinationAddresses.has(address);
+    const walletSource = sourceWallet && destinationWallet
+      ? 'source-and-destination-pair-wallet-balance'
+      : sourceWallet
+        ? 'source-pair-wallet-balance'
+        : 'destination-pair-wallet-balance';
+    return {
+      token,
+      address,
+      walletRaw,
+      withdrawRaw,
+      dustRaw,
+      maxSpendRaw,
+      walletSource
+    };
+  });
+}
+
 export function buildV4PathKeys(route, tokenInAddress) {
   let currencyIn = String(tokenInAddress).toLowerCase();
   return (route || []).map((pool) => {

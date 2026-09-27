@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { rankAprPools, findV4Route, chooseInvestmentAnchor, buildV4PathKeys } from '../src/execution/investment-target.js';
+import {
+  rankAprPools,
+  findV4Route,
+  chooseInvestmentAnchor,
+  buildV4PathKeys,
+  buildCrossPoolFundingScope
+} from '../src/execution/investment-target.js';
 
 const USDG = '0x0000000000000000000000000000000000000010';
 const MOO = '0x0000000000000000000000000000000000000020';
@@ -56,4 +62,28 @@ test('investment anchor picks the destination token with a connected route for e
   );
   assert.equal(choice.anchor.address.toLowerCase(), USDG);
   assert.equal(choice.routes.get(MOO).length, 1);
+});
+
+test('cross-pool funding is limited to source and destination pair tokens with withdrawal delta and dust', () => {
+  const source = pool('source', token(USDG, 'USDG'), token(MOO, 'MEME'));
+  const destination = pool('destination', token(USDG, 'USDG'), token(UBIK, 'EARN'));
+  const unrelated = '0x0000000000000000000000000000000000000050';
+  const scope = buildCrossPoolFundingScope({
+    sourcePool: source,
+    destinationPool: destination,
+    walletBalances: new Map([
+      [USDG, 100n],
+      [MOO, 20n],
+      [UBIK, 30n],
+      [unrelated, 9_999n]
+    ]),
+    expectedWithdraw: { raw0: 5n, raw1: 2n },
+    dustRawByAddress: { [USDG]: 1n, [MOO]: 3n, [UBIK]: 4n }
+  });
+
+  assert.deepEqual(scope.map((entry) => entry.address).sort(), [USDG, MOO, UBIK].sort());
+  assert.equal(scope.find((entry) => entry.address === USDG).maxSpendRaw, 104n);
+  assert.equal(scope.find((entry) => entry.address === MOO).maxSpendRaw, 19n);
+  assert.equal(scope.find((entry) => entry.address === UBIK).maxSpendRaw, 26n);
+  assert.equal(scope.find((entry) => entry.address === USDG).walletSource, 'source-and-destination-pair-wallet-balance');
 });

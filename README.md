@@ -1,12 +1,12 @@
 # Auto LP Bot — Fables.fi / Robinhood Chain
 
-> 目前工作目錄包含 Fables 池級 APR 與 RPC 控制，也支援 OOR 後自動投入最高有效 APR 池或指定池；本機預設每 5 分鐘評估區間，淺度 OOR 最長等待 30 分鐘。
+> 目前工作目錄包含 Fables 池級 APR 與 RPC 控制，也支援 OOR 後投入最高有效 APR 池或指定池；本機預設每 5 分鐘評估區間，淺度 OOR 最長等待 30 分鐘。
 
 錢包助記詞／私鑰僅傳送至本機回環中控台；助記詞不會保存。設定 `PERSIST_RUNTIME_CREDENTIALS=true` 後，通過驗證的目前錢包私鑰／地址及 Robinhood RPC 會原子更新到 Git 忽略的本機 `.env`，並限制檔案 ACL；API 與日誌不回傳憑證。匯入或切換錢包會強制 `DRY_RUN=true`、關閉鏈上寫入與自動重新部署，並暫停執行；每次程序啟動仍保持暫停，需在條件通過後按下啟動。自訂 RPC 套用前會實際查詢 `eth_chainId`，並保留官方 RPC 作為讀取備援。
 
-池級 APR 取自 Fables 公開市場統計，沿用頁面公式「24 小時手續費 × 365 ÷ 目前 TVL」；這是近期年化估算，不代表個人實際收益或收益保證。APR 資料暫時無法取得時會留白，鏈上池子探索仍可獨立運作。
+池級 APR 取自 Fables 公開市場統計，沿用頁面公式「24 小時手續費 × 365 ÷ 目前 TVL」；這是近期年化估算，不代表個人實際收益或收益保證。APR、TVL 與成交量／手續費統計使用 Fables 公開來源；資料暫時無法取得時 APR 會留白，依 APR 跨池選擇再投入目標會停止。鏈上池子、range、餘額與交易狀態則由 Robinhood Chain RPC 讀取。
 
-OOR 再投入可設定為最高有效 APR 或指定池。最高 APR 候選需有新鮮統計、未暫停、TVL 達 `APR_POOL_MIN_TVL_USD`，且所有非零 Fables 登錄代幣餘額都能預先報價；跨池檢查未通過時會保留原 LP，不先提領。指定池可用關鍵字篩選 APR 排序下拉選單。預設區間檢查週期為 5 分鐘，深度 OOR 門檻仍需連續 2 次確認；未達深度門檻時最長等待 30 分鐘。
+OOR 再投入可設定為最高有效 APR 或指定池。最高 APR 候選需有新鮮統計、未暫停，且 TVL 達 `APR_POOL_MIN_TVL_USD`。目前跨池實盤因無法在提領前可靠模擬「兌幣後存入」而安全阻擋，原 LP 會保留；預演只涵蓋來源與目的池交易對的錢包餘額及來源提領預估，不掃入無關代幣。現有 LP 在區間內時，可將同交易對的閒置餘額加倉。預設只使用現有代幣比例；若明確設定 `AUTO_TOPUP_SWAP_ENABLED=true`、單一 `AUTO_TOPUP_SWAP_POOL_ID` 與獨立的 `AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS`，才會在「授權→兌幣→存入」整串 RPC 模擬成功後兌幣加倉。兌幣前會再次確認價格衝擊、錢包餘額、原區間及完整模擬，並保留設定的零頭與 Gas。指定池可用關鍵字篩選 APR 排序下拉選單。預設區間檢查週期為 5 分鐘，深度 OOR 仍需連續 2 次確認；淺度 OOR 最長等待 30 分鐘。
 
 ## v0.6.0 — 本機錢包、池級 APR 與 RPC 控制
 
@@ -32,28 +32,19 @@ OOR 再投入可設定為最高有效 APR 或指定池。最高 APR 候選需有
 
 Manual Rebalance 不提供 bypass：In-Range Hold、OOR hysteresis、topology revalidation/cooldown、Pause、rate limit、live signer/guard gates、receipt state machine 全部照常生效。
 
-## v0.4.1 — Real-wallet replay hardening
+## v0.4.1 — Replay and executor hardening
 
-2026-09-26 以錢包 `0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF` 的真實 Robinhood Chain 歷史做端到端 replay：
+此版本加強 receipt reconciliation、recovery pause、guard identity 驗證與依 pool/range 分離的狀態管理。公開文件與 CI 不保存特定錢包的地址、部位快照、績效數字或交易時間線；回歸檢查以通用測試與脫敏資料為主。
 
-- 掃描 **84 筆 Fables lifecycle**：49 deposits / 35 withdraws，涵蓋 Index/USDG、CASHCAT/USDG、USDG/MOO、USDG/ZZZ。
-- **35 / 35 withdrawAndClaim ABI 驗證通過**。
-- 使用 BOT 的 50 bps BigInt withdraw min-out 回放，**35 / 35 真實 receipt output 均可通過**。
-- 31 次 180 分鐘內的 same-pool withdraw→re-deposit handoff 可重建；其中 30 次已有雙邊 operation inventory，**30 / 30 exact BigInt deposit plan feasible**；另 1 次為單邊 inventory，正確標示為 `NEEDS SWAP` 而非 math failure。
-- lifecycle replay 最後的 active ERC-6909 range/shares 與當前鏈上狀態 **完全一致**。
-- 人工下一個 range 只有 8 次剛好等於 BOT centered target；其餘差異反映人工使用不同寬度/置中方式，不視為 executor failure。
-- 當時的 range-policy replay 已擴充到 16 個 LP epochs / 13 個 OOR episodes。舊版 15 分鐘採樣下，0.5% 第一次就搬會觸發 10 次；連續兩次確認只觸發 7 次，並保留 3 次自然回區間。這是歷史校準紀錄；目前預設改為 `5m / 0.5% / 30m / deep-confirm=2`。
-
-Executor 額外 hardening：
+Executor 安全性改進：
 
 - 所有 ERC20→Permit2、Permit2→Universal Router、token→Fables hook approvals 優先在 withdraw 前完成；approval 失敗時 LP principal 尚未移動。
 - EIP-7702 delegation 除了 pointer，還驗證 `guardVersion == keccak256("Fables7702Guard/v1")` 與 `IMPLEMENTATION == EIP7702_GUARD_ADDRESS`。
 - exact-input swap receipt 強制 `actual spent == requested amountIn`；under-spend / over-spend 都 fail closed。
 - deposit 前再次讀 current tick，以最新狀態重算 centered range / BigInt liquidity / amount caps。
-- deposit receipt 後再讀 `rangeKey(newRangeId)`，完整驗證 PoolKey + tickLower/tickUpper，避免 shared hook 把錯 pool/range 當成功。
+- deposit receipt 後再讀 `rangeKey(newRangeId)`，完整驗證 PoolKey + tickLower/tickUpper。
 - withdraw 後任何 failure 進 `recovery_required` 時，BOT 自動 Pause；新 write 必須先完成 recovery review。
 - `solc` 移到 devDependencies；CI 對 production dependency tree 執行 high-level npm audit。
-
 ## v0.4.0 — Full receipt-reconciled executor + exact BigInt math + atomic OOR guard
 
 三個原本的 full-live blockers 已全部實作：
@@ -62,8 +53,8 @@ Executor 額外 hardening：
    - 真實 selector：`0x289a2a15`
    - verified signature：
      `withdrawAndClaim((address,address,uint24,int24,address),int24,int24,uint128,address,uint128,uint128,uint256,uint16)`
-   - 35 筆錢包真實成功 withdraw TX 均可由 verified ABI 正確 decode；抽樣 raw calldata 為 420-byte / 13 static words，`walk=1000`。
-   - regression test 會把 encoder 與真實 calldata 做 byte-for-byte 比對。
+   - `withdrawAndClaim` selector 與參數布局已有 ABI 回歸覆蓋。
+   - regression tests 會驗證支援的 selector、參數與 calldata 編碼。
 
 2. **Receipt-reconciled withdraw → swap → deposit state machine**
    - withdraw 前只使用 exact BigInt principal math 產生 min-out。
@@ -90,12 +81,13 @@ DRY_RUN=true
 ENABLE_LIVE_WRITES=false
 ENABLE_AUTO_REDEPLOY=false
 EIP7702_GUARD_VERIFIED=false
+EIP7702_GUARD_VERIFIED_FOR=
 ```
 
-先在獨立 canary wallet 驗證，再碰主錢包：
+先在獨立 canary wallet 驗證，再碰主錢包。部署合約需設定專用 `GUARD_DEPLOYER_PRIVATE_KEY`，且不可與 LP signer 的 `PRIVATE_KEY` 相同：
 
 ```bash
-npm install
+npm ci
 npm run compile:guard
 
 # 明確允許部署
@@ -121,10 +113,11 @@ npm run setup:guard
 npm run verify:guard
 ```
 
-`verify:guard` 會使用目前真實 In-Range LP 做 **eth_call-only** canary；預期結果一定是 `in-range-withdrawal-blocked`。只有 delegation、guardVersion、In-Range block canary 全部通過後，才可人工設定：
+`verify:guard` 會使用目前 In-Range LP 做 **eth_call-only** canary；預期結果一定是 `in-range-withdrawal-blocked`。只有 delegation、guardVersion、In-Range block canary 全部通過後，才可人工設定；`EIP7702_GUARD_VERIFIED_FOR` 必須與目前 `WALLET_ADDRESS` 完全一致，換 signer 後需重新 canary：
 
 ```env
 EIP7702_GUARD_VERIFIED=true
+EIP7702_GUARD_VERIFIED_FOR=<same as WALLET_ADDRESS>
 DRY_RUN=false
 ENABLE_LIVE_WRITES=true
 ENABLE_AUTO_REDEPLOY=true
@@ -143,9 +136,9 @@ Production executor 已能完整執行並驗證 **direct Fables V4 pool route**�
 
 ### Swap path review
 
-- Bot 的 minimal direct V4 path 使用 Universal Router `V4_SWAP (0x10)` + `SWAP_EXACT_IN_SINGLE (0x06) / SETTLE_ALL (0x0c) / TAKE_ALL (0x0f)`；USDG→MOO、USDG→ZZZ 已用真實 wallet allowance 做 `eth_call` 成功。
-- 反向 MOO/ZZZ→USDG 在 withdraw **之前**若 free wallet balance 不足，模擬可能回 `TRANSFER_FROM_FAILED`，因 meme token principal 仍鎖在 LP；最終 swap simulation 必須放在 withdraw receipt 後，以實際 wallet delta 作 amountIn。Simulation workflow 會同時檢查 free balance + ERC20→Permit2 + Permit2→Router allowance，只有「allowance 足夠但 principal 尚鎖在 LP」才標記為 expected pre-withdraw failure，不再誤報 route 壞掉。
-- 真實手動 ZZZ→USDG 成功 TX 顯示前端可能使用 Permit2 + 多段 V4 + V3/WETH 的複合路徑；因此 direct Fables-pool route 是有效 fallback，**不是已證明的最佳 route**。正式 live 應比較可執行 routes 的實際 quote / gas / slippage。
+- Bot 的 minimal direct V4 path 使用 Universal Router `V4_SWAP (0x10)` + `SWAP_EXACT_IN_SINGLE (0x06) / SETTLE_ALL (0x0c) / TAKE_ALL (0x0f)`，並以 Quoter / `eth_call` 在執行前檢查可用性。
+- 需要使用 LP principal 的反向兌換必須在 withdraw receipt 後，以實際 wallet delta 作為 `amountIn`；不得用 withdraw 前估算的 free balance 代替。
+- 外部前端可組合 Permit2 與多段路由；direct Fables-pool route 是有效 fallback，**不是已證明的最佳 route**。正式 live 應比較可執行 routes 的實際 quote / gas / slippage。
 - Swap sizing 使用該 LP 自己的 `sqrtPriceX96` relative price，不再使用可能被其他 pool 污染的 global USD graph。
 - v0.4 production executor 已接入 Universal Router direct V4 route，且只在 withdraw receipt 後用 actual raw balance 重新 quote / simulate / broadcast。
 
@@ -174,27 +167,18 @@ Code review 發現舊 executor 在 `ENABLE_AUTO_REDEPLOY=true` 時會先 withdra
 
 **不可覆寫的核心規則：只要 LP 仍在原 range 內，BOT 絕不自動撤出 LP。** 自動 withdraw → swap → 窄區間 redeposit 只有在真實鏈上 tick 已 Out of Range 時才有資格啟動。
 
-- 真實 LP membership 採 concentrated-liquidity 語義：`tick >= tickLower && tick < tickUpper` 為 In Range。
+- LP membership 採 concentrated-liquidity 語義：`tick >= tickLower && tick < tickUpper` 為 In Range。
 - `EDGE_BUFFER_TICKS` 只允許作 near-edge 監控提示，永遠不能授權撤 LP。
 - 策略層：In Range 強制 `shouldRebalance=false`，並清除 OOR timer / deep confirmations。
 - 排程層：pending rebalance 必須同時滿足 `outside===true && shouldRebalance===true`。
 - BOT 執行前：重新從鏈上讀最新 tick；若已回到舊 range，記錄 `rebalance.blocked: absolute in-range hold` 並取消整輪。
-- Executor 邊界再次讀取最新 PoolManager tick 並 fail closed；目前 live withdraw/swap/deposit 全部 hard-block，因此沒有單步 write 可繞過此 guard。
-- 因鏈上價格可能在 RPC 檢查後、交易被打包前再次變動，正式 unattended live 啟用前仍需 atomic on-chain OOR guard 才能達到交易打包瞬間的絕對保證；目前 live auto-redeploy gate 維持關閉。
+- Executor 邊界再次讀取最新 PoolManager tick 並 fail closed；live withdraw 使用 atomic guard；withdraw、swap 與 deposit 仍各自受設定及 recovery gate 保護，不能用單步 write 繞過流程。
+- RPC 檢查後到交易被打包前鏈上價格仍可能變動；withdraw 的 atomic on-chain OOR guard 會在交易執行時再次檢查。Live auto-redeploy 仍由 guard 身分驗證與操作設定 gate 控制。
 
-## v0.3.2 — 15 分鐘 OOR hysteresis（真實 Swap tick 回放校準）
+## v0.3.2 — Range policy calibration
 
-2026-09-24 以錢包真實 Fables LP range，對 Robinhood Chain Uniswap v4 PoolManager `Swap` 事件的歷史 tick 回放：
-
-- 回放 pools：CASHCAT/USDG 712 筆 Swap、USDG/ZZZ 115 筆、USDG/MOO 274 筆。
-- 5 個真實 LP epoch 中，以 15 分鐘採樣共出現 4 次 OOR episode。
-- 唯一自然回區間的 episode 是 MOO：最大只越界約 0.07%，15 分鐘後自行回區間。
-- 舊 ZZZ / MOO 的明顯 breakout 最大越界約 3.87% / 9.88%，退出後 180 分鐘內也未觀察到回到舊 range。
-- 目前採用：**每 15 分鐘才推進一次 OOR 決策狀態**；≤0.5% 最多等待 90 分鐘；>0.5% 必須連續兩次 15 分鐘採樣都成立才觸發 rebalance；任何時候回區間即清除 OOR timer。
-- BOT 底層仍可每 15 秒刷新 topology/dashboard；因此快速監控與慢速策略採樣互不綁死。
-- 回放工具：`npm run analyze:range-policy`，CI artifact 會產出完整 policy matrix。
-
-## v0.3.0 — 動態 meme pair 接管 + 真實 TX 驗證
+舊版使用 15 分鐘採樣與 90 分鐘淺度等待；目前預設改為 **5 分鐘 / 0.5% / 30 分鐘 / deep-confirm=2**。回歸測試涵蓋連續深度確認、淺度等待及回到區間時清除計時狀態。歷史錢包部位與績效資料不納入公開文件或 CI 輸出。
+## v0.3.0 — 動態 wallet topology
 
 - 預設 `TARGET_MODE=wallet-active`：不再需要每次換 meme LP 都手動改 `TARGET_POOL_IDS`。
 - 從錢包的 Fables `Deposited/Withdrawn` 事件建立 range candidates，再用 `rangeKey()` 完整 PoolKey 回配 registry pool。
@@ -203,10 +187,10 @@ Code review 發現舊 executor 在 `ENABLE_AUTO_REDEPLOY=true` 時會先 withdra
 - 同一 pool 手動換 range、或跨 pool 換 meme 標的，都視為 topology handoff；預設 120 秒只監控、不自動交易。
 - position / IL / fee state 全部改成 `poolId + rangeId` scope，避免多 pair 共用 hook 時互相污染。
 - Fables shared hook fee event 若無法唯一還原 PoolKey，禁止猜測 pair 歸屬與重複計算；個人 fee 仍以 `userPosition.owed` / claim receipt 為準。
-- 2026-09-24 真實錢包 TX integration smoke 已驗證：CASHCAT/USDG 退出後，BOT 自動移除 CASHCAT，並自動接管新 USDG/ZZZ 與既有 USDG/MOO。
-- 真實 deposit TX 已驗證 Fables selector `0x36a9ca1a` 對應：
+- 動態 wallet-active topology 會依鏈上 deposit/withdraw 事件與仍持有的 range shares 更新目標；測試覆蓋已退出部位的退役流程。
+- Fables deposit selector 對應下列函式 ABI，並由回歸測試檢查：
   `deposit((address,address,uint24,int24,address),int24,int24,uint128,uint128,uint128,uint256)`
-- 三筆實際 deposit calldata 固定為 regression fixtures；deposit liquidity / amount caps 已納入 dry-run plan。
+- deposit 編碼與 liquidity / amount caps 已納入回歸測試和 dry-run plan。
 - Live rebalance fail-closed：完整 redeploy 未解鎖前，禁止先 withdraw 再停在半套狀態。
 
 > 歷史註記：此段描述的是 v0.3.0 當時狀態；withdraw ABI / receipt state machine / exact fixed-point math 已於 v0.4.0 完成。
@@ -218,13 +202,13 @@ Code review 發現舊 executor 在 `ENABLE_AUTO_REDEPLOY=true` 時會先 withdra
 - `SWAP_SLIPPAGE_BPS` 產生 minOut，Dashboard 顯示下一筆預估 swap。
 - 每 5 分鐘預設寫入一筆 `portfolio.snapshot`，保留 PnL / HODL / IL / fees / gas / Points 時序。
 - Reference tx inspector 可選配 Blockscout API：抓 transaction / logs / internal tx / raw trace / verified ABI，自動定位 Fables `Deposited` hook call 與 candidate selector。
-- 日常監控與 quote 仍然不依賴 Fables API；Blockscout 只用於歷史交易反解與 debug。
+- 鏈上池狀態與 quote 透過 Robinhood Chain RPC 讀取；市場 APR/TVL/成交量與官方 Points 使用 Fables 公開資料來源。Blockscout 是 reference transaction 反解的可選來源。
 
-> 安全狀態：swap **報價與配平計畫已完成**；swap broadcast 與 Fables new-range deposit 仍 fail-closed，直到 reference transaction 的實際 execution manifest 被驗證。
+> 安全狀態：withdraw → swap → deposit 執行程式碼已實作；live 預設仍關閉，只有當前 signer 的 guard canary、設定與 recovery gate 全部通過才可進入 live。
 
 ## v0.2 重點
 
-Fables 不提供可申請的交易 API 並不會阻擋這個 BOT。Fables 的 pool、range、fee 與交易結果都落在 Robinhood Chain，因此本專案把 **Robinhood JSON-RPC + Fables on-chain contracts/events** 當成 source of truth：
+鏈上 pool、range、fee 與交易結果由 Robinhood Chain 讀取；Fables 公開市場統計及官方 Points 另使用公開資料來源。專案不依賴私有交易 API、API key 或網頁 DOM：
 
 ```text
 Robinhood RPC / managed RPC
@@ -290,7 +274,7 @@ Dashboard 顯示：
 - EIP-7702 guard config flag + runtime identity readiness
 - recovery state / active execution journal / topology cooldown
 - RPC health / current block
-- 15m / 0.5% / 90m / deep-confirm=2 policy 與 withdraw/swap/deposit slippage、max gas
+- 5m / 0.5% / 30m / deep-confirm=2 policy 與 withdraw/swap/deposit slippage、max gas
 - append-only transaction / accounting ledger
 
 Dashboard 控制：
@@ -381,7 +365,7 @@ BOT 會持續讀 `userPosition().owed0 / owed1`，將同一 range 的 owed-fee �
 Points V2 依目前已驗證的活動規則使用：
 
 ```
-dailyBudget = 900,000,000 × weeklyWeight / 7
+dailyBudget = 1,000,000,000 × weeklyWeight / 7
 dailyPoints = dailyBudget × userEffectiveFeeUsd / globalEffectiveFeeUsd
 ```
 
@@ -413,7 +397,7 @@ Snapshot 主要欄位：
 Node.js 20+：
 
 ```bash
-npm install
+npm ci
 cp .env.example .env
 npm run once
 npm start
@@ -439,7 +423,7 @@ Robinhood public RPC 適合開發/備援。常駐 BOT 建議至少放一個 mana
 
 ## Reference deposit transaction inspector
 
-Fables 新建 range 的 deposit ABI 已由 2026-09-24 三筆真實成功交易驗證；inspector 仍用來持續檢查 Fables 是否更換 selector / calldata：
+Fables 新建 range 的 deposit ABI 已有回歸覆蓋；inspector 可用於檢查 Fables 是否更換 selector / calldata：
 
 ```bash
 npm run inspect:tx
@@ -463,15 +447,12 @@ data/reference-tx/<hash>.json
 - 若 RPC 支援 `debug_traceTransaction`：完整 call trace
 - 如果 top-level calldata 是已知 Fables hook ABI：直接 decode
 
-目前研究 reference：
-
-`0x4473378d0f20e03c647fe0d5b22a482b5700af7638578046d41396b5adf2dd30`
-
+本機可用環境變數或私密設定提供 reference transaction hash；CI 不將其寫入 workflow log/artifact。
 只有完成 target contract、selector、call trace、allowance、swap/deposit params、minted ERC-6909 shares 的驗證後，才解除 `ENABLE_AUTO_REDEPLOY` safety gate。
 
 ## Live mode 現況
 
-**完整 executor code path 已實作，但主錢包 live auto-redeploy 仍維持 fail-closed 預設。**
+**完整 executor code path 已實作；live auto-redeploy 預設仍 fail-closed。**
 
 已完成的 live path：
 
@@ -491,6 +472,7 @@ DRY_RUN=true
 ENABLE_LIVE_WRITES=false
 ENABLE_AUTO_REDEPLOY=false
 EIP7702_GUARD_VERIFIED=false
+EIP7702_GUARD_VERIFIED_FOR=
 ```
 
 最後的**操作性啟用條件**不是缺 code，而是必須在持有 private key 的本地安全環境完成：
@@ -502,7 +484,7 @@ npm run setup:guard
 npm run verify:guard
 ```
 
-`verify:guard` 必須以目前真實 In-Range LP 證明 atomic withdraw canary 被 block，之後才人工設定 `EIP7702_GUARD_VERIFIED=true` 並考慮小額 canary。GitHub/repo 不持有 private key，因此不會自動替主錢包做 delegation 或 live broadcast。
+`verify:guard` 必須以目前 In-Range LP 證明 atomic withdraw canary 被 block，之後才設定 `EIP7702_GUARD_VERIFIED=true` 與相同 signer 的 `EIP7702_GUARD_VERIFIED_FOR`，再考慮小額 canary。GitHub/repo 不持有 private key，因此不會自動替主錢包做 delegation 或 live broadcast。
 
 ## Dashboard API
 
@@ -513,7 +495,7 @@ npm run verify:guard
 - `GET /api/control/status`
 - `POST /api/control/pause`
 - `POST /api/control/resume`
-- `POST /api/control/scan` — observation-only, no trades
+- `POST /api/control/scan` — refreshes local state without sending trades
 - `POST /api/control/rebalance` — requires `DASHBOARD_MANUAL_CONTROL_ENABLED=true` and JSON `confirm: "REBALANCE"`
 - `POST /api/points/baseline`
 - `POST /api/cashflow`
@@ -527,7 +509,7 @@ npm run check
 npm test
 ```
 
-v0.2：12 個 pure unit tests。
+以 `npm test` 執行 Node.js built-in test suite。
 
 ## Production activation checklist
 

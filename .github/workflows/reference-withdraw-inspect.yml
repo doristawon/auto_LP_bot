@@ -13,41 +13,52 @@ jobs:
   inspect:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        tx:
-          - "0x9650acf53554eefeeb2a88bae0b8cf336e4a39cad19ca963a4b1717efb287d61"
-          - "0x1666390cbf93697391b85458f3bc0e76a6feb4b83cfba8c5384b9ec767036e11"
-          - "0x3a91a366564e6bf45cfa9ee58dc2617afb7523d866f05c794a056987c529aa71"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
-      - name: Inspect real manual withdraw
+      - run: npm ci
+      - name: Check optional reference transaction secrets
+        id: reference
+        env:
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
+          REFERENCE_TX_HASHES: ${{ secrets.REFERENCE_WITHDRAW_TX_HASHES }}
+        run: |
+          if [[ -n "$WALLET_ADDRESS" && -n "$REFERENCE_TX_HASHES" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Reference withdraw inspection skipped: required secrets are not configured."
+          fi
+      - name: Inspect optional reference withdrawals
+        if: steps.reference.outputs.configured == 'true'
         env:
           RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
-          WALLET_ADDRESS: "0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF"
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
+          REFERENCE_TX_HASHES: ${{ secrets.REFERENCE_WITHDRAW_TX_HASHES }}
           DRY_RUN: "true"
           ENABLE_LIVE_WRITES: "false"
           DATA_DIR: "./data"
-        run: node src/tools/inspect-reference-tx.js "${{ matrix.tx }}"
-      - name: Lookup selector / verified contract ABI
         run: |
-          echo "=== 4byte ==="
-          curl -fsSL --max-time 15 "https://www.4byte.directory/api/v1/signatures/?hex_signature=0x289a2a15" || true
-          echo
-          echo "=== Blockscout smart contract ==="
-          curl -fsSL --max-time 15 -H "accept: application/json" -H "user-agent: auto-LP-bot-review"             "https://robinhoodchain.blockscout.com/api/v2/smart-contracts/0x08E52564Bad99E05a694b4809F397edcA417A080" || true
-          echo
-      - name: Print direct decode
-        run: |
-          node --input-type=module <<'NODE'
-          import fs from 'node:fs';
-          for (const file of fs.readdirSync('data/reference-tx').filter(x => x.endsWith('.json'))) {
-            const x=JSON.parse(fs.readFileSync('data/reference-tx/'+file,'utf8'));
-            console.log(JSON.stringify({hash:x.hash,transaction:x.transaction,directHookDecode:x.directHookDecode},null,2));
-          }
-          NODE
+          set -euo pipefail
+          while IFS= read -r tx; do
+            [[ -z "$tx" ]] && continue
+            if [[ ! "$tx" =~ ^0x[[:xdigit:]]{64}$ ]]; then
+              echo "::error::Reference transaction secret contains an invalid hash format."
+              exit 2
+            fi
+            if node src/tools/inspect-reference-tx.js "$tx" > "$RUNNER_TEMP/reference-withdraw.log" 2>&1; then
+              :
+            else
+              status=$?
+              rm -f "$RUNNER_TEMP/reference-withdraw.log"
+              echo "::error::Reference withdraw inspection failed; transaction details were withheld."
+              exit "$status"
+            fi
+            rm -f "$RUNNER_TEMP/reference-withdraw.log"
+          done <<< "${REFERENCE_TX_HASHES//,/$'\n'}"
+          echo "Reference withdraw inspection completed."
+      - name: Remove reference inspection output
+        if: always()
+        run: rm -rf data/reference-tx

@@ -195,7 +195,7 @@ export class FablesAdapter {
     const hook = new Contract(pool.key.hooks, HOOK_ABI, this.provider);
     const [poolManagerAddress, paused] = await Promise.all([
       hook.poolManager(),
-      hook.paused().catch(() => false)
+      hook.paused()
     ]);
     const manager = new Contract(poolManagerAddress, POOL_MANAGER_ABI, this.provider);
     const slot = keccak256(abiCoder.encode(['bytes32', 'uint256'], [pool.id, POOLS_STORAGE_SLOT]));
@@ -345,7 +345,11 @@ export class FablesAdapter {
       if (key === ZERO_ADDRESS) {
         const raw = await this.provider.getBalance(this.config.walletAddress);
         result[key] = { raw, amount: Number(formatUnits(raw, 18)) };
-      } else if (token.decimals != null) {
+      } else {
+        if (token.decimals == null || !Number.isInteger(Number(token.decimals))
+          || Number(token.decimals) < 0 || Number(token.decimals) > 36) {
+          throw new Error(`Token decimals unavailable for wallet balance: ${token.address}`);
+        }
         const contract = new Contract(token.address, ERC20_ABI, this.provider);
         const raw = await contract.balanceOf(this.config.walletAddress);
         result[key] = { raw, amount: Number(formatUnits(raw, token.decimals)) };

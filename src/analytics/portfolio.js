@@ -40,15 +40,66 @@ export class PortfolioAnalytics {
         const unclaimedFeeUsd = valuePair(owed0, pool.token0.address, owed1, pool.token1.address, prices);
         const baselineKey = `positionBaseline:${pool.id.toLowerCase()}:${position.id.toLowerCase()}`;
         let baseline = this.state.getSetting(baselineKey, null);
-        if (!baseline || String(baseline.shares || '') !== position.shares.toString()) {
+        const currentShares = BigInt(position.shares);
+        const baselineShares = parseShares(baseline?.shares);
+        const baselineMatchesTokens = baseline
+          && String(baseline.token0 || '').toLowerCase() === pool.token0.address.toLowerCase()
+          && String(baseline.token1 || '').toLowerCase() === pool.token1.address.toLowerCase()
+          && Number.isFinite(Number(baseline.amount0))
+          && Number.isFinite(Number(baseline.amount1));
+        if (!baselineMatchesTokens || baselineShares == null) {
           baseline = {
             createdAt: Date.now(),
-            shares: position.shares.toString(),
+            updatedAt: Date.now(),
+            shares: currentShares.toString(),
             amount0: amounts.amount0,
             amount1: amounts.amount1,
             token0: pool.token0.address,
-            token1: pool.token1.address
+            token1: pool.token1.address,
+            adjustmentCount: 0
           };
+          this.state.setSetting(baselineKey, baseline);
+        } else if (baselineShares !== currentShares) {
+          const now = Date.now();
+          const adjustmentCount = Number(baseline.adjustmentCount || 0) + 1;
+          if (baselineShares === 0n && currentShares > 0n) {
+            baseline = {
+              ...baseline,
+              createdAt: now,
+              updatedAt: now,
+              shares: currentShares.toString(),
+              amount0: amounts.amount0,
+              amount1: amounts.amount1,
+              adjustmentCount
+            };
+          } else if (currentShares > baselineShares) {
+            const added = rangeAmounts(
+              currentShares - baselineShares,
+              pool.state.sqrtPriceX96,
+              position.tickLower,
+              position.tickUpper,
+              pool.token0.decimals,
+              pool.token1.decimals
+            );
+            baseline = {
+              ...baseline,
+              updatedAt: now,
+              shares: currentShares.toString(),
+              amount0: Number(baseline.amount0) + added.amount0,
+              amount1: Number(baseline.amount1) + added.amount1,
+              adjustmentCount
+            };
+          } else {
+            const retainedShareRatio = Number(currentShares) / Number(baselineShares);
+            baseline = {
+              ...baseline,
+              updatedAt: now,
+              shares: currentShares.toString(),
+              amount0: Number(baseline.amount0) * retainedShareRatio,
+              amount1: Number(baseline.amount1) * retainedShareRatio,
+              adjustmentCount
+            };
+          }
           this.state.setSetting(baselineKey, baseline);
         }
         const hodlUsd = valuePair(baseline.amount0, baseline.token0, baseline.amount1, baseline.token1, prices);
@@ -102,6 +153,9 @@ export class PortfolioAnalytics {
           hodlUsd,
           ilUsd,
           ilPct,
+          ilBaselineCreatedAt: Number(baseline.createdAt || 0),
+          ilBaselineUpdatedAt: Number(baseline.updatedAt || baseline.createdAt || 0),
+          ilBaselineAdjustments: Number(baseline.adjustmentCount || 0),
           outside: Boolean(position.outside),
           excursionPct: Number(position.excursionPct || 0),
           confirmations: Number(position.confirmations || 0),
@@ -127,6 +181,22 @@ export class PortfolioAnalytics {
     }
 
     const inventoryObject = Object.fromEntries([...inventory.entries()]);
+    const priceSources = [...targetTokens.entries()].map(([address, token]) => {
+      const source = prices.sources?.get(address) || null;
+      return {
+        address,
+        symbol: token.symbol || address,
+        priceUsd: prices.get(address) ?? null,
+        sourcePoolId: source?.poolId || null,
+        sourcePair: source?.pair || null,
+        sourceTvlUsd: source?.tvlUsd ?? null,
+        bottleneckTvlUsd: source?.bottleneckTvlUsd ?? null,
+        pathPoolIds: source?.pathPoolIds || [],
+        pathPairs: source?.pathPairs || [],
+        hops: source?.hops ?? null,
+        isAnchor: source?.hops === 0
+      };
+    });
     let baseline = this.ledger.readBaseline();
     if (!baseline) {
       baseline = {
@@ -158,6 +228,7 @@ export class PortfolioAnalytics {
     return {
       baseline,
       inventory: inventoryObject,
+      priceSources,
       currentValueUsd,
       hodlValueUsd,
       grossPnlUsd,
@@ -175,6 +246,10 @@ export class PortfolioAnalytics {
 function addInventory(map, address, amount) {
   const key = address.toLowerCase();
   map.set(key, (map.get(key) || 0) + amount);
+}
+function parseShares(value) {
+  try { return value == null ? null : BigInt(value); }
+  catch { return null; }
 }
 function inventoryUsd(inventory, prices) {
   let total = 0;

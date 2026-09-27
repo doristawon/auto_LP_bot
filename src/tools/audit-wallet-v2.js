@@ -15,7 +15,8 @@ import { V4QuoterAdapter } from '../adapters/quoter.js';
 import { buildUsdPriceMap } from '../analytics/prices.js';
 import { rangeAmounts } from '../analytics/liquidity.js';
 import { buildRebalanceInventoryPlan } from '../analytics/rebalance-plan.js';
-import { buildTargetRange, isOutsideRange } from '../math/ticks.js';
+import { buildTargetRange } from '../math/ticks.js';
+import { assessAuditRange } from './audit-wallet-range.js';
 import { DEPOSITED_EVENT, HOOK_ABI, WITHDRAWN_EVENT } from '../abi.js';
 import { ZERO_ADDRESS } from '../constants.js';
 
@@ -192,7 +193,13 @@ for (const position of activePositions) {
   const hodlUsd = hodl0 == null || hodl1 == null ? null : hodl0 * price0 + hodl1 * price1;
   const ilUsd = hodlUsd == null ? null : principalUsd - hodlUsd;
   const ilPct = hodlUsd > 0 && Number.isFinite(ilUsd) ? ilUsd / hodlUsd * 100 : null;
-  const outside = isOutsideRange(pool.state.tick, position.tickLower, position.tickUpper, config.edgeBufferTicks);
+  const rangeAssessment = assessAuditRange(
+    pool.state.tick,
+    position.tickLower,
+    position.tickUpper,
+    config.edgeBufferTicks
+  );
+  const { outside, nearEdge, autoAction } = rangeAssessment;
   const target = buildTargetRange(pool.state.tick, pool.key.tickSpacing, config.tightWidthBps, config.rangePreset);
   let inventoryPlan = null;
   let quote = null;
@@ -228,7 +235,8 @@ for (const position of activePositions) {
     ilUsd,
     ilPct,
     outside,
-    autoAction: outside ? 'WAIT_SECOND_CONFIRMATION_THEN_REBALANCE' : 'HOLD_IN_RANGE',
+    nearEdge,
+    autoAction,
     target,
     inventoryPlan,
     quote,
@@ -853,13 +861,13 @@ function renderMarkdown(report) {
   lines.push('');
   lines.push('## Active LP positions');
   lines.push('');
-  lines.push('| Pair | Range | Tick | Status | Principal | Owed fees | IL | Bot action | Quote |');
-  lines.push('|---|---|---:|---|---:|---:|---:|---|---|');
+  lines.push('| Pair | Range | Tick | Status | Near edge | Principal | Owed fees | IL | Bot action | Quote |');
+  lines.push('|---|---|---:|---|---|---:|---:|---:|---|---|');
   for (const p of report.activePositions) {
     const quote = p.quote
       ? p.quote.symbolIn + '→' + p.quote.symbolOut + ' ' + f(p.quote.amountIn, 6) + ' → ' + f(p.quote.amountOut, 6) + ' (min ' + f(p.quote.minAmountOut, 6) + ')'
       : p.quoteError ? 'quote failed: ' + p.quoteError : '--';
-    lines.push('| ' + p.pair + ' | ' + p.tickLower + '…' + p.tickUpper + ' | ' + p.tick + ' | ' + (p.outside ? 'OUT' : 'IN') + ' | ' + usd(p.principalUsd) + ' | ' + usd(p.owedUsd) + ' | ' + usd(p.ilUsd) + ' / ' + pct(p.ilPct) + ' | ' + p.autoAction + ' | ' + quote + ' |');
+    lines.push('| ' + p.pair + ' | ' + p.tickLower + '…' + p.tickUpper + ' | ' + p.tick + ' | ' + (p.outside ? 'OUT' : 'IN') + ' | ' + (p.nearEdge ? 'YES' : 'NO') + ' | ' + usd(p.principalUsd) + ' | ' + usd(p.owedUsd) + ' | ' + usd(p.ilUsd) + ' / ' + pct(p.ilPct) + ' | ' + p.autoAction + ' | ' + quote + ' |');
   }
   lines.push('');
   lines.push('## Fees');

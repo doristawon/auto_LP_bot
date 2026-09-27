@@ -20,21 +20,33 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
+      - run: npm ci
+      - name: Check optional wallet secret
+        id: wallet
+        env:
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
+        run: |
+          if [[ -n "$WALLET_ADDRESS" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "OOR policy smoke skipped: WALLET_ADDRESS secret is not configured."
+          fi
       - name: First observation against current real wallet topology
+        if: steps.wallet.outputs.configured == 'true'
         env: &env
           RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
-          WALLET_ADDRESS: "0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF"
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
           TARGET_MODE: "wallet-active"
           DRY_RUN: "true"
           ENABLE_LIVE_WRITES: "false"
           ENABLE_AUTO_REDEPLOY: "false"
           LOG_FROM_BLOCK: "44000000"
-          WALLET_POOL_DISCOVERY_FROM_BLOCK: "71121689"
+          WALLET_POOL_DISCOVERY_FROM_BLOCK: ${{ vars.WALLET_POOL_DISCOVERY_FROM_BLOCK || '44000000' }}
           REORG_LOOKBACK_BLOCKS: "64"
-          RANGE_CHECK_INTERVAL_MS: "900000"
+          RANGE_CHECK_INTERVAL_MS: "300000"
           OOR_SHALLOW_THRESHOLD_PCT: "0.5"
-          OOR_MAX_WAIT_MIN: "90"
+          OOR_MAX_WAIT_MIN: "30"
           OOR_DEEP_CONFIRMATIONS: "2"
           MANUAL_TOPOLOGY_COOLDOWN_SEC: "0"
           FEE_LOG_FROM_BLOCK: "999999999"
@@ -43,24 +55,45 @@ jobs:
           DEPOSIT_SLIPPAGE_BPS: "50"
           DATA_DIR: "./data"
           STATE_FILE: "./state/oor-smoke-state.json"
-        run: npm run once
-      - name: Advance policy clock by one 15-minute sample without changing chain state
+        run: |
+          if npm run once > "$RUNNER_TEMP/real-oor-first.log" 2>&1; then
+            rm -f "$RUNNER_TEMP/real-oor-first.log"
+            echo "First policy observation completed."
+          else
+            status=$?
+            rm -f "$RUNNER_TEMP/real-oor-first.log"
+            echo "::error::First policy observation failed; wallet-specific diagnostics were withheld."
+            exit "$status"
+          fi
+      - name: Advance policy clock by one 5-minute sample without changing chain state
+        if: steps.wallet.outputs.configured == 'true'
         run: |
           node --input-type=module <<'NODE'
           import fs from 'node:fs';
           const file = 'state/oor-smoke-state.json';
           const state = JSON.parse(fs.readFileSync(file, 'utf8'));
-          const M15 = 15 * 60 * 1000;
+          const M5 = 5 * 60 * 1000;
           for (const position of Object.values(state.positions || {})) {
-            if (position.lastRangeEvaluationAt) position.lastRangeEvaluationAt -= M15;
-            if (position.outOfRangeSince) position.outOfRangeSince -= M15;
+            if (position.lastRangeEvaluationAt) position.lastRangeEvaluationAt -= M5;
+            if (position.outOfRangeSince) position.outOfRangeSince -= M5;
           }
           fs.writeFileSync(file, JSON.stringify(state, null, 2));
           NODE
       - name: Second policy observation against latest real tick
+        if: steps.wallet.outputs.configured == 'true'
         env: *env
-        run: npm run once
-      - name: Assert 15-minute hysteresis, absolute in-range hold, and dry-run isolation
+        run: |
+          if npm run once > "$RUNNER_TEMP/real-oor-second.log" 2>&1; then
+            rm -f "$RUNNER_TEMP/real-oor-second.log"
+            echo "Second policy observation completed."
+          else
+            status=$?
+            rm -f "$RUNNER_TEMP/real-oor-second.log"
+            echo "::error::Second policy observation failed; wallet-specific diagnostics were withheld."
+            exit "$status"
+          fi
+      - name: Assert 5-minute policy sample, absolute in-range hold, and dry-run isolation
+        if: steps.wallet.outputs.configured == 'true'
         run: |
           node --input-type=module <<'NODE'
           import fs from 'node:fs';
@@ -71,33 +104,19 @@ jobs:
           const positions = snapshot.portfolio?.positions || [];
           const dryRuns = events.filter((e) => e.type === 'rebalance.dry_run');
 
-          const summary = positions.map((p) => ({
-            pair: p.pair,
-            currentTick: p.currentTick,
-            range: [p.tickLower, p.tickUpper],
-            outside: p.outside,
-            excursionPct: p.excursionPct,
-            deepConfirmations: p.deepConfirmations,
-            elapsedMin: p.outOfRangeElapsedMin,
-            shouldRebalance: p.shouldRebalance,
-            hasPlan: Boolean(p.rebalancePlan),
-            dryRun: dryRuns.some((e) => e.poolId === p.poolId && e.position?.id === p.id)
-          }));
-          console.log(JSON.stringify({ summary, dryRunCount: dryRuns.length }, null, 2));
-
           for (const p of positions) {
             const dry = dryRuns.some((e) => e.poolId === p.poolId && e.position?.id === p.id);
             if (!p.outside) {
-              if (p.shouldRebalance) throw new Error('IN-RANGE position became rebalance-eligible: ' + p.pair);
-              if (p.rebalancePlan) throw new Error('IN-RANGE position has an auto rebalance plan: ' + p.pair);
-              if (dry) throw new Error('IN-RANGE position produced a dry-run: ' + p.pair);
+              if (p.shouldRebalance) throw new Error('In-range hold assertion failed');
+              if (p.rebalancePlan) throw new Error('In-range plan assertion failed');
+              if (dry) throw new Error('In-range dry-run assertion failed');
             }
             if (p.outside && Number(p.excursionPct) > 0.5 && Number(p.deepConfirmations) >= 2) {
-              if (!p.shouldRebalance) throw new Error('Deep OOR position was not eligible after simulated second 15m sample: ' + p.pair);
-              if (!dry) throw new Error('Eligible OOR position did not produce dry-run: ' + p.pair);
+              if (!p.shouldRebalance) throw new Error('Deep OOR confirmation assertion failed');
+              if (!dry) throw new Error('Eligible OOR dry-run assertion failed');
             }
-            if (p.outside && Number(p.excursionPct) <= 0.5 && Number(p.outOfRangeElapsedMin) < 90) {
-              if (p.shouldRebalance || dry) throw new Error('Shallow OOR position moved before 90m: ' + p.pair);
+            if (p.outside && Number(p.excursionPct) <= 0.5 && Number(p.outOfRangeElapsedMin) < 30) {
+              if (p.shouldRebalance || dry) throw new Error('Shallow OOR wait assertion failed');
             }
           }
 
@@ -105,13 +124,10 @@ jobs:
           if ((state.rebalanceHistory || []).length !== 0) {
             throw new Error('dry-run polluted rebalanceHistory');
           }
+          console.log('OOR policy assertions passed.');
           NODE
-      - uses: actions/upload-artifact@v4
+      - name: Remove wallet-specific smoke data
         if: always()
-        with:
-          name: real-oor-policy-smoke
-          path: |
-            state/oor-smoke-state.json
-            data/latest-snapshot.json
-            data/events.jsonl
-          if-no-files-found: warn
+        run: |
+          rm -f state/oor-smoke-state.json
+          rm -rf data

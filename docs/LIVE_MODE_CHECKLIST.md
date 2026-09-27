@@ -11,6 +11,7 @@ DRY_RUN=true
 ENABLE_LIVE_WRITES=false
 ENABLE_AUTO_REDEPLOY=false
 EIP7702_GUARD_VERIFIED=false
+EIP7702_GUARD_VERIFIED_FOR=
 DASHBOARD_MANUAL_CONTROL_ENABLED=false
 ```
 
@@ -44,7 +45,7 @@ Manual Rebalance 不得提供 bypass。
 
 ## 4. EIP-7702 guard
 
-依序執行：
+部署 guard 時使用專用 `GUARD_DEPLOYER_PRIVATE_KEY`；部署金鑰不得與 LP signer 的 `PRIVATE_KEY` 相同。依序執行：
 
 ```bash
 npm run compile:guard
@@ -59,12 +60,14 @@ npm run verify:guard
 - `guardVersion() == keccak256("Fables7702Guard/v1")`。
 - `IMPLEMENTATION() == EIP7702_GUARD_ADDRESS`。
 - 真實 In-Range LP 的 guarded withdrawal canary 必須 revert。
-- guard runtime readiness 在 Dashboard 顯示 `READY`。
+- 目前 signer 地址必須與 `EIP7702_GUARD_VERIFIED_FOR` 完全一致；換 signer 後必須重新執行 canary。
+- Dashboard「安全防護狀態」顯示「已就緒」。
 
 完成後才人工設定：
 
 ```env
 EIP7702_GUARD_VERIFIED=true
+EIP7702_GUARD_VERIFIED_FOR=<must exactly match WALLET_ADDRESS>
 ```
 
 ## 5. Withdraw / swap / deposit path
@@ -123,18 +126,13 @@ DRY_RUN=false
 ENABLE_LIVE_WRITES=true
 ENABLE_AUTO_REDEPLOY=true
 EIP7702_GUARD_VERIFIED=true
+EIP7702_GUARD_VERIFIED_FOR=<must exactly match WALLET_ADDRESS>
 DASHBOARD_MANUAL_CONTROL_ENABLED=true
 ```
 
 Dashboard 必須同時顯示：
 
-- Signer: READY
-- Live writes: READY
-- Auto redeploy: READY
-- Guard config flag: READY
-- Guard runtime: READY
-- Recovery: CLEAR
-- Execution: LIVE READY
+Dashboard「部署與安全閘門」需確認「簽署錢包」、「鏈上寫入」、「自動重新部署」與「安全防護設定」均顯示「是」，「安全防護狀態」顯示「已就緒」；復原狀態需正常，執行狀態須為實盤監控中。
 
 只挑一個小額、已達 OOR policy 的 position 做第一次 Manual Rebalance。
 

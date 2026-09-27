@@ -10,6 +10,8 @@ $stopFile = Join-Path $stateDir 'dashboard-supervisor.stop'
 $dashboardPort = 8787
 $dashboardToken = ''
 $envFile = Join-Path $repoRoot '.env'
+$dataDir = Join-Path $repoRoot 'data'
+$stateFile = Join-Path $repoRoot 'state\bot-state.json'
 
 New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
 New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
@@ -22,6 +24,18 @@ if (Test-Path -LiteralPath $envFile) {
     if ($line -match '^\s*DASHBOARD_TOKEN\s*=\s*(.*)$') {
       $dashboardToken = $Matches[1].Trim().Trim('"').Trim("'")
     }
+    if ($line -match '^\s*DATA_DIR\s*=\s*(.*)$') {
+      $configured = $Matches[1].Trim().Trim('"').Trim("'")
+      if ($configured) {
+        $dataDir = [System.IO.Path]::GetFullPath($(if ([System.IO.Path]::IsPathRooted($configured)) { $configured } else { Join-Path $repoRoot $configured }))
+      }
+    }
+    if ($line -match '^\s*STATE_FILE\s*=\s*(.*)$') {
+      $configured = $Matches[1].Trim().Trim('"').Trim("'")
+      if ($configured) {
+        $stateFile = [System.IO.Path]::GetFullPath($(if ([System.IO.Path]::IsPathRooted($configured)) { $configured } else { Join-Path $repoRoot $configured }))
+      }
+    }
   }
 }
 
@@ -33,6 +47,8 @@ $script:repoRoot = $repoRoot
 $script:entrypoint = $entrypoint
 $script:logsDir = $logsDir
 $script:dashboardToken = $dashboardToken
+$script:dataDir = $dataDir
+$script:stateFile = $stateFile
 $script:healthUri = "http://127.0.0.1:$dashboardPort/api/health"
 $script:nodeExe = (Get-Command node.exe -ErrorAction Stop).Source
 
@@ -71,6 +87,29 @@ function Test-DashboardHealth {
   }
 }
 
+function Get-PendingExecution {
+  $paths = @($script:stateFile)
+  $walletRoot = Join-Path $script:dataDir 'wallets'
+  if (Test-Path -LiteralPath $walletRoot) {
+    foreach ($walletDir in Get-ChildItem -LiteralPath $walletRoot -Directory -ErrorAction SilentlyContinue) {
+      $paths += Join-Path $walletDir.FullName 'bot-state.json'
+    }
+  }
+  foreach ($file in $paths | Select-Object -Unique) {
+    if (-not (Test-Path -LiteralPath $file)) { continue }
+    try {
+      $state = Get-Content -LiteralPath $file -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+      $phase = [string]$state.settings.activeRebalanceExecution.phase
+      if ($phase -and $phase -notin @('completed', 'failed')) {
+        return @{ phase = $phase }
+      }
+    } catch {
+      return @{ phase = 'state-unreadable' }
+    }
+  }
+  return $null
+}
+
 function Start-AppProcess {
   $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
   $stdoutPath = Join-Path $script:logsDir "auto-lp-supervised-$stamp.stdout.log"
@@ -91,10 +130,17 @@ Write-SupervisorLog -Event 'supervisor.started' -Data @{ processId = $PID; port 
 $child = $null
 $healthFailures = 0
 $externalHealthy = $false
+$restartFailures = 0
 
 while ($true) {
   if (Test-Path -LiteralPath $stopFile) {
     if ($child) {
+      $pending = Get-PendingExecution
+      if ($pending) {
+        Write-SupervisorLog -Event 'app.stop_deferred_for_execution' -Data @{ processId = $child.Id; phase = $pending.phase }
+        Start-Sleep -Seconds 15
+        continue
+      }
       Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue
       Write-SupervisorLog -Event 'app.stopped' -Data @{ processId = $child.Id; reason = 'stop-file' }
     }
@@ -120,7 +166,8 @@ while ($true) {
         $child = Start-AppProcess
       } catch {
         Write-SupervisorLog -Event 'app.launch_failed' -Data @{ errorType = $_.Exception.GetType().Name }
-        Start-Sleep -Seconds 10
+        $restartFailures++
+        Start-Sleep -Seconds ([Math]::Min(300, 10 * [Math]::Pow(2, [Math]::Min(5, $restartFailures - 1))))
         continue
       }
     }
@@ -134,7 +181,8 @@ while ($true) {
     Write-SupervisorLog -Event 'app.exited' -Data @{ processId = $child.Id; exitCode = $child.ExitCode }
     $child = $null
     $healthFailures = 0
-    Start-Sleep -Seconds 3
+    $restartFailures++
+    Start-Sleep -Seconds ([Math]::Min(300, 10 * [Math]::Pow(2, [Math]::Min(5, $restartFailures - 1))))
     continue
   }
 
@@ -143,12 +191,18 @@ while ($true) {
       Write-SupervisorLog -Event 'dashboard.health_recovered' -Data @{ processId = $child.Id }
     }
     $healthFailures = 0
+    $restartFailures = 0
   } else {
     $healthFailures++
     if ($healthFailures -ge 4) {
-      Write-SupervisorLog -Event 'dashboard.health_failed_restarting_app' -Data @{ processId = $child.Id; consecutiveFailures = $healthFailures }
-      Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue
-      $child = $null
+      $pending = Get-PendingExecution
+      if ($pending) {
+        Write-SupervisorLog -Event 'dashboard.health_failed_execution_active' -Data @{ processId = $child.Id; phase = $pending.phase; consecutiveFailures = $healthFailures }
+      } else {
+        Write-SupervisorLog -Event 'dashboard.health_failed_restarting_app' -Data @{ processId = $child.Id; consecutiveFailures = $healthFailures }
+        Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue
+        $child = $null
+      }
       $healthFailures = 0
     }
   }
