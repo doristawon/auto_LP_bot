@@ -30,7 +30,7 @@ const position = {
   rebalanceReason: 'oor_max_wait_expired'
 };
 
-function createHarness({ failSwap = false } = {}) {
+function createHarness({ failSwap = false, failPreflight = false } = {}) {
   const events = [];
   const settings = new Map();
   const balances = [
@@ -94,6 +94,12 @@ function createHarness({ failSwap = false } = {}) {
   executor.readPositionShares = async (_pool, rangeId) => rangeId === position.id ? 0n : 5_000_000_000_000_000n;
   executor.ensureSwapAllowances = async () => {};
   executor.ensureHookAllowance = async () => {};
+  executor.getPinnedFeeOverrides = async () => ({ gasPrice: 1n });
+  executor.assertTopUpGasBudget = async () => {};
+  executor.preflightSamePoolSequence = async () => {
+    if (failPreflight) throw new Error('mock full-sequence preflight failure');
+    return { status: 'full-sequence-simulated', callCount: 4, simulatedGasUsed: '1000000' };
+  };
   executor.quoter = {
     async quoteExactInputSingleRaw(_pool, tokenIn, rawAmountIn, slippageBps) {
       rawAmountIn = BigInt(rawAmountIn);
@@ -151,7 +157,7 @@ function createHarness({ failSwap = false } = {}) {
     if (!receipt.logs?.length) return null;
     return { rangeId: '0x' + '22'.repeat(32), liquidity: 5_000_000_000_000_000n };
   };
-  return { executor, events, settings };
+  return { executor, events, settings, sentCount: () => sent };
 }
 
 test('full executor advances only after receipts and completes with new LP shares', async () => {
@@ -175,4 +181,15 @@ test('post-withdraw swap failure records recovery_required and leaves execution 
   assert.equal(journal.phase, 'recovery_required');
   assert.ok(journal.tx.withdraw);
   assert.ok(events.some((x) => x.type === 'rebalance.recovery_required'));
+});
+
+test('failed full-sequence preflight leaves principal in the original LP', async () => {
+  const { executor, events, settings, sentCount } = createHarness({ failPreflight: true });
+  await assert.rejects(
+    executor.execute({ pool: structuredClone(pool), position: { ...position }, currentTick: 1100 }),
+    /mock full-sequence preflight failure/
+  );
+  assert.equal(sentCount(), 0);
+  assert.equal(settings.get('activeRebalanceExecution').phase, 'failed');
+  assert.equal(events.some((x) => x.type === 'rebalance.recovery_required'), false);
 });

@@ -1,6 +1,7 @@
 import {
   Contract,
   Interface,
+  MaxUint256,
   Wallet,
   formatUnits,
   id,
@@ -79,6 +80,7 @@ export class RebalanceExecutor {
 
     await this.assertLiveReady(plan);
     this.assertNoUnfinishedExecution();
+    const rebalanceMaxImpactBps = this.samePoolRebalanceMaxImpactBps(plan.pool);
     let phase = 'prepared';
     let journal = {
       id: `${Date.now()}:${plan.pool.id}:${plan.position.id}`,
@@ -166,6 +168,30 @@ export class RebalanceExecutor {
         }
       });
 
+      // Prove the post-withdraw route and new tight-range deposit in one
+      // temporary RPC state before any principal is moved on-chain.
+      const sequencePreflight = await this.preflightSamePoolSequence({
+        pool: plan.pool,
+        position: plan.position,
+        guardedData,
+        preBalances,
+        poolState: latest,
+        deadline: withdrawDeadline,
+        maxPriceImpactBps: rebalanceMaxImpactBps
+      });
+      const feeOverrides = await this.getPinnedFeeOverrides();
+      await this.assertTopUpGasBudget({
+        reserveWei: this.config.topUpMinGasReserveWei,
+        maxFeePerGas: feeOverrides.maxFeePerGas || feeOverrides.gasPrice,
+        futureGasLimit: BigInt(sequencePreflight.simulatedGasUsed) * 3n / 2n,
+        phase: 'same-pool-rebalance-before-withdrawal'
+      });
+      journal = this.patchJournal(journal, {
+        phase: 'sequence_preflighted',
+        sequencePreflight
+      });
+      await this.assertPlanStillOutOfRange(plan, 'after-sequence-preflight');
+
       const withdrawReceipt = await this.sendVerifiedTx({
         label: 'guardedWithdrawAndClaim',
         to: this.config.walletAddress,
@@ -211,7 +237,7 @@ export class RebalanceExecutor {
         tickLower: targetAfterWithdraw.tickLower,
         tickUpper: targetAfterWithdraw.tickUpper,
         slippageBps: this.config.swapSlippageBps,
-        maxPriceImpactBps: this.config.maxSwapPriceImpactBps ?? 200
+        maxPriceImpactBps: rebalanceMaxImpactBps
       });
       journal = this.patchJournal(journal, {
         targetAfterWithdraw,
@@ -222,7 +248,9 @@ export class RebalanceExecutor {
       if (swapPlan.direction !== 'none') {
         const inputToken = swapPlan.tokenIn === 0 ? plan.pool.token0 : plan.pool.token1;
         await this.ensureSwapAllowances(inputToken, swapPlan.rawAmountIn);
-        const executableSwapPlan = await this.refreshSingleSwapQuote(plan.pool, swapPlan, 'immediately-before-swap');
+        const executableSwapPlan = await this.refreshSingleSwapQuote(
+          plan.pool, swapPlan, 'immediately-before-swap', rebalanceMaxImpactBps
+        );
 
         const swapDeadline = this.deadline();
         const request = this.router.buildV4ExactInputSingle({
@@ -1105,6 +1133,160 @@ export class RebalanceExecutor {
     return { swapRequest, depositData, depositEvent, callCount: results.length };
   }
 
+  async preflightSamePoolSequence({
+    pool, position, guardedData, preBalances, poolState, deadline,
+    maxPriceImpactBps
+  }) {
+    const balanceCalls = [pool.token0, pool.token1].map((token) => ({
+      to: token.address,
+      data: erc20Interface.encodeFunctionData('balanceOf', [this.config.walletAddress]),
+      value: 0n,
+      gasLimit: 100_000
+    }));
+    const withdrawCall = {
+      to: this.config.walletAddress, data: guardedData, value: 0n,
+      gasLimit: 1_500_000
+    };
+    const simulationArgs = {
+      walletAddress: this.config.walletAddress,
+      chainId: this.config.chainId
+    };
+    const withdrawnSimulation = await simulateSequentialCalls(this.writeProvider, {
+      ...simulationArgs, calls: [withdrawCall, ...balanceCalls]
+    });
+    const postWithdraw = {
+      raw0: BigInt(erc20Interface.decodeFunctionResult('balanceOf', withdrawnSimulation[1].returnData)[0]),
+      raw1: BigInt(erc20Interface.decodeFunctionResult('balanceOf', withdrawnSimulation[2].returnData)[0])
+    };
+    const withdrawn = operationDelta(preBalances, postWithdraw);
+    if (withdrawn.raw0 < 0n || withdrawn.raw1 < 0n
+      || withdrawn.raw0 + withdrawn.raw1 === 0n) {
+      throw new Error('Sequential preflight did not return non-negative withdrawn inventory');
+    }
+
+    const target = buildTargetRange(
+      poolState.tick, pool.key.tickSpacing,
+      this.config.tightWidthBps, this.config.rangePreset
+    );
+    const swapPlan = await buildExactBalancedSwapPlan({
+      pool, quoter: this.quoter,
+      rawAmount0: withdrawn.raw0,
+      rawAmount1: withdrawn.raw1,
+      sqrtPriceX96: poolState.sqrtPriceX96,
+      tickLower: target.tickLower,
+      tickUpper: target.tickUpper,
+      slippageBps: this.config.swapSlippageBps,
+      maxPriceImpactBps
+    });
+    if (swapPlan.blockedReason) {
+      throw new Error(`Sequential preflight cannot swap within price-impact limit: ${swapPlan.blockedReason}`);
+    }
+
+    let projected = withdrawn;
+    let finalTarget = target;
+    let finalSqrtPriceX96 = poolState.sqrtPriceX96;
+    let swapRequest = null;
+    if (swapPlan.direction !== 'none') {
+      swapRequest = this.router.buildV4ExactInputSingle({
+        pool, quote: swapPlan.quote, deadline
+      });
+      const swapApprovals = await this.buildTopUpApprovalRequests(pool, swapPlan, {
+        amount0Max: 0n, amount1Max: 0n
+      });
+      const preview = await simulateSequentialCalls(this.writeProvider, {
+        ...simulationArgs,
+        calls: [
+          ...swapApprovals.map(({ tx }) => ({
+            to: tx.to, data: tx.data, value: tx.value || 0n,
+            gasLimit: Number(TOP_UP_APPROVAL_GAS_RESERVE)
+          })),
+          withdrawCall,
+          { to: swapRequest.router, data: swapRequest.data,
+            value: swapRequest.value, gasLimit: Number(TOP_UP_SWAP_GAS_LIMIT) },
+          ...balanceCalls
+        ]
+      });
+      const swapReceipt = preview[swapApprovals.length + 1];
+      let swapPrice = null;
+      for (const entry of swapReceipt.logs || []) {
+        try {
+          const event = swapEventInterface.parseLog(entry);
+          if (String(event.args.id).toLowerCase() === pool.id.toLowerCase()) {
+            swapPrice = {
+              tick: Number(event.args.tick),
+              sqrtPriceX96: BigInt(event.args.sqrtPriceX96)
+            };
+          }
+        } catch {}
+      }
+      if (!swapPrice || swapPrice.sqrtPriceX96 <= 0n) {
+        throw new Error('Sequential preflight swap did not emit the expected pool price');
+      }
+      projected = swapPlan.tokenIn === 0
+        ? { raw0: withdrawn.raw0 - swapPlan.rawAmountIn,
+            raw1: withdrawn.raw1 + BigInt(swapPlan.quote.minRawAmountOut) }
+        : { raw0: withdrawn.raw0 + BigInt(swapPlan.quote.minRawAmountOut),
+            raw1: withdrawn.raw1 - swapPlan.rawAmountIn };
+      const postSwap = {
+        raw0: BigInt(erc20Interface.decodeFunctionResult('balanceOf', preview.at(-2).returnData)[0]),
+        raw1: BigInt(erc20Interface.decodeFunctionResult('balanceOf', preview.at(-1).returnData)[0])
+      };
+      const actualInventory = operationDelta(preBalances, postSwap);
+      if (actualInventory.raw0 < projected.raw0 || actualInventory.raw1 < projected.raw1) {
+        throw new Error('Sequential preflight swap returned less than conservative minOut inventory');
+      }
+      finalTarget = buildTargetRange(
+        swapPrice.tick, pool.key.tickSpacing,
+        this.config.tightWidthBps, this.config.rangePreset
+      );
+      finalSqrtPriceX96 = swapPrice.sqrtPriceX96;
+    }
+
+    const depositPlan = buildExactDepositPlan({
+      rawAmount0: projected.raw0,
+      rawAmount1: projected.raw1,
+      sqrtPriceX96: finalSqrtPriceX96,
+      tickLower: finalTarget.tickLower,
+      tickUpper: finalTarget.tickUpper,
+      slippageBps: this.config.depositSlippageBps,
+      liquidityReserveBps: this.config.depositLiquidityReserveBps
+    });
+    this.assertValidDeposit(depositPlan, 'Sequential preflight deposit plan is invalid');
+    const fullApprovals = await this.buildTopUpApprovalRequests(pool, swapPlan, depositPlan);
+    const depositData = this.fables.encodeDeposit(
+      pool, finalTarget, depositPlan.liquidity,
+      depositPlan.amount0Max, depositPlan.amount1Max, deadline
+    );
+    const fullCalls = [
+      ...fullApprovals.map(({ tx }) => ({
+        to: tx.to, data: tx.data, value: tx.value || 0n,
+        gasLimit: Number(TOP_UP_APPROVAL_GAS_RESERVE)
+      })),
+      withdrawCall,
+      ...(swapRequest ? [{ to: swapRequest.router, data: swapRequest.data,
+        value: swapRequest.value, gasLimit: Number(TOP_UP_SWAP_GAS_LIMIT) }] : []),
+      { to: pool.key.hooks, data: depositData, value: 0n,
+        gasLimit: Number(TOP_UP_DEPOSIT_GAS_LIMIT) }
+    ];
+    const simulated = await simulateSequentialCalls(this.writeProvider, {
+      ...simulationArgs, calls: fullCalls
+    });
+    const deposited = this.findWalletDepositEvent(pool, simulated.at(-1));
+    if (!deposited || deposited.liquidity <= 0n) {
+      throw new Error('Sequential preflight did not mint a wallet LP position');
+    }
+    return {
+      status: 'full-sequence-simulated',
+      callCount: simulated.length,
+      simulatedGasUsed: simulated.reduce(
+        (total, receipt) => total + BigInt(receipt.gasUsed || 0), 0n
+      ).toString(),
+      swapPriceImpactBps: swapPlan.priceImpactBps ?? null,
+      finalTarget,
+      mintedLiquidity: deposited.liquidity.toString()
+    };
+  }
+
   async buildTopUpApprovalRequests(pool, swapPlan, depositPlan) {
     const requests = [];
     const swapAmountByAddress = new Map();
@@ -1124,7 +1306,8 @@ export class RebalanceExecutor {
       if (swapAmount > 0n) {
         const tokenContract = new Contract(token.address, ERC20_ABI, this.readProvider);
         const erc20Allowance = BigInt(await tokenContract.allowance(this.config.walletAddress, PERMIT2));
-        if (erc20Allowance !== swapAmount) {
+        if (erc20Allowance !== swapAmount
+          && !(await this.hasFixedInfinitePermit2Allowance(token, erc20Allowance))) {
           if (erc20Allowance > 0n) add(`approve:${token.symbol}:permit2:reset`, token.address, erc20Interface.encodeFunctionData('approve', [PERMIT2, 0n]));
           add(`approve:${token.symbol}:permit2`, token.address, erc20Interface.encodeFunctionData('approve', [PERMIT2, swapAmount]));
         }
@@ -1400,6 +1583,14 @@ export class RebalanceExecutor {
     return impactBps;
   }
 
+  samePoolRebalanceMaxImpactBps(pool) {
+    const defaultLimit = this.config.maxSwapPriceImpactBps ?? 200;
+    const scopedPoolId = String(this.config.oorRebalanceSwapPoolId || '').toLowerCase();
+    return scopedPoolId && scopedPoolId === String(pool.id).toLowerCase()
+      ? this.config.oorRebalanceMaxSwapPriceImpactBps ?? defaultLimit
+      : defaultLimit;
+  }
+
   async refreshSingleSwapQuote(pool, swapPlan, phase, maxOverrideBps = null) {
     const state = await this.fables.readPoolState(pool);
     if (state.paused !== false || BigInt(state.liquidity || 0) <= 0n) {
@@ -1586,7 +1777,8 @@ export class RebalanceExecutor {
     if (token.address.toLowerCase() === ZERO_ADDRESS) throw new Error('Native input is not enabled');
     const tokenContract = new Contract(token.address, ERC20_ABI, this.readProvider);
     let erc20Allowance = BigInt(await tokenContract.allowance(this.config.walletAddress, PERMIT2));
-    if (erc20Allowance !== rawAmountIn) {
+    if (erc20Allowance !== rawAmountIn
+      && !(await this.hasFixedInfinitePermit2Allowance(token, erc20Allowance))) {
       if (erc20Allowance > 0n) {
         await this.sendVerifiedTx({
           label: `approve:${token.symbol}:permit2:reset`,
@@ -1641,6 +1833,26 @@ export class RebalanceExecutor {
       if (BigInt(updated.amount) !== rawAmountIn || Number(updated.expiration) <= now + this.config.txDeadlineSec) {
         throw new Error('Permit2 -> Universal Router allowance did not update to the exact requested amount');
       }
+    }
+  }
+
+  async hasFixedInfinitePermit2Allowance(token, allowance) {
+    if (BigInt(allowance) !== MaxUint256) return false;
+    // Solady ERC20 may hardwire Permit2 allowance to uint256.max and reject
+    // approve(Permit2, ...). Confirm that exact custom error before accepting
+    // the immutable layer; the Permit2 -> router allowance stays exact/expiring.
+    try {
+      await this.readProvider.call({
+        from: this.config.walletAddress,
+        to: token.address,
+        data: erc20Interface.encodeFunctionData('approve', [PERMIT2, 0n])
+      });
+      return false;
+    } catch (error) {
+      const revertData = [error?.data, error?.info?.error?.data, error?.error?.data]
+        .find((value) => typeof value === 'string' && /^0x[0-9a-fA-F]{8}/.test(value));
+      if (revertData?.slice(0, 10).toLowerCase() === '0x3f68539a') return true;
+      throw error;
     }
   }
 

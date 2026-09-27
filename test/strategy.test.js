@@ -196,6 +196,36 @@ test('checks inside the 5-minute policy window do not advance confirmations', ()
   assert.equal(x.shouldRebalance, false);
 });
 
+test('confirmed deep OOR remains eligible between policy samples', () => {
+  const t0 = 4_500_000;
+  const base = {
+    currentTick: 1051,
+    tickSpacing: 10,
+    position: { tickLower: 900, tickUpper: 1000 },
+    widthBps: 120,
+    lastEvaluationAt: t0,
+    outOfRangeSince: t0 - M5,
+    deepConfirmationsSeen: 2,
+    checkIntervalMs: M5,
+    shallowThresholdPct: 0.5,
+    deepConfirmationsRequired: 2,
+    nowMs: t0 + 60 * 1000
+  };
+  const confirmed = evaluatePosition(base);
+  assert.equal(confirmed.evaluationDue, false);
+  assert.equal(confirmed.deepConfirmations, 2);
+  assert.equal(confirmed.shouldRebalance, true);
+  assert.equal(confirmed.rebalanceReason, 'deep_oor_confirmed');
+
+  const inCooldown = evaluatePosition({ ...base, cooldownUntil: t0 + M5 });
+  assert.equal(inCooldown.shouldRebalance, false);
+
+  const reentered = evaluatePosition({ ...base, currentTick: 950 });
+  assert.equal(reentered.outside, false);
+  assert.equal(reentered.deepConfirmations, 0);
+  assert.equal(reentered.shouldRebalance, false);
+});
+
 test('re-entry on a due evaluation clears the OOR timer', () => {
   const t0 = 5_000_000;
   const x = evaluatePosition({

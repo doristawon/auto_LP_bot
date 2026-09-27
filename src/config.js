@@ -44,6 +44,8 @@ export function loadConfig() {
   const oorDeepConfirmations = envInt('OOR_DEEP_CONFIRMATIONS', envInt('OUT_OF_RANGE_CONFIRMATIONS', 2));
   const swapSlippageBps = envInt('SWAP_SLIPPAGE_BPS', 50);
   const maxSwapPriceImpactBps = envInt('MAX_SWAP_PRICE_IMPACT_BPS', 200);
+  const oorRebalanceSwapPoolId = process.env.OOR_REBALANCE_SWAP_POOL_ID?.trim().toLowerCase() || '';
+  const oorRebalanceMaxSwapPriceImpactBps = envInt('OOR_REBALANCE_MAX_SWAP_PRICE_IMPACT_BPS', maxSwapPriceImpactBps);
   const autoTopupMaxSwapPriceImpactBps = envInt('AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS', maxSwapPriceImpactBps);
   const autoTopupSwapPoolId = process.env.AUTO_TOPUP_SWAP_POOL_ID?.trim().toLowerCase() || '';
   const autoTopupSwapEnabled = envBool('AUTO_TOPUP_SWAP_ENABLED', false);
@@ -85,6 +87,15 @@ export function loadConfig() {
   if (swapSlippageBps < 0 || swapSlippageBps >= 10_000) throw new Error('SWAP_SLIPPAGE_BPS must be 0..9999');
   if (maxSwapPriceImpactBps < 0 || maxSwapPriceImpactBps > 1000) {
     throw new Error('MAX_SWAP_PRICE_IMPACT_BPS must be 0..1000');
+  }
+  if (oorRebalanceMaxSwapPriceImpactBps < 0 || oorRebalanceMaxSwapPriceImpactBps > 1000) {
+    throw new Error('OOR_REBALANCE_MAX_SWAP_PRICE_IMPACT_BPS must be 0..1000');
+  }
+  if (oorRebalanceSwapPoolId && !/^0x[0-9a-f]{64}$/.test(oorRebalanceSwapPoolId)) {
+    throw new Error('OOR_REBALANCE_SWAP_POOL_ID must be a pool bytes32 ID');
+  }
+  if (oorRebalanceMaxSwapPriceImpactBps !== maxSwapPriceImpactBps && !oorRebalanceSwapPoolId) {
+    throw new Error('OOR_REBALANCE_MAX_SWAP_PRICE_IMPACT_BPS override requires OOR_REBALANCE_SWAP_POOL_ID');
   }
   if (autoTopupMaxSwapPriceImpactBps < 0 || autoTopupMaxSwapPriceImpactBps > 1000) {
     throw new Error('AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS must be 0..1000');
@@ -161,6 +172,8 @@ export function loadConfig() {
     maxRebalancesPerHour: envInt('MAX_REBALANCES_PER_HOUR', 3),
     swapSlippageBps,
     maxSwapPriceImpactBps,
+    oorRebalanceSwapPoolId,
+    oorRebalanceMaxSwapPriceImpactBps,
     depositSlippageBps,
     withdrawSlippageBps,
     depositLiquidityReserveBps: envInt('DEPOSIT_LIQUIDITY_RESERVE_BPS', 10),

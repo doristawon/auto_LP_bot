@@ -8,6 +8,8 @@
 
 OOR 再投入可設定為最高有效 APR 或指定池。最高 APR 候選需有新鮮統計、未暫停，且 TVL 達 `APR_POOL_MIN_TVL_USD`。目前跨池實盤因無法在提領前可靠模擬「兌幣後存入」而安全阻擋，原 LP 會保留；預演只涵蓋來源與目的池交易對的錢包餘額及來源提領預估，不掃入無關代幣。現有 LP 在區間內時，可將同交易對的閒置餘額加倉。預設只使用現有代幣比例；若明確設定 `AUTO_TOPUP_SWAP_ENABLED=true`、單一 `AUTO_TOPUP_SWAP_POOL_ID` 與獨立的 `AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS`，才會在「授權→兌幣→存入」整串 RPC 模擬成功後兌幣加倉。兌幣前會再次確認價格衝擊、錢包餘額、原區間及完整模擬，並保留設定的零頭與 Gas。指定池可用關鍵字篩選 APR 排序下拉選單。預設區間檢查週期為 5 分鐘，深度 OOR 仍需連續 2 次確認；淺度 OOR 最長等待 30 分鐘。
 
+同池 OOR 實盤現在也要求撤池前完成「guarded 撤池→必要換幣→tight 入池」連續 RPC 模擬及 Gas 預算檢查；任一步失敗就保留舊 LP。`npm run preflight:oor` 可唯讀檢查目前部位，參數 `-- --diagnostic-max-bps=350` 僅供診斷，不修改實盤上限。單一池的實盤上限可用 `OOR_REBALANCE_SWAP_POOL_ID` 與 `OOR_REBALANCE_MAX_SWAP_PRICE_IMPACT_BPS` 明確設定，其餘池沿用一般上限。Solady 固定無限額 Permit2 授權的代幣，僅在合約回傳特定固定授權錯誤時略過無法執行的 ERC20 重設，Router 仍使用定額、限時的 Permit2 授權。
+
 ## v0.6.0 — 本機錢包、池級 APR 與 RPC 控制
 
 - Fables 官方活躍池清單會顯示目前 Tick、TVL、24 小時成交量與手續費，以及池級 APR。

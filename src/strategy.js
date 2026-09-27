@@ -62,6 +62,14 @@ export function evaluatePosition({
 
   if (!evaluationDue) {
     const elapsedMs = outOfRangeSince ? Math.max(0, nowMs - outOfRangeSince) : 0;
+    // A dashboard or other observation may consume the due sample before the
+    // execution loop sees it. Keep a confirmed OOR decision eligible until a
+    // later policy sample, re-entry, or cooldown invalidates it.
+    const deepConfirmed = excursionPct > shallowThresholdPct
+      && deepConfirmationsSeen >= deepConfirmationsRequired;
+    const waitExpired = excursionPct <= shallowThresholdPct
+      && outOfRangeSince > 0 && elapsedMs >= maxWaitMs;
+    const shouldRebalance = !cooldownActive && (deepConfirmed || waitExpired);
     return {
       outside: true,
       nearEdge: false,
@@ -73,8 +81,10 @@ export function evaluatePosition({
       outOfRangeElapsedMs: elapsedMs,
       deepConfirmations: deepConfirmationsSeen,
       cooldownActive,
-      shouldRebalance: false,
-      rebalanceReason: null,
+      shouldRebalance,
+      rebalanceReason: shouldRebalance
+        ? (waitExpired ? 'oor_max_wait_expired' : 'deep_oor_confirmed')
+        : null,
       target
     };
   }
