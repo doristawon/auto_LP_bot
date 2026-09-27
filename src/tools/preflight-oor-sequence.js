@@ -20,8 +20,9 @@ const config = loadConfig();
 const ceilingArg = process.argv.find((arg) => arg.startsWith('--diagnostic-max-bps='));
 const diagnosticMaxBps = ceilingArg
   ? Number(ceilingArg.slice('--diagnostic-max-bps='.length))
-  : config.maxSwapPriceImpactBps;
-if (!Number.isInteger(diagnosticMaxBps) || diagnosticMaxBps < 0 || diagnosticMaxBps > 1000) {
+  : null;
+if (diagnosticMaxBps !== null
+  && (!Number.isInteger(diagnosticMaxBps) || diagnosticMaxBps < 0 || diagnosticMaxBps > 1000)) {
   throw new Error('Diagnostic max price impact must be an integer from 0 through 1000 bps');
 }
 const walletDir = path.join(config.dataDir, 'wallets', config.walletAddress.toLowerCase());
@@ -49,6 +50,7 @@ const executor = new RebalanceExecutor(
   providers.readProvider, providers.writeProvider, config, fables,
   { append: () => {} }, () => 1, null
 );
+const appliedMaxBps = diagnosticMaxBps ?? executor.samePoolRebalanceMaxImpactBps(pool);
 await executor.assertAtomicGuardReady();
 const balances = await executor.readRawPairBalances(pool);
 const bounds = buildExactWithdrawBounds({
@@ -97,7 +99,7 @@ const swapPlan = await buildExactBalancedSwapPlan({
   tickUpper: target.tickUpper,
   slippageBps: config.swapSlippageBps,
   // An optional diagnostic ceiling never changes the live executor's cap.
-  maxPriceImpactBps: diagnosticMaxBps
+  maxPriceImpactBps: appliedMaxBps
 });
 if (swapPlan.direction === 'none') {
   throw new Error(`Simulated OOR inventory has no executable swap: ${swapPlan.blockedReason || 'already balanced'}`);
@@ -192,11 +194,18 @@ if (!depositEvent || depositEvent.liquidity <= 0n) {
 }
 const livePathPreflight = await executor.preflightSamePoolSequence({
   pool, position, guardedData: guardData, preBalances: balances,
-  poolState: state, deadline, maxPriceImpactBps: diagnosticMaxBps
+  poolState: state, deadline, maxPriceImpactBps: appliedMaxBps
 });
 if (livePathPreflight.status !== 'full-sequence-simulated') {
   throw new Error('Executor did not select a fully simulated OOR sequence');
 }
+const feeOverrides = await executor.getPinnedFeeOverrides();
+await executor.assertTopUpGasBudget({
+  reserveWei: config.topUpMinGasReserveWei,
+  maxFeePerGas: feeOverrides.maxFeePerGas || feeOverrides.gasPrice,
+  futureGasLimit: BigInt(livePathPreflight.simulatedGasUsed) * 3n / 2n,
+  phase: 'read-only-oor-preflight'
+});
 console.log(JSON.stringify({
   ok: true,
   pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
@@ -204,12 +213,13 @@ console.log(JSON.stringify({
   range: [position.tickLower, position.tickUpper],
   simulatedCalls: fullSequence.length,
   quotedPriceImpactBps: swapPlan.priceImpactBps,
-  diagnosticPriceImpactCeilingBps: diagnosticMaxBps,
+  diagnosticPriceImpactCeilingBps: appliedMaxBps,
   livePriceImpactCeilingBps: executor.samePoolRebalanceMaxImpactBps(pool),
   simulatedSwapTick: simulatedPrice.tick,
   newRange: [depositTarget.tickLower, depositTarget.tickUpper],
   mintedLiquidity: depositEvent.liquidity.toString(),
   livePathPreflight,
+  gasBudgetOk: true,
   withdrawnRaw: {
     token0: withdrawn.raw0.toString(),
     token1: withdrawn.raw1.toString()

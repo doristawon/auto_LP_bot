@@ -17,6 +17,7 @@ function makeExecutor({ rpcChainId = '0x2105', broadcast = async () => { throw n
   executor.readProvider = { async call() { return '0x'; } };
   executor.writeProvider = {
     async getFeeData() { return { maxFeePerGas: 1_000_000_000n, maxPriorityFeePerGas: 100_000_000n }; },
+    async getBlock() { return { baseFeePerGas: 900_000_000n }; },
     async send(method) {
       assert.equal(method, 'eth_chainId');
       return rpcChainId;
@@ -31,6 +32,33 @@ function makeExecutor({ rpcChainId = '0x2105', broadcast = async () => { throw n
   executor.getUsdPrice = () => 0;
   return { executor, settings, events };
 }
+
+test('fee quote covers a changing base fee before the sequence is budgeted', async () => {
+  const { executor } = makeExecutor();
+  executor.writeProvider.getFeeData = async () => ({ gasPrice: 20_000_000n });
+  executor.writeProvider.getBlock = async () => ({ baseFeePerGas: 21_000_000n });
+  assert.deepEqual(await executor.getPinnedFeeOverrides(), { gasPrice: 42_000_000n });
+  assert.deepEqual(await executor.getPinnedFeeOverrides({ gasPrice: 42_000_000n }), { gasPrice: 42_000_000n });
+});
+
+test('contract preflight excludes fees while the signed transaction retains the buffered fee', async () => {
+  const { executor } = makeExecutor({ rpcChainId: '0x1' });
+  let callRequest;
+  let estimateRequest;
+  let populatedRequest;
+  executor.readProvider.call = async (request) => { callRequest = request; return '0x'; };
+  executor.signer.estimateGas = async (request) => { estimateRequest = request; return 21_000n; };
+  executor.signer.populateTransaction = async (request) => { populatedRequest = request; return { ...request, nonce: 3 }; };
+  await assert.rejects(
+    executor.sendVerifiedTx({ label: 'fee-preflight', to: WALLET, data: '0x1234' }),
+    /Write RPC chainId mismatch/
+  );
+  assert.deepEqual(callRequest, { to: WALLET, data: '0x1234', value: 0n, from: WALLET });
+  assert.deepEqual(estimateRequest, callRequest);
+  assert.equal(populatedRequest.maxFeePerGas, 1_900_000_000n);
+  assert.equal(populatedRequest.maxPriorityFeePerGas, 100_000_000n);
+  assert.equal(populatedRequest.chainId, 8453);
+});
 
 test('ambiguous broadcast rejection locks the execution journal with the signed hash', async () => {
   const { executor, settings, events } = makeExecutor();

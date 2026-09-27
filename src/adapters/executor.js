@@ -1924,14 +1924,27 @@ export class RebalanceExecutor {
   }
 
   async getPinnedFeeOverrides(preferred = null) {
-    const feeData = preferred || await this.writeProvider.getFeeData();
+    if (preferred) return preferred;
+    const [feeData, latestBlock] = await Promise.all([
+      this.writeProvider.getFeeData(),
+      this.writeProvider.getBlock('latest')
+    ]);
+    const baseFeePerGas = latestBlock?.baseFeePerGas == null ? 0n : BigInt(latestBlock.baseFeePerGas);
     const maxFeePerGas = feeData.maxFeePerGas == null ? 0n : BigInt(feeData.maxFeePerGas);
     const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas == null ? 0n : BigInt(feeData.maxPriorityFeePerGas);
     if (maxFeePerGas > 0n && maxPriorityFeePerGas > 0n && maxPriorityFeePerGas <= maxFeePerGas) {
-      return { maxFeePerGas, maxPriorityFeePerGas };
+      // A quote from the previous block can already be below the current base
+      // fee. Keep room for several blocks before the signed tx is included.
+      const buffered = baseFeePerGas > 0n ? baseFeePerGas * 2n + maxPriorityFeePerGas : 0n;
+      return { maxFeePerGas: maxFeePerGas > buffered ? maxFeePerGas : buffered, maxPriorityFeePerGas };
     }
     const gasPrice = feeData.gasPrice == null ? 0n : BigInt(feeData.gasPrice);
-    if (gasPrice > 0n) return { gasPrice };
+    if (gasPrice > 0n) {
+      const reference = gasPrice > baseFeePerGas ? gasPrice : baseFeePerGas;
+      // Robinhood RPC can return a legacy gasPrice lower than the next block's
+      // base fee. Buffer the pinned quote before budgeting the whole sequence.
+      return { gasPrice: baseFeePerGas > 0n ? reference * 2n : gasPrice };
+    }
     throw new Error('Fee data is unavailable or incomplete; refusing to build a transaction');
   }
 
@@ -1953,9 +1966,12 @@ export class RebalanceExecutor {
     await this.assertGasGuard(fees);
     const chainId = BigInt(this.config.chainId || 0);
     if (chainId <= 0n) throw new Error('Configured chainId is unavailable');
+    const semanticRequest = { to, data, value: BigInt(value), from: this.config.walletAddress };
+    // eth_call/estimateGas with a pinned fee can fail on RPC fee drift or on
+    // the node's large default call gas limit even when the contract succeeds.
+    await this.readProvider.call(semanticRequest);
+    const gasEstimate = await this.signer.estimateGas(semanticRequest);
     const request = { to, data, value: BigInt(value), chainId: Number(chainId), ...fees };
-    await this.readProvider.call({ ...request, from: this.config.walletAddress });
-    const gasEstimate = await this.signer.estimateGas({ ...request, from: this.config.walletAddress });
     const populated = await this.signer.populateTransaction({
       ...request,
       gasLimit: gasEstimate * 120n / 100n
