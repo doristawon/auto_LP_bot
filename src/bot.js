@@ -652,6 +652,7 @@ export class AutoLpBot {
 
   async refreshMarket(force = false) {
     if (!force && Date.now() - this.market.refreshedAt < this.config.marketRefreshMs) return this.market;
+    log('info', 'market.refresh_started', { force });
     const latestBlock = await this.providers.readProvider.getBlockNumber();
     const discovered = await this.fables.discoverAllPools();
     const pools = await this.fables.hydratePoolStates(discovered);
@@ -660,7 +661,12 @@ export class AutoLpBot {
     try { fablesStats = await fetchFablesPoolStats(); }
     catch (error) { log('warn', 'fables.stats_unavailable', { error: error.message }); }
     this.market = { refreshedAt: Date.now(), pools, prices, latestBlock, fablesStats };
-    await this.scanGlobalPointFees(pools, latestBlock);
+    if (this.config.pointsGlobalSwapScanEnabled !== false) {
+      log('info', 'points.global_scan_started', { block: latestBlock, pools: pools.length });
+      await this.scanGlobalPointFees(pools, latestBlock);
+    } else {
+      log('info', 'points.global_scan_skipped', { reason: 'POINTS_GLOBAL_SWAP_SCAN_ENABLED=false' });
+    }
     await this.scanGlobalPoolFees(pools, latestBlock);
     log('info', 'market.refreshed', {
       block: latestBlock,

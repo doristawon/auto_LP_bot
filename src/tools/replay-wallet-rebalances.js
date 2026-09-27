@@ -55,14 +55,12 @@ const poolByFingerprint = new Map(allPools.map((pool) => [poolKeyFingerprint(poo
 const hooks = [...new Set(allPools.map((pool) => pool.key.hooks.toLowerCase()))];
 const walletTopic = zeroPadValue(config.walletAddress, 32).toLowerCase();
 
-const lifecycleLogs = [];
-for (const hook of hooks) {
-  const logs = await fables.getLogsAdaptive({
-    address: hook,
-    topics: [[depositedTopic, withdrawnTopic], walletTopic]
-  }, fromBlock, latestBlock);
-  lifecycleLogs.push(...logs);
-}
+const lifecycleLogs = hooks.length
+  ? await fables.getLogsAdaptive({
+      address: hooks,
+      topics: [[depositedTopic, withdrawnTopic], walletTopic]
+    }, fromBlock, latestBlock)
+  : [];
 lifecycleLogs.sort(logOrder);
 if (!lifecycleLogs.length) throw new Error('No wallet Fables lifecycle events found');
 

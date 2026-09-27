@@ -1,8 +1,14 @@
-import { FallbackProvider, JsonRpcProvider } from 'ethers';
+import { FallbackProvider, FetchRequest, JsonRpcProvider } from 'ethers';
 
 export function createProviders(config) {
   const network = { chainId: config.chainId, name: 'robinhood' };
-  const rawProviders = config.rpcUrls.map((url) => new JsonRpcProvider(url, network, { staticNetwork: true }));
+  const requestTimeoutMs = Number(config.rpcRequestTimeoutMs || 30_000);
+  const rawProviders = config.rpcUrls.map((url) => {
+    const request = new FetchRequest(url);
+    request.timeout = requestTimeoutMs;
+    return new JsonRpcProvider(request, network, { staticNetwork: true });
+  });
+  const writeProvider = new JsonRpcProvider(config.rpcUrls[0], network, { staticNetwork: true });
   const readProvider = rawProviders.length === 1
     ? rawProviders[0]
     : new FallbackProvider(
@@ -15,7 +21,7 @@ export function createProviders(config) {
         network,
         { quorum: 1 }
       );
-  return { readProvider, writeProvider: rawProviders[0], rawProviders };
+  return { readProvider, writeProvider, rawProviders };
 }
 
 export async function verifyProviders(providers, chainId) {

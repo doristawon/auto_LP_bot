@@ -25,6 +25,8 @@ export function loadConfig() {
   const enableLiveWrites = envBool('ENABLE_LIVE_WRITES', false);
   const enableAutoRedeploy = envBool('ENABLE_AUTO_REDEPLOY', false);
   const rpcUrls = envList('RPC_URLS', [DEFAULT_RPC_URL]);
+  const rpcRequestTimeoutMs = envInt('RPC_REQUEST_TIMEOUT_MS', 30_000);
+  const pointsGlobalSwapScanEnabled = envBool('POINTS_GLOBAL_SWAP_SCAN_ENABLED', true);
   const targetMode = (process.env.TARGET_MODE?.trim() || 'wallet-active').toLowerCase();
   const logFromBlock = envInt('LOG_FROM_BLOCK', 44_000_000);
   const oorMaxWaitMin = envInt('OOR_MAX_WAIT_MIN', 30);
@@ -47,6 +49,9 @@ export function loadConfig() {
   const eip7702GuardVerified = envBool('EIP7702_GUARD_VERIFIED', false);
 
   if (!rpcUrls.length) throw new Error('RPC_URLS must contain at least one endpoint');
+  if (!Number.isSafeInteger(rpcRequestTimeoutMs) || rpcRequestTimeoutMs < 1_000 || rpcRequestTimeoutMs > 300_000) {
+    throw new Error('RPC_REQUEST_TIMEOUT_MS must be between 1000 and 300000');
+  }
   if (!['wallet-active', 'allowlist', 'symbols'].includes(targetMode)) {
     throw new Error('TARGET_MODE must be wallet-active, allowlist, or symbols');
   }
@@ -77,6 +82,8 @@ export function loadConfig() {
   return {
     chainId: CHAIN_ID,
     rpcUrls,
+    rpcRequestTimeoutMs,
+    pointsGlobalSwapScanEnabled,
     registryAddress: getAddress(process.env.FABLES_REGISTRY?.trim() || FABLES_REGISTRY),
     usdgAddress: getAddress(process.env.USDG_ADDRESS?.trim() || USDG),
     walletAddress,

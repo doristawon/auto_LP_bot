@@ -62,6 +62,7 @@ jobs:
           REORG_LOOKBACK_BLOCKS: "64"
           MANUAL_TOPOLOGY_COOLDOWN_SEC: "120"
           FEE_LOG_FROM_BLOCK: "999999999"
+          POINTS_GLOBAL_SWAP_SCAN_ENABLED: "false"
           DATA_DIR: "./data"
           STATE_FILE: "./state/smoke-state.json"
         run: npm run once

@@ -38,6 +38,7 @@ jobs:
           OOR_DEEP_CONFIRMATIONS: "2"
           MANUAL_TOPOLOGY_COOLDOWN_SEC: "0"
           FEE_LOG_FROM_BLOCK: "999999999"
+          POINTS_GLOBAL_SWAP_SCAN_ENABLED: "false"
           SWAP_SLIPPAGE_BPS: "50"
           DEPOSIT_SLIPPAGE_BPS: "50"
           DATA_DIR: "./data"
