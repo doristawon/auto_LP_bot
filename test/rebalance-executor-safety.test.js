@@ -35,7 +35,10 @@ test('dry-run rebalance never commits cooldown/history or resets OOR state', asy
     },
     ledger: { append() {} },
     executionPaused: false,
+    market: { pools: [pool], fablesStats: { pools: new Map() } },
     config: { maxRebalancesPerHour: 3, minRebalanceIntervalSec: 300 },
+    getInvestmentTargetSettings() { return { mode: 'apr-highest', poolId: '' }; },
+    resolveInvestmentTarget(sourcePool) { return sourcePool; },
     async assertStillOutOfRangeBeforeRebalance() { return true; },
     executor: { async execute() { return { status: 'dry-run' }; } }
   };
@@ -170,7 +173,10 @@ test('bot auto-pauses when executor enters recovery_required after capital moved
     },
     ledger: { append(type, data) { events.push({ type, data }); } },
     executionPaused: false,
+    market: { pools: [pool], fablesStats: { pools: new Map() } },
     config: { maxRebalancesPerHour: 3, minRebalanceIntervalSec: 300 },
+    getInvestmentTargetSettings() { return { mode: 'apr-highest', poolId: '' }; },
+    resolveInvestmentTarget(sourcePool) { return sourcePool; },
     async assertStillOutOfRangeBeforeRebalance() { return true; },
     executor: { async execute() { throw new Error('post-withdraw failure'); } },
     setExecutionPaused(value, source) {

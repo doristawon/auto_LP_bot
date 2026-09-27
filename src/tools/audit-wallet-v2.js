@@ -15,7 +15,7 @@ import { V4QuoterAdapter } from '../adapters/quoter.js';
 import { buildUsdPriceMap } from '../analytics/prices.js';
 import { rangeAmounts } from '../analytics/liquidity.js';
 import { buildRebalanceInventoryPlan } from '../analytics/rebalance-plan.js';
-import { buildCenteredRange, isOutsideRange } from '../math/ticks.js';
+import { buildTargetRange, isOutsideRange } from '../math/ticks.js';
 import { DEPOSITED_EVENT, HOOK_ABI, WITHDRAWN_EVENT } from '../abi.js';
 import { ZERO_ADDRESS } from '../constants.js';
 
@@ -193,7 +193,7 @@ for (const position of activePositions) {
   const ilUsd = hodlUsd == null ? null : principalUsd - hodlUsd;
   const ilPct = hodlUsd > 0 && Number.isFinite(ilUsd) ? ilUsd / hodlUsd * 100 : null;
   const outside = isOutsideRange(pool.state.tick, position.tickLower, position.tickUpper, config.edgeBufferTicks);
-  const target = buildCenteredRange(pool.state.tick, pool.key.tickSpacing, config.tightWidthBps);
+  const target = buildTargetRange(pool.state.tick, pool.key.tickSpacing, config.tightWidthBps, config.rangePreset);
   let inventoryPlan = null;
   let quote = null;
   let quoteError = null;

@@ -100,3 +100,55 @@ test('minimal V4 Universal Router plan encodes reverse 1_to_0 direction', () => 
   assert.equal(settleCurrency.toLowerCase(), pool.token1.address.toLowerCase());
   assert.equal(takeCurrency.toLowerCase(), pool.token0.address.toLowerCase());
 });
+
+test('multi-hop V4 Universal Router plan encodes ordered path, exact input, and minimum output', () => {
+  const destination = {
+    id: '0x' + '33'.repeat(32),
+    key: {
+      currency0: pool.token0.address,
+      currency1: '0x00000000000000000000000000000000000000bb',
+      fee: pool.key.fee,
+      tickSpacing: pool.key.tickSpacing,
+      hooks: pool.key.hooks
+    },
+    token0: pool.token0,
+    token1: { address: '0x00000000000000000000000000000000000000bb', symbol: 'UBIK', decimals: 18 }
+  };
+  const route = [pool, destination];
+  const routeQuote = {
+    tokenIn: pool.token1.address,
+    tokenOut: destination.token1.address,
+    rawAmountIn: '500000000000000000',
+    minRawAmountOut: '123400',
+    zeroForOne: false
+  };
+  const adapter = new UniversalRouterAdapter(null, { walletAddress: '0x0000000000000000000000000000000000000001' });
+  const plan = adapter.buildV4ExactInputPath({
+    route, tokenIn: pool.token1, quote: routeQuote, deadline: 1790249999
+  });
+  assert.equal(plan.v4Actions, '0x070c0f');
+  assert.deepEqual(plan.path, route.map((item) => item.id));
+
+  const router = new Interface(UNIVERSAL_ROUTER_ABI);
+  const decoded = router.decodeFunctionData('execute', plan.data);
+  const coder = AbiCoder.defaultAbiCoder();
+  const [actions, params] = coder.decode(['bytes', 'bytes[]'], decoded[1][0]);
+  assert.equal(actions, '0x070c0f');
+  const [swapPath] = coder.decode([
+    'tuple(address,tuple(address,uint24,int24,address,bytes)[],uint256[],uint128,uint128)'
+  ], params[0]);
+  const [currencyIn, path, minHopPrices, amountIn, minAmountOut] = swapPath;
+  assert.equal(currencyIn.toLowerCase(), pool.token1.address.toLowerCase());
+  assert.equal(path.length, 2);
+  assert.equal(path[0][0].toLowerCase(), pool.token0.address.toLowerCase());
+  assert.equal(path[1][0].toLowerCase(), destination.token1.address.toLowerCase());
+  assert.equal(minHopPrices.length, 0);
+  assert.equal(BigInt(amountIn), 500000000000000000n);
+  assert.equal(BigInt(minAmountOut), 123400n);
+  const [settleCurrency, settleMax] = coder.decode(['address', 'uint256'], params[1]);
+  const [takeCurrency, takeMin] = coder.decode(['address', 'uint256'], params[2]);
+  assert.equal(settleCurrency.toLowerCase(), pool.token1.address.toLowerCase());
+  assert.equal(BigInt(settleMax), 500000000000000000n);
+  assert.equal(takeCurrency.toLowerCase(), destination.token1.address.toLowerCase());
+  assert.equal(BigInt(takeMin), 123400n);
+});

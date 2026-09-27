@@ -1,22 +1,28 @@
-import { Interface, formatUnits, id } from 'ethers';
+import fs from 'node:fs';
+import path from 'node:path';
+import { Interface, formatUnits, getAddress, id, Wallet } from 'ethers';
 import { createProviders, verifyProviders } from './rpc/providers.js';
 import { FablesAdapter, lifecycleEventType, lifecycleLiquidity } from './adapters/fables.js';
 import { RebalanceExecutor } from './adapters/executor.js';
 import { V4QuoterAdapter } from './adapters/quoter.js';
+import { fetchFablesPoolStats } from './adapters/fables-stats.js';
 import { buildUsdPriceMap } from './analytics/prices.js';
 import { spotToken1PerToken0 } from './analytics/liquidity.js';
 import { PortfolioAnalytics } from './analytics/portfolio.js';
 import { PointsTracker } from './analytics/points-tracker.js';
 import { valueSwapFeeInUsd } from './analytics/points-accounting.js';
 import { buildDepositPlan } from './analytics/rebalance-plan.js';
+import { chooseInvestmentAnchor, rankAprPools } from './execution/investment-target.js';
 import { evaluatePosition, outOfRangeExcursionPct } from './strategy.js';
 import { LedgerStore } from './ledger.js';
 import { StateStore } from './state.js';
-import { ZERO_ADDRESS } from './constants.js';
+import { normalizeRuntimeIntervals } from './config.js';
+import { persistRuntimeCredentials } from './runtime-credentials.js';
+import { DEFAULT_RPC_URL, ZERO_ADDRESS } from './constants.js';
 import { isLpOutOfRange } from './math/ticks.js';
 import { buildExactWithdrawBounds } from './math/v4-fixed.js';
 import { HOOK_ABI } from './abi.js';
-import { log } from './logger.js';
+import { log, registerSensitiveValues } from './logger.js';
 
 const hookInterface = new Interface(HOOK_ABI);
 const transferTopic = id('Transfer(address,address,uint256)').toLowerCase();
@@ -24,19 +30,49 @@ const transferTopic = id('Transfer(address,address,uint256)').toLowerCase();
 export class AutoLpBot {
   constructor(config) {
     this.config = config;
+    this.baseExecutionTarget = {
+      mode: config.targetMode,
+      poolIds: [...(config.targetPoolIds || [])],
+      symbols: [...(config.targetSymbols || [])]
+    };
+    registerSensitiveValues([...(config.rpcUrls || []), config.privateKey || '']);
+    this.baseDataDir = config.dataDir;
+    this.baseStateFile = config.stateFile;
+    this.preferenceState = new StateStore(path.join(this.baseDataDir, 'dashboard-settings.json'));
+    const savedIntervals = this.preferenceState.getSetting('runtimeIntervals', null);
+    if (savedIntervals) Object.assign(this.config, normalizeRuntimeIntervals({ ...this.getRuntimeIntervals(), ...savedIntervals }));
+    this.initialWalletAddress = config.walletAddress.toLowerCase();
+    const savedWalletDir = path.join(this.baseDataDir, 'wallets', this.initialWalletAddress);
+    const savedWalletState = path.join(savedWalletDir, 'bot-state.json');
+    if (fs.existsSync(savedWalletState)) {
+      this.config.dataDir = savedWalletDir;
+      this.config.stateFile = savedWalletState;
+    }
+    this.walletProfiles = new Map([[this.initialWalletAddress, {
+      address: config.walletAddress,
+      privateKey: config.privateKey || '',
+      type: config.privateKey ? 'environment' : 'watch-only',
+      importedAt: null
+    }]]);
+    this.walletImportState = config.walletAddress.toLowerCase() === ZERO_ADDRESS.toLowerCase()
+      ? { status: 'failed', address: config.walletAddress, error: '尚未設定有效的監控錢包地址' }
+      : { status: 'scanning', address: config.walletAddress, error: null };
     this.providers = createProviders(config);
     this.state = new StateStore(config.stateFile);
+    this.applyStoredExecutionTarget();
     this.ledger = new LedgerStore(config.dataDir);
     this.fables = new FablesAdapter(this.providers.readProvider, config);
     this.quoter = new V4QuoterAdapter(this.providers.readProvider);
     this.analytics = new PortfolioAnalytics(config, this.ledger, this.state);
     this.points = new PointsTracker(config, this.ledger, this.state);
-    this.market = { refreshedAt: 0, pools: [], prices: new Map(), latestBlock: 0 };
+    this.market = { refreshedAt: 0, pools: [], prices: new Map(), latestBlock: 0, fablesStats: null };
     this.rpcHealth = [];
-    this.executionPaused = Boolean(this.state.getSetting('executionPaused', false));
+    this.executionPaused = true;
+    this.state.setSetting('executionPaused', true);
     this.snapshot = this.ledger.readSnapshot();
     this.running = false;
     this.cycleActive = false;
+    this.pointsSimulationTimer = null;
     this.blockTimeCache = new Map();
     this.executor = new RebalanceExecutor(
       this.providers.readProvider,
@@ -101,16 +137,62 @@ export class AutoLpBot {
       && !this.cycleActive
       && !executionBusy
       && !recoveryRequired;
+    const startBlockers = [];
+    const selectedTargetPoolId = this.getSelectedExecutionTargetPoolId();
+    if (!selectedTargetPoolId) startBlockers.push('target-required');
+    else if (!this.market.pools.some((pool) => pool.id.toLowerCase() === selectedTargetPoolId)) startBlockers.push('target-unavailable');
+    const selectedPool = this.snapshot?.pools?.find((pool) => pool.id.toLowerCase() === selectedTargetPoolId);
+    const investmentMode = this.getInvestmentTargetSettings().mode;
+    const activeLp = ['apr-highest', 'specific-pool'].includes(investmentMode)
+      ? Boolean((this.snapshot?.portfolio?.positions || []).some((position) => BigInt(position.shares || 0) > 0n))
+      : Boolean(selectedPool?.positions?.some((position) => BigInt(position.shares || 0) > 0n));
+    if (!this.config.walletAddress || this.config.walletAddress.toLowerCase() === ZERO_ADDRESS.toLowerCase()) {
+      startBlockers.push('wallet-address-missing');
+    } else if (this.walletImportState.status !== 'ready') {
+      startBlockers.push(`wallet-${this.walletImportState.status || 'not-ready'}`);
+    }
+    if (!this.rpcHealth.some((item) => item.ok && Number(item.chainId) === this.config.chainId)) startBlockers.push('rpc-not-ready');
+    if (this.cycleActive) startBlockers.push('cycle-active');
+    if (recoveryRequired) startBlockers.push('recovery-required');
+    else if (executionBusy) startBlockers.push('execution-busy');
+    if (!this.config.dryRun) {
+      if (!activeLp) startBlockers.push('active-lp-required');
+      const snapshotAge = Date.now() - Number(this.snapshot?.generatedAt || 0);
+      if (snapshotAge > Math.max(120_000, this.config.pollIntervalMs * 3)) startBlockers.push('wallet-snapshot-stale');
+      if (!this.config.enableLiveWrites) startBlockers.push('live-writes-disabled');
+      if (!this.config.enableAutoRedeploy) startBlockers.push('auto-redeploy-disabled');
+      if (!signerConfigured) startBlockers.push('signer-required');
+      if (!guardConfigured || !guardVerifiedFlag || !guardRuntimeReady) startBlockers.push('guard-not-ready');
+    }
 
     return {
       generatedAt: Date.now(),
       mode: this.config.dryRun ? 'dry-run' : 'live',
+      walletAddress: this.config.walletAddress,
+      walletImportState: this.walletImportState,
+      walletProfiles: [...this.walletProfiles.values()].map((profile) => ({
+        address: profile.address,
+        type: profile.type,
+        signerConfigured: Boolean(profile.privateKey),
+        importedAt: profile.importedAt,
+        active: profile.address.toLowerCase() === this.config.walletAddress.toLowerCase()
+      })),
+      rpc: {
+        customConfigured: this.config.rpcUrls.some((url) => url !== DEFAULT_RPC_URL),
+        endpointCount: this.config.rpcUrls.length,
+        chainId: this.config.chainId
+      },
+      runtimeIntervals: this.getRuntimeIntervals(),
+      targetMode: this.config.targetMode,
+      selectedExecutionTargetPoolId: selectedTargetPoolId || null,
+      investmentTarget: this.getInvestmentTargetSnapshot(),
       dryRun: this.config.dryRun,
       liveWrites: this.config.enableLiveWrites,
       autoRedeploy: this.config.enableAutoRedeploy,
       executionPaused: this.executionPaused,
       cycleActive: this.cycleActive,
       signerConfigured,
+      credentialPersistenceEnabled: Boolean(this.config.persistRuntimeCredentials),
       guard: {
         address: this.config.eip7702GuardAddress || null,
         configured: guardConfigured,
@@ -123,6 +205,7 @@ export class AutoLpBot {
       executionBusy,
       topologyCooldownUntil,
       liveReady,
+      startReadiness: { ready: startBlockers.length === 0, blockers: startBlockers },
       limits: {
         maxGasGwei: this.config.maxGasGwei,
         withdrawSlippageBps: this.config.withdrawSlippageBps,
@@ -134,9 +217,395 @@ export class AutoLpBot {
       strategy: {
         absoluteInRangeHold: true,
         tightWidthBps: this.config.tightWidthBps,
+        rangePreset: this.config.rangePreset,
         ...rangePolicySnapshot(this.config)
       }
     };
+  }
+
+  getRuntimeIntervals() {
+    return {
+      marketRefreshMs: this.config.marketRefreshMs,
+      rangeCheckIntervalMs: this.config.rangeCheckIntervalMs,
+      pointsSimulationIntervalMs: this.config.pointsSimulationIntervalMs
+    };
+  }
+
+  setRuntimeIntervals(values = {}) {
+    const previous = this.getRuntimeIntervals();
+    const intervals = normalizeRuntimeIntervals({ ...this.getRuntimeIntervals(), ...values });
+    Object.assign(this.config, intervals);
+    this.preferenceState.setSetting('runtimeIntervals', intervals);
+    if (intervals.marketRefreshMs !== previous.marketRefreshMs) this.market.refreshedAt = 0;
+    if (intervals.pointsSimulationIntervalMs !== previous.pointsSimulationIntervalMs) {
+      this.points?.invalidate();
+      this.updatePointsSnapshot(true);
+      this.schedulePointsSimulation();
+    }
+    log('info', 'dashboard.intervals_updated', intervals);
+    return intervals;
+  }
+
+  updatePointsSnapshot(force = false) {
+    const points = this.points.snapshot({ force });
+    if (this.snapshot) {
+      this.snapshot = { ...this.snapshot, points };
+      this.ledger.writeSnapshot(this.snapshot);
+    }
+    return points;
+  }
+
+  schedulePointsSimulation() {
+    if (this.pointsSimulationTimer) clearTimeout(this.pointsSimulationTimer);
+    this.pointsSimulationTimer = null;
+    if (!this.running) return;
+    this.pointsSimulationTimer = setTimeout(async () => {
+      this.pointsSimulationTimer = null;
+      if (!this.running) return;
+      try {
+        const tracker = this.points;
+        await tracker.refreshEvidence({
+          address: this.config.walletAddress,
+          provider: this.providers.readProvider,
+          pools: this.market.pools,
+          prices: this.market.prices
+        });
+        if (this.running && tracker === this.points) this.updatePointsSnapshot(true);
+      }
+      catch (error) { log('warn', 'points.simulation_failed', { error: error.message }); }
+      this.schedulePointsSimulation();
+    }, this.config.pointsSimulationIntervalMs);
+    this.pointsSimulationTimer.unref?.();
+  }
+
+  async setRpcEndpoint(value) {
+    if (this.cycleActive) throw new Error('Wait for the current monitor cycle before changing RPC');
+    const endpoint = String(value || '').trim();
+    if (endpoint.length > 2048) throw new Error('RPC endpoint is too long');
+    let parsed;
+    try { parsed = new URL(endpoint); }
+    catch { throw new Error('Enter a valid Robinhood Chain RPC URL'); }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+      throw new Error('RPC must use HTTP(S) and must not include URL username or password');
+    }
+
+    const urls = endpoint === DEFAULT_RPC_URL ? [endpoint] : [endpoint, DEFAULT_RPC_URL];
+    const nextProviders = createProviders({ ...this.config, rpcUrls: urls });
+    const health = await verifyProviders(nextProviders.rawProviders, this.config.chainId);
+    if (!health[0]?.ok || health[0].chainId !== this.config.chainId) {
+      throw new Error('RPC endpoint did not verify as Robinhood Chain (chain ID 4663)');
+    }
+
+    persistRuntimeCredentials({
+      rpcUrls: urls,
+      walletAddress: this.config.walletAddress,
+      privateKey: this.config.privateKey
+    }, { enabled: this.config.persistRuntimeCredentials });
+
+    this.config.rpcUrls = urls;
+    registerSensitiveValues([...urls, ...[...this.walletProfiles.values()].map((profile) => profile.privateKey)]);
+    this.providers = nextProviders;
+    this.rpcHealth = health;
+    this.fables = new FablesAdapter(this.providers.readProvider, this.config);
+    this.quoter = new V4QuoterAdapter(this.providers.readProvider);
+    this.executor = this.createExecutor();
+    this.market.refreshedAt = 0;
+    await this.refreshMarket(true);
+    return { ok: true, chainId: this.config.chainId, endpointCount: urls.length };
+  }
+
+  async mountWallet(addressValue, privateKey, type) {
+    if (this.cycleActive) throw new Error('Wait for the current monitor cycle before mounting another wallet');
+    const activeExecution = this.state.getSetting('activeRebalanceExecution', null);
+    if (activeExecution?.phase && !new Set(['completed', 'failed']).has(activeExecution.phase)) {
+      throw new Error('Resolve the active wallet recovery journal before switching wallets');
+    }
+
+    let address;
+    try { address = getAddress(addressValue); }
+    catch { throw new Error('Wallet address did not validate'); }
+    if (address.toLowerCase() === ZERO_ADDRESS.toLowerCase()) {
+      throw new Error('Zero address cannot be used as a monitoring wallet');
+    }
+    let normalizedKey = '';
+    if (privateKey) {
+      try {
+        const signer = new Wallet(privateKey);
+        if (signer.address.toLowerCase() !== address.toLowerCase()) {
+          throw new Error('address mismatch');
+        }
+        normalizedKey = signer.privateKey;
+      } catch {
+        throw new Error('Wallet signer did not validate for this address');
+      }
+    }
+
+    const profile = {
+      address,
+      privateKey: normalizedKey,
+      type,
+      importedAt: Date.now()
+    };
+    persistRuntimeCredentials({
+      rpcUrls: this.config.rpcUrls,
+      walletAddress: profile.address,
+      privateKey: profile.privateKey
+    }, { enabled: this.config.persistRuntimeCredentials });
+    this.walletProfiles.set(address.toLowerCase(), profile);
+    registerSensitiveValues([
+      ...(this.config.rpcUrls || []),
+      ...[...this.walletProfiles.values()].map((item) => item.privateKey)
+    ]);
+    this.activateWalletProfile(profile);
+    return { ok: true, address, status: this.walletImportState.status };
+  }
+
+  switchWallet(addressValue) {
+    if (this.cycleActive) throw new Error('Wait for the current monitor cycle before switching wallets');
+    const profile = this.walletProfiles.get(String(addressValue || '').toLowerCase());
+    if (!profile) throw new Error('Wallet is not mounted in this session');
+    persistRuntimeCredentials({
+      rpcUrls: this.config.rpcUrls,
+      walletAddress: profile.address,
+      privateKey: profile.privateKey
+    }, { enabled: this.config.persistRuntimeCredentials });
+    this.activateWalletProfile(profile);
+    return { ok: true, address: profile.address, status: this.walletImportState.status };
+  }
+
+  setWatchedPool(poolId, watch) {
+    const normalized = String(poolId || '').toLowerCase();
+    if (!/^0x[0-9a-f]{64}$/.test(normalized)) throw new Error('Invalid pool ID');
+    if (!this.market.pools.some((pool) => pool.id.toLowerCase() === normalized)) {
+      throw new Error('Pool is not present in the current Fables registry');
+    }
+    const ids = new Set((this.state.getSetting('watchedPoolIds', []) || []).map((id) => String(id).toLowerCase()));
+    if (watch) ids.add(normalized);
+    else ids.delete(normalized);
+    this.state.setSetting('watchedPoolIds', [...ids].sort());
+    return [...ids];
+  }
+
+  getSelectedExecutionTargetPoolId() {
+    return String(this.state?.getSetting('selectedExecutionTargetPoolId', '') || '').toLowerCase();
+  }
+
+  getInvestmentTargetSettings() {
+    return {
+      mode: String(this.state?.getSetting('investmentTargetMode', 'apr-highest') || 'apr-highest'),
+      poolId: String(
+        this.state?.getSetting('investmentTargetPoolId', this.getSelectedExecutionTargetPoolId())
+        || this.getSelectedExecutionTargetPoolId()
+      ).toLowerCase()
+    };
+  }
+
+  getInvestmentTargetSnapshot() {
+    const settings = this.getInvestmentTargetSettings();
+    const ranked = settings.mode === 'apr-highest'
+      ? rankAprPools({
+        pools: this.market.pools,
+        stats: this.market.fablesStats,
+        nowMs: Date.now(),
+        maxStatsAgeMs: Math.max(5 * 60 * 1000, this.config.marketRefreshMs * 3),
+        minTvlUsd: this.config.aprPoolMinTvlUsd
+      })
+      : [];
+    const currentPosition = (this.snapshot?.portfolio?.positions || []).find((position) => Number(position.shares) > 0);
+    const sourcePool = currentPosition
+      ? this.market.pools.find((pool) => pool.id.toLowerCase() === String(currentPosition.poolId).toLowerCase())
+      : null;
+    const aprSelected = ranked.find(({ pool }) => {
+      if (!sourcePool) return true;
+      try {
+        chooseInvestmentAnchor(
+          [sourcePool.token0, sourcePool.token1, pool.token0, pool.token1],
+          pool,
+          this.market.pools
+        );
+        return true;
+      } catch { return false; }
+    })?.pool;
+    const selected = settings.mode === 'specific-pool'
+      ? this.market.pools.find((pool) => pool.id.toLowerCase() === settings.poolId)
+      : aprSelected;
+    const stats = selected && this.market.fablesStats?.pools?.get(selected.id.toLowerCase());
+    return {
+      mode: settings.mode,
+      poolId: selected?.id || (settings.mode === 'specific-pool' ? settings.poolId : null),
+      specificPoolId: settings.poolId || null,
+      pair: selected ? selected.token0.symbol + '/' + selected.token1.symbol : null,
+      aprPct: stats?.aprPct ?? null,
+      tvlUsd: stats?.tvlUsd ?? null,
+      statsObservedAt: this.market.fablesStats?.observedAt ?? null,
+      minTvlUsd: this.config.aprPoolMinTvlUsd
+    };
+  }
+
+  resolveInvestmentTarget(sourcePool) {
+    const settings = this.getInvestmentTargetSettings();
+    if (settings.mode === 'specific-pool') {
+      const selected = this.market.pools.find((pool) => pool.id.toLowerCase() === settings.poolId);
+      if (!selected) throw new Error('指定的再投入池不在目前 Fables 登錄清單內');
+      if (selected.state?.paused !== false || BigInt(selected.state?.liquidity || 0) <= 0n) {
+        throw new Error('指定的再投入池已暫停或沒有可用流動性');
+      }
+      chooseInvestmentAnchor(
+        [sourcePool.token0, sourcePool.token1, selected.token0, selected.token1],
+        selected,
+        this.market.pools
+      );
+      return selected;
+    }
+    if (settings.mode !== 'apr-highest') throw new Error('未知的再投入模式');
+    const ranked = rankAprPools({
+      pools: this.market.pools,
+      stats: this.market.fablesStats,
+      nowMs: Date.now(),
+      maxStatsAgeMs: Math.max(5 * 60 * 1000, this.config.marketRefreshMs * 3),
+      minTvlUsd: this.config.aprPoolMinTvlUsd
+    });
+    for (const candidate of ranked) {
+      try {
+        chooseInvestmentAnchor(
+          [sourcePool.token0, sourcePool.token1, candidate.pool.token0, candidate.pool.token1],
+          candidate.pool,
+          this.market.pools
+        );
+        return candidate.pool;
+      } catch {}
+    }
+    throw new Error('沒有 APR 資料新鮮、TVL 達標且資產兌換路徑可用的 Fables 池；保留原 LP');
+  }
+
+  applyStoredExecutionTarget() {
+    const selectedPoolId = this.getSelectedExecutionTargetPoolId();
+    if (selectedPoolId && !/^0x[0-9a-f]{64}$/.test(selectedPoolId)) {
+      throw new Error('Stored execution target pool is invalid; refusing to start');
+    }
+    const investmentMode = String(this.state?.getSetting('investmentTargetMode', 'apr-highest') || 'apr-highest');
+    if (['apr-highest', 'specific-pool'].includes(investmentMode)) {
+      this.config.targetMode = 'wallet-active';
+      this.config.targetPoolIds = [];
+      this.config.targetSymbols = [];
+      return;
+    }
+    this.config.targetMode = selectedPoolId ? 'allowlist' : this.baseExecutionTarget.mode;
+    this.config.targetPoolIds = selectedPoolId ? [selectedPoolId] : [...this.baseExecutionTarget.poolIds];
+    this.config.targetSymbols = selectedPoolId ? [] : [...this.baseExecutionTarget.symbols];
+  }
+
+  setInvestmentTarget(mode, poolId = '') {
+    if (this.cycleActive) throw new Error('Wait for the current monitor cycle before changing the investment target');
+    const normalizedMode = String(mode || '').trim().toLowerCase();
+    if (!['apr-highest', 'specific-pool'].includes(normalizedMode)) {
+      throw new Error('再投入模式只能是最高 APR 或指定池');
+    }
+    const normalizedPoolId = String(poolId || '').trim().toLowerCase();
+    let pool = null;
+    if (normalizedMode === 'specific-pool') {
+      if (!/^0x[0-9a-f]{64}$/.test(normalizedPoolId)) throw new Error('請從清單選擇指定再投入池');
+      pool = this.market.pools.find((item) => item.id.toLowerCase() === normalizedPoolId) || null;
+      if (!pool) throw new Error('指定的再投入池不在目前 Fables 登錄清單內');
+      if (pool.state?.paused !== false || BigInt(pool.state?.liquidity || 0) <= 0n) {
+        throw new Error('指定池已暫停或目前沒有流動性，不能作為再投入目標');
+      }
+    }
+    this.state.setSetting('investmentTargetMode', normalizedMode);
+    if (pool) this.state.setSetting('investmentTargetPoolId', normalizedPoolId);
+    this.applyStoredExecutionTarget();
+    const target = this.getInvestmentTargetSnapshot();
+    this.ledger.append('investment.target_updated', {
+      mode: normalizedMode,
+      poolId: normalizedMode === 'specific-pool' ? normalizedPoolId : null,
+      pair: pool ? pool.token0.symbol + '/' + pool.token1.symbol : null
+    });
+    return target;
+  }
+
+  setExecutionTargetPool(poolId = '') {
+    if (this.cycleActive) throw new Error('Wait for the current monitor cycle before changing the execution target');
+    const normalized = String(poolId || '').trim().toLowerCase();
+    if (normalized && !/^0x[0-9a-f]{64}$/.test(normalized)) throw new Error('Invalid pool ID');
+    const pool = normalized ? this.market.pools.find((item) => item.id.toLowerCase() === normalized) : null;
+    if (normalized && !pool) throw new Error('Pool is not present in the current Fables registry');
+
+    this.state.setSetting('selectedExecutionTargetPoolId', normalized);
+    this.applyStoredExecutionTarget();
+    log('info', 'dashboard.execution_target_updated', {
+      poolId: normalized || null,
+      pair: pool ? `${pool.token0.symbol}/${pool.token1.symbol}` : null,
+      targetMode: this.config.targetMode
+    });
+    return {
+      poolId: normalized || null,
+      pair: pool ? `${pool.token0.symbol}/${pool.token1.symbol}` : null,
+      targetMode: this.config.targetMode
+    };
+  }
+
+  async startExecution(source = 'dashboard') {
+    const status = await this.controlStatus();
+    if (!status.startReadiness.ready) {
+      return { ok: false, blockers: status.startReadiness.blockers };
+    }
+    this.setExecutionPaused(false, source);
+    return { ok: true, executionPaused: false, mode: status.mode };
+  }
+
+  activateWalletProfile(profile) {
+    this.config.walletAddress = profile.address;
+    this.config.privateKey = profile.privateKey || '';
+    this.config.dryRun = true;
+    this.config.enableLiveWrites = false;
+    this.config.enableAutoRedeploy = false;
+    this.executionPaused = true;
+
+    const lowerAddress = profile.address.toLowerCase();
+    const walletDir = path.join(this.baseDataDir, 'wallets', lowerAddress);
+    if (lowerAddress === this.initialWalletAddress && !fs.existsSync(path.join(walletDir, 'bot-state.json'))) {
+      this.config.dataDir = this.baseDataDir;
+      this.config.stateFile = this.baseStateFile;
+    } else {
+      this.config.dataDir = walletDir;
+      this.config.stateFile = path.join(walletDir, 'bot-state.json');
+    }
+    this.state = new StateStore(this.config.stateFile);
+    this.applyStoredExecutionTarget();
+    this.ledger = new LedgerStore(this.config.dataDir);
+    this.analytics = new PortfolioAnalytics(this.config, this.ledger, this.state);
+    this.points = new PointsTracker(this.config, this.ledger, this.state);
+    this.state.setSetting('executionPaused', true);
+    this.fables.positionCandidates.clear();
+    this.market.refreshedAt = 0;
+    this.snapshot = this.ledger.readSnapshot();
+    this.walletImportState = { status: 'scanning', address: profile.address, error: null };
+    this.executor = this.createExecutor();
+
+    const address = profile.address.toLowerCase();
+    void this.runOnce({ executeRebalances: false, source: 'wallet-import' })
+      .then(() => {
+        if (this.config.walletAddress.toLowerCase() === address) {
+          this.walletImportState = { status: 'ready', address: profile.address, error: null };
+        }
+      })
+      .catch(() => {
+        if (this.config.walletAddress.toLowerCase() === address) {
+          this.walletImportState = { status: 'failed', address: profile.address, error: 'Initial scan failed; check RPC health and logs' };
+        }
+      });
+  }
+
+  createExecutor() {
+    return new RebalanceExecutor(
+      this.providers.readProvider,
+      this.providers.writeProvider,
+      this.config,
+      this.fables,
+      this.ledger,
+      (address) => this.market.prices.get(String(address).toLowerCase()) || 0,
+      this.state
+    );
   }
 
   async manualRebalance(poolId, positionId, source = 'dashboard') {
@@ -187,8 +656,12 @@ export class AutoLpBot {
     const discovered = await this.fables.discoverAllPools();
     const pools = await this.fables.hydratePoolStates(discovered);
     const prices = buildUsdPriceMap(pools, this.config.usdgAddress);
-    this.market = { refreshedAt: Date.now(), pools, prices, latestBlock };
+    let fablesStats = null;
+    try { fablesStats = await fetchFablesPoolStats(); }
+    catch (error) { log('warn', 'fables.stats_unavailable', { error: error.message }); }
+    this.market = { refreshedAt: Date.now(), pools, prices, latestBlock, fablesStats };
     await this.scanGlobalPointFees(pools, latestBlock);
+    await this.scanGlobalPoolFees(pools, latestBlock);
     log('info', 'market.refreshed', {
       block: latestBlock,
       pools: pools.length,
@@ -233,6 +706,13 @@ export class AutoLpBot {
       for (const pool of accountingPools) {
         pool.state = await this.fables.readPoolState(pool);
         const cursorKey = `positionLogs:${pool.id}`;
+        const candidatesKey = `positionCandidates:${pool.id}`;
+        const knownCandidates = this.state.getSetting(candidatesKey, []) || [];
+        const candidates = this.fables.positionCandidates.get(pool.id) || new Set(this.config.positionIds);
+        for (const id of knownCandidates) {
+          if (/^0x[0-9a-f]{64}$/i.test(String(id))) candidates.add(String(id).toLowerCase());
+        }
+        this.fables.positionCandidates.set(pool.id, candidates);
         const fallbackCursor = this.config.targetMode === 'wallet-active'
           ? Math.max(this.config.logFromBlock, latestBlock - this.config.reorgLookbackBlocks)
           : this.config.logFromBlock;
@@ -240,6 +720,7 @@ export class AutoLpBot {
         const fromBlock = Math.max(this.config.logFromBlock, previousCursor - this.config.reorgLookbackBlocks);
         const result = await this.fables.discoverPositions(pool, fromBlock, latestBlock);
         pool.positions = result.positions;
+        this.state.setSetting(candidatesKey, [...this.fables.positionCandidates.get(pool.id)].sort());
         await this.recordLifecycleLogs(pool, result.lifecycleLogs);
         this.state.setCursor(cursorKey, latestBlock + 1);
         for (const position of pool.positions) {
@@ -258,20 +739,32 @@ export class AutoLpBot {
       });
       await this.attachRebalanceQuotes(targetPools, portfolio);
       const points = this.points.snapshot();
+      if (this.config.walletAddress.toLowerCase() !== ZERO_ADDRESS.toLowerCase()) {
+        this.walletImportState = { status: 'ready', address: this.config.walletAddress, error: null };
+      }
       const snapshot = {
         generatedAt: Date.now(),
         blockNumber: latestBlock,
+        markets: this.market.pools.map((pool) => snapshotMarket(
+          pool,
+          this.market.fablesStats?.pools?.get(pool.id) || null,
+          new Set((this.state.getSetting('watchedPoolIds', []) || []).map((id) => String(id).toLowerCase())).has(pool.id.toLowerCase()),
+          this.market.fablesStats
+        )),
         bot: {
-          version: '0.5.1',
+          version: '0.6.0',
           wallet: this.config.walletAddress,
+          walletImportState: this.walletImportState,
           dryRun: this.config.dryRun,
           liveWrites: this.config.enableLiveWrites,
           autoRedeploy: this.config.enableAutoRedeploy,
           executionPaused: this.executionPaused,
           lastAction: this.state.getSetting('lastAction', null),
           targetMode: this.config.targetMode,
+          investmentTarget: this.getInvestmentTargetSnapshot(),
           activePoolIds: targetPools.map((pool) => pool.id),
           accountingPoolIds: accountingPools.map((pool) => pool.id),
+          watchedPoolIds: this.state.getSetting('watchedPoolIds', []) || [],
           topologyCooldownUntil: this.state.getSetting('walletTopologyCooldownUntil', 0),
           targetSymbols: this.config.targetSymbols,
           swapSlippageBps: this.config.swapSlippageBps,
@@ -313,6 +806,9 @@ export class AutoLpBot {
     if (this.config.targetMode !== 'wallet-active') {
       const pools = this.fables.targetPools(this.market.pools);
       return { pools, accountingPools: pools, discovery: null };
+    }
+    if (this.config.walletAddress.toLowerCase() === ZERO_ADDRESS.toLowerCase()) {
+      return { pools: [], accountingPools: [], discovery: null };
     }
 
     const cursorKey = 'walletPoolDiscovery';
@@ -494,6 +990,7 @@ export class AutoLpBot {
       tickSpacing: pool.key.tickSpacing,
       position,
       widthBps: this.config.tightWidthBps,
+      rangePreset: this.config.rangePreset,
       edgeBufferTicks: this.config.edgeBufferTicks,
       lastEvaluationAt: Number(stored.lastRangeEvaluationAt || 0),
       outOfRangeSince: Number(stored.outOfRangeSince || 0),
@@ -653,8 +1150,28 @@ export class AutoLpBot {
       this.ledger.append('rebalance.blocked', { positionId: position.id, reason: 'hourly rate limit', source });
       return { status: 'blocked', reason: 'hourly-rate-limit' };
     }
+    let destinationPool;
+    try {
+      destinationPool = this.resolveInvestmentTarget(pool);
+    } catch (error) {
+      this.ledger.append('rebalance.blocked', {
+        positionId: position.id,
+        poolId: pool.id,
+        reason: 'investment target unavailable',
+        error: error.message
+      });
+      return { status: 'blocked', reason: 'investment-target-unavailable', error: error.message };
+    }
     const plan = {
       pool,
+      destinationPool,
+      destinationStats: this.market.fablesStats?.pools?.get(destinationPool.id.toLowerCase()) || null,
+      destinationStatsObservedAt: this.market.fablesStats?.observedAt ?? 0,
+      routingPools: this.market.pools,
+      routingTokens: String(destinationPool.id).toLowerCase() === String(pool.id).toLowerCase()
+        ? []
+        : uniqueTargetTokens(this.market.pools, { excludeNative: true }),
+      investmentTargetMode: this.getInvestmentTargetSettings().mode,
       position,
       currentTick: pool.state.tick,
       target: position.target,
@@ -697,11 +1214,13 @@ export class AutoLpBot {
       });
       this.state.recordRebalance({
         ts: Date.now(), positionId: position.id, poolId: pool.id, result: result.status,
+        destinationPoolId: destinationPool.id,
         currentTick: pool.state.tick, target: position.target
       });
       this.state.setSetting(
         'lastAction',
-        `completed ${pool.token0.symbol}/${pool.token1.symbol} ${position.id.slice(0, 10)}…`
+        'completed ' + pool.token0.symbol + '/' + pool.token1.symbol
+          + ' → ' + destinationPool.token0.symbol + '/' + destinationPool.token1.symbol
       );
       return result;
     } catch (error) {
@@ -1210,10 +1729,17 @@ export class AutoLpBot {
     if (this.running) return;
     this.running = true;
     await this.initialize();
+    this.walletImportState = this.config.walletAddress.toLowerCase() === ZERO_ADDRESS.toLowerCase()
+      ? { status: 'failed', address: this.config.walletAddress, error: '尚未設定有效的監控錢包地址' }
+      : { status: 'scanning', address: this.config.walletAddress, error: null };
+    this.schedulePointsSimulation();
     while (this.running) {
       const started = Date.now();
       try { await this.runOnce(); }
       catch (error) {
+        if (this.walletImportState.status === 'scanning') {
+          this.walletImportState = { status: 'failed', address: this.config.walletAddress, error: 'Initial scan failed; check RPC health and logs' };
+        }
         this.ledger.append('cycle.failed', { error: error.message });
         log('error', 'cycle.failed', { error: error.stack || error.message });
       }
@@ -1222,14 +1748,21 @@ export class AutoLpBot {
     }
   }
 
-  stop() { this.running = false; }
+  stop() {
+    this.running = false;
+    if (this.pointsSimulationTimer) clearTimeout(this.pointsSimulationTimer);
+    this.pointsSimulationTimer = null;
+  }
 }
 
-function uniqueTargetTokens(pools) {
+function uniqueTargetTokens(pools, { excludeNative = false } = {}) {
   const map = new Map();
   for (const pool of pools) {
-    map.set(pool.token0.address.toLowerCase(), pool.token0);
-    map.set(pool.token1.address.toLowerCase(), pool.token1);
+    for (const token of [pool.token0, pool.token1]) {
+      const address = token.address.toLowerCase();
+      if (excludeNative && address === ZERO_ADDRESS.toLowerCase()) continue;
+      map.set(address, token);
+    }
   }
   return [...map.values()];
 }
@@ -1254,6 +1787,23 @@ function snapshotPool(pool) {
     }))
   };
 }
+function snapshotMarket(pool, stats, watched, fablesStats) {
+  return {
+    id: pool.id,
+    pair: pool.token0.symbol + '/' + pool.token1.symbol,
+    token0: pool.token0.symbol,
+    token1: pool.token1.symbol,
+    tick: pool.state?.tick ?? null,
+    paused: pool.state?.paused ?? null,
+    watched,
+    tvlUsd: stats?.tvlUsd ?? null,
+    volume24hUsd: stats?.volume24hUsd ?? null,
+    fees24hUsd: stats?.fees24hUsd ?? null,
+    aprPct: stats?.aprPct ?? null,
+    statsObservedAt: fablesStats?.observedAt ?? null,
+    statsSource: fablesStats?.source ?? null
+  };
+}
 function positionStateKey(pool, position) {
   return `${pool.id.toLowerCase()}:${position.id.toLowerCase()}`;
 }
@@ -1262,6 +1812,7 @@ function sameStringArray(a, b) {
 }
 function rangePolicySnapshot(config) {
   return {
+    rangePreset: config.rangePreset,
     evaluationIntervalMs: config.rangeCheckIntervalMs,
     shallowThresholdPct: config.oorShallowThresholdPct,
     maxWaitMin: config.oorMaxWaitMin,

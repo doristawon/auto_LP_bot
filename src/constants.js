@@ -1,6 +1,7 @@
 export const CHAIN_ID = 4663;
 export const CHAIN_NAME = 'robinhood';
 export const DEFAULT_RPC_URL = 'https://rpc.mainnet.chain.robinhood.com';
+export const FABLES_STATS_URL = 'https://www.fables.fi/api/gw/';
 export const FABLES_REGISTRY = '0x159A113E012593D9B3cC63ad45E30F0467e13Ef3';
 export const USDG = '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168';
 export const UNISWAP_V4_QUOTER = '0x8dc178efb8111bb0973dd9d722ebeff267c98f94';
@@ -13,5 +14,5 @@ export const MIN_TICK = -887272;
 export const MAX_TICK = 887272;
 export const FABLES_POINTS_START_MS = Date.parse('2026-08-24T02:00:00Z');
 export const FABLES_POINTS_END_MS = Date.parse('2026-10-05T02:00:00Z');
-export const FABLES_LP_POINTS_TOTAL = 900_000_000;
+export const FABLES_LP_POINTS_TOTAL = 1_000_000_000;
 export const FABLES_WEEKLY_POINT_WEIGHTS = [0.08, 0.115, 0.15, 0.185, 0.22, 0.25];

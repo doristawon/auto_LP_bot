@@ -30,9 +30,9 @@ Dashboard 顯示 `DRY RUN`、`MANUAL SAFE-OFF` 為正常安全狀態。
 Production policy：
 
 ```env
-RANGE_CHECK_INTERVAL_MS=900000
+RANGE_CHECK_INTERVAL_MS=300000
 OOR_SHALLOW_THRESHOLD_PCT=0.5
-OOR_MAX_WAIT_MIN=90
+OOR_MAX_WAIT_MIN=30
 OOR_DEEP_CONFIRMATIONS=2
 ```
 
@@ -173,7 +173,7 @@ Dashboard `Pause new execution`：
 即使進入 unattended live，也保留：
 
 - Absolute In-Range Hold
-- 15m / 0.5% / 90m / 2-confirm policy
+- 5m / 0.5% / 30m / 2-confirm policy
 - topology cooldown / revalidation
 - max gas
 - withdraw / swap / deposit slippage

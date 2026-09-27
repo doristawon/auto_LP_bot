@@ -1,11 +1,13 @@
 import {
   POINTS_DAY_MS,
+  dailyPointBudget,
   estimateDailyPoints,
   latestCompletedPointsBoundaryMs,
   pointsBoundaryAtOrBefore,
   pointsCampaignDayKey,
   pointsCampaignDayStartMs
 } from './points.js';
+import { fetchOfficialPoints, fetchWalletFeeEvidence } from './points-evidence.js';
 import {
   FABLES_POINTS_END_MS,
   FABLES_POINTS_START_MS
@@ -13,12 +15,19 @@ import {
 
 const USER_FEE_TYPES = new Set(['fee.accrual', 'points.user_fee_adjustment']);
 const GLOBAL_FEE_TYPE = 'points.global_swap_fee';
+const EVIDENCE_REFRESH_MS = 60_000;
 
 export class PointsTracker {
   constructor(config, ledger, state) {
     this.config = config;
     this.ledger = ledger;
     this.state = state;
+    this.lastEvidenceAttemptAt = 0;
+    this.evidencePromise = null;
+    this.walletEvidence = null;
+    this.evidenceError = null;
+    this.cachedSnapshot = null;
+    this.lastSimulationAt = 0;
 
     if (this.state.getSetting('actualPointsBaseline', null) == null && config.actualPointsBaseline > 0) {
       const rawAt = config.actualPointsBaselineAt
@@ -53,6 +62,7 @@ export class PointsTracker {
   noteUserTrackingStarted(at = Date.now()) {
     const current = this.state.getSetting('pointsUserTrackingStartedAtV2', null);
     if (current == null) this.state.setSetting('pointsUserTrackingStartedAtV2', Number(at));
+    this.invalidate();
   }
 
   markUserCoverageBroken(at = Date.now(), reason = 'unknown', detail = {}) {
@@ -65,6 +75,7 @@ export class PointsTracker {
     const item = { at: brokenAt, reason, ...detail };
     this.state.setSetting('pointsUserCoverageBrokenV2', item);
     this.ledger.append('points.user_coverage_broken', item, brokenAt);
+    this.invalidate();
     return item;
   }
 
@@ -88,7 +99,7 @@ export class PointsTracker {
 
     let reconciliation = null;
     if (previousPoints > 0 && Number.isFinite(previousAtMs) && atMs > previousAtMs && value >= previousPoints) {
-      const before = this.snapshot(atMs);
+      const before = this.snapshot({ atMs, force: true });
       const rows = Object.values(before.buckets || {}).filter((bucket) =>
         bucket.timestampMs >= previousAtMs && bucket.endMs <= atMs
       );
@@ -127,10 +138,121 @@ export class PointsTracker {
       requestedAt: at ? String(at) : null,
       campaignBoundaryNormalized: true
     }, atMs);
+    this.invalidate();
     return { points: value, at: iso, reconciliation };
   }
 
+  invalidate() {
+    this.cachedSnapshot = null;
+  }
+
+  async refreshEvidence({ address, provider, pools, prices, force = false }) {
+    if (!address || !provider || !pools?.length || !prices?.size) return;
+    if (this.evidencePromise) return this.evidencePromise;
+    if (!force && Date.now() - this.lastEvidenceAttemptAt < EVIDENCE_REFRESH_MS) return;
+    this.lastEvidenceAttemptAt = Date.now();
+    this.evidencePromise = this.fetchAndApplyEvidence({ address, provider, pools, prices });
+    try { return await this.evidencePromise; }
+    finally { this.evidencePromise = null; }
+  }
+
+  async fetchAndApplyEvidence(context) {
+    const [officialResult, walletResult] = await Promise.allSettled([
+      fetchOfficialPoints(context.address),
+      fetchWalletFeeEvidence(context)
+    ]);
+    if (walletResult.status === 'fulfilled') {
+      const evidence = walletResult.value;
+      const localHashes = new Set(this.ledger.all()
+        .filter((event) => ['lp.deposit', 'lp.withdraw', 'tx.confirmed'].includes(event.type))
+        .map((event) => String(event.hash || '').toLowerCase()));
+      evidence.localTxCount = evidence.transactionHashes.length;
+      evidence.localTxMatched = evidence.transactionHashes.filter((hash) => localHashes.has(hash)).length;
+      delete evidence.transactionHashes;
+      this.walletEvidence = evidence;
+    }
+    if (officialResult.status === 'fulfilled') {
+      this.applyOfficialSettlement(officialResult.value, walletResult.status === 'fulfilled' ? walletResult.value : null);
+    }
+    this.evidenceError = [officialResult, walletResult]
+      .filter((result) => result.status === 'rejected')
+      .map((result) => result.reason?.message || 'points evidence unavailable').join('; ') || null;
+    this.invalidate();
+    return this.evidenceError ? { ok: false, error: this.evidenceError } : { ok: true };
+  }
+
+  applyOfficialSettlement(official, walletEvidence) {
+    const prior = this.state.getSetting('pointsOfficial', null);
+    const priorForWallet = prior?.wallet === official.wallet ? prior : null;
+    if (priorForWallet && Number(priorForWallet.settledAt) > official.settledAt) return;
+
+    const totalPoints = Number(official.lpPoints || 0) + Number(official.referralPoints || 0);
+    const settlementChanged = !priorForWallet
+      || Number(priorForWallet.settledAt) !== Number(official.settledAt)
+      || Number(priorForWallet.lpPoints || 0) !== Number(official.lpPoints || 0)
+      || Number(priorForWallet.referralPoints || 0) !== Number(official.referralPoints || 0);
+    if (settlementChanged) {
+      if (prior && prior.wallet !== official.wallet) {
+        this.state.setSetting('actualPointsBaseline', 0);
+        this.state.setSetting('actualPointsBaselineAt', null);
+        this.state.setSetting('pointsLastReconciliation', null);
+      }
+      this.setActualBaseline(totalPoints, new Date(official.settledAt).toISOString());
+    }
+
+    if (priorForWallet && Number(priorForWallet.settledAt) < official.settledAt) {
+      const addedPoints = Number(official.lpPoints || 0) - Number(priorForWallet.lpPoints || 0);
+      const addedFees = Number(official.settledFeesUsd || 0) - Number(priorForWallet.settledFeesUsd || 0);
+      if (addedPoints >= 0 && addedFees > 0.005) {
+        this.state.setSetting('pointsCalibration', {
+          wallet: official.wallet,
+          pointsPerFeeUsd: addedPoints / addedFees,
+          feeUsd: addedFees,
+          points: addedPoints,
+          programmeDayEnd: official.settledAt,
+          source: 'consecutive-official-settlements'
+        });
+      }
+    } else if (!priorForWallet && walletEvidence?.firstDepositAt != null
+      && walletEvidence.firstDepositAt >= official.settledAt - POINTS_DAY_MS
+      && walletEvidence.firstDepositAt < official.settledAt
+      && Number(official.lpPoints) > 0 && Number(official.settledFeesUsd) > 0.005) {
+      this.state.setSetting('pointsCalibration', {
+        wallet: official.wallet,
+        pointsPerFeeUsd: Number(official.lpPoints) / Number(official.settledFeesUsd),
+        feeUsd: Number(official.settledFeesUsd),
+        points: Number(official.lpPoints),
+        programmeDayEnd: official.settledAt,
+        source: 'first-wallet-lp-day'
+      });
+    }
+
+    if (settlementChanged || !priorForWallet || priorForWallet.settledFeesUsd !== official.settledFeesUsd) {
+      this.ledger.appendUnique(
+        `points-settled:${official.wallet}:${official.settledAt}`,
+        'points.official_settlement',
+        {
+          settledAt: official.settledAt,
+          lpPoints: official.lpPoints,
+          referralPoints: official.referralPoints,
+          settledFeesUsd: official.settledFeesUsd,
+          source: 'Fables points API'
+        }
+      );
+      this.state.setSetting('pointsOfficial', official);
+    }
+  }
+
   snapshot(nowMs = Date.now()) {
+    const options = nowMs && typeof nowMs === 'object' ? nowMs : {};
+    const atMs = Number.isFinite(Number(options.atMs)) ? Number(options.atMs) : Date.now();
+    const simulationAtMs = typeof nowMs === 'number' && Number.isFinite(nowMs) ? Number(nowMs) : atMs;
+    const force = options.force === true || typeof nowMs === 'number';
+    const simulationIntervalMs = Math.max(5_000, Number(this.config.pointsSimulationIntervalMs) || 15_000);
+    if (!force && this.cachedSnapshot && Date.now() - this.lastSimulationAt < simulationIntervalMs) {
+      return this.withEvidence(this.cachedSnapshot, atMs);
+    }
+    nowMs = simulationAtMs;
     const actualBaseline = Number(this.state.getSetting('actualPointsBaseline', 0) || 0);
     const baselineAtRaw = this.state.getSetting('actualPointsBaselineAt', null);
     const baselineAtMs = baselineAtRaw ? Date.parse(baselineAtRaw) : 0;
@@ -203,7 +325,7 @@ export class PointsTracker {
       ? null
       : new Date(Math.min(currentDayStart + POINTS_DAY_MS, FABLES_POINTS_END_MS)).toISOString();
 
-    return {
+    const snapshot = {
       version: 2,
       status,
       actualBaseline,
@@ -226,6 +348,56 @@ export class PointsTracker {
         : 0,
       lastReconciliation: this.state.getSetting('pointsLastReconciliation', null),
       buckets
+    };
+    this.lastSimulationAt = Date.now();
+    this.cachedSnapshot = snapshot;
+    return this.withEvidence(snapshot, nowMs);
+  }
+
+  withEvidence(snapshot, nowMs) {
+    const official = this.state.getSetting('pointsOfficial', null);
+    const calibration = this.state.getSetting('pointsCalibration', null);
+    const matchingEvidence = official && this.walletEvidence?.wallet === official.wallet ? this.walletEvidence : null;
+    const matchingCalibration = official && calibration?.wallet === official.wallet ? calibration : null;
+    const unsettled = matchingEvidence && official
+      ? Number(matchingEvidence.lifetimeFeeUsd) - Number(official.settledFeesUsd || 0)
+      : null;
+    const unsettledFeeUsd = unsettled != null && unsettled >= -0.05 ? Math.max(0, unsettled) : null;
+    const currentBudget = dailyPointBudget(Math.min(nowMs, FABLES_POINTS_END_MS - 1));
+    const settledBudget = matchingCalibration
+      ? dailyPointBudget(Number(matchingCalibration.programmeDayEnd) - 1)
+      : 0;
+    const calibratedPointsPerFeeUsd = matchingCalibration && settledBudget > 0
+      ? Number(matchingCalibration.pointsPerFeeUsd) * currentBudget / settledBudget
+      : null;
+    const buckets = { ...snapshot.buckets };
+    for (const bucket of Object.values(buckets)) bucket.source = 'estimate';
+    for (const day of official?.history || []) {
+      const key = pointsCampaignDayKey(Number(day.settledAt) - 1);
+      if (!key) continue;
+      buckets[key] = {
+        ...(buckets[key] || {}),
+        source: 'official',
+        timestampMs: Number(day.settledAt) - 1,
+        actualPoints: Number(day.lpPoints || 0) + Number(day.referralPoints || 0)
+      };
+    }
+    return {
+      ...snapshot,
+      buckets,
+      actualPointsFromFables: Boolean(official),
+      settledLpPoints: official?.lpPoints ?? null,
+      settledReferralPoints: official?.referralPoints ?? null,
+      settledFeeUsd: official?.settledFeesUsd ?? null,
+      officialSettledAt: official?.settledAt ?? null,
+      walletFeeEvidence: matchingEvidence,
+      unsettledFeeUsd,
+      calibratedPointsPerFeeUsd,
+      calibrationSource: matchingCalibration?.source || null,
+      evidenceError: this.evidenceError,
+      simulatedAt: this.lastSimulationAt,
+      simulationIntervalMs: Math.max(5_000, Number(this.config.pointsSimulationIntervalMs) || 15_000),
+      nextSimulationAt: this.lastSimulationAt + Math.max(5_000, Number(this.config.pointsSimulationIntervalMs) || 15_000)
     };
   }
 

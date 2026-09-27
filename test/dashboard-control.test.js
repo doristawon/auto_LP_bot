@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DashboardServer } from '../src/dashboard/server.js';
+import { dashboardPage } from '../src/dashboard/page.js';
 
 function makeHarness() {
-  const calls = { scans: [], manual: [], pause: [] };
+  const calls = { scans: [], manual: [], pause: [], investmentTarget: [] };
   const config = {
     dashboardEnabled: true,
     dashboardHost: '127.0.0.1',
@@ -32,6 +33,14 @@ function makeHarness() {
     },
     setExecutionPaused(value, source) {
       calls.pause.push({ value, source });
+    },
+    setInvestmentTarget(mode, poolId) {
+      calls.investmentTarget.push({ mode, poolId });
+      return { mode, poolId: poolId || null, pair: mode === 'specific-pool' ? 'USDG/MOO' : 'USDG/UBIK' };
+    },
+    async startExecution(source) {
+      this.setExecutionPaused(false, source);
+      return { ok: true, executionPaused: false, mode: 'dry-run' };
     },
     async manualRebalance(poolId, positionId, source) {
       calls.manual.push({ poolId, positionId, source });
@@ -62,7 +71,7 @@ async function withServer(fn) {
 
 test('dashboard scan is observation-only and never requests execution', async () => {
   await withServer(async ({ calls }, base) => {
-    const response = await fetch(base + '/api/control/scan', { method: 'POST' });
+    const response = await fetch(base + '/api/control/scan', { method: 'POST', headers: { origin: base } });
     assert.equal(response.status, 200);
     assert.equal(calls.scans.length, 1);
     assert.equal(calls.scans[0].executeRebalances, false);
@@ -80,11 +89,32 @@ test('dashboard status exposes manual-control arming separately from bot readine
   });
 });
 
+test('dashboard accepts an explicit auto-APR or specified-pool reinvest target', async () => {
+  await withServer(async ({ calls }, base) => {
+    const response = await fetch(base + '/api/investment/target', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: base },
+      body: JSON.stringify({ mode: 'specific-pool', poolId: '0x' + '11'.repeat(32) })
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.target.mode, 'specific-pool');
+    assert.deepEqual(calls.investmentTarget, [{ mode: 'specific-pool', poolId: '0x' + '11'.repeat(32) }]);
+  });
+});
+
+test('dashboard provides a keyword-filtered specified-pool selector', () => {
+  const html = dashboardPage();
+  assert.match(html, /id="investmentPoolSearch" type="search"/);
+  assert.match(html, /id="investmentPool"><\/select>/);
+  assert.match(html, /investmentPoolSearch'\)\.addEventListener\('input'/);
+});
+
 test('dashboard manual rebalance is fail-closed until explicitly armed', async () => {
   await withServer(async ({ calls }, base) => {
     const response = await fetch(base + '/api/control/rebalance', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', origin: base },
       body: JSON.stringify({ poolId: '0x' + '11'.repeat(32), positionId: '0x' + '22'.repeat(32), confirm: 'REBALANCE' })
     });
     assert.equal(response.status, 403);
@@ -97,7 +127,7 @@ test('armed dashboard still requires explicit REBALANCE confirmation', async () 
     config.dashboardManualControlEnabled = true;
     const bad = await fetch(base + '/api/control/rebalance', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', origin: base },
       body: JSON.stringify({ poolId: '0x' + '11'.repeat(32), positionId: '0x' + '22'.repeat(32), confirm: 'NO' })
     });
     assert.equal(bad.status, 400);
@@ -105,7 +135,7 @@ test('armed dashboard still requires explicit REBALANCE confirmation', async () 
 
     const good = await fetch(base + '/api/control/rebalance', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', origin: base },
       body: JSON.stringify({ poolId: '0x' + '11'.repeat(32), positionId: '0x' + '22'.repeat(32), confirm: 'REBALANCE' })
     });
     assert.equal(good.status, 200);
@@ -120,7 +150,10 @@ test('dashboard resume returns conflict when bot recovery lock refuses resume', 
     bot.setExecutionPaused = (value) => {
       if (value === false) throw new Error('Cannot resume while rebalance execution requires review: recovery_required');
     };
-    const response = await fetch(base + '/api/control/resume', { method: 'POST' });
+    bot.startExecution = async () => {
+      throw new Error('Cannot resume while rebalance execution requires review: recovery_required');
+    };
+    const response = await fetch(base + '/api/control/resume', { method: 'POST', headers: { origin: base } });
     assert.equal(response.status, 409);
     const body = await response.json();
     assert.match(body.error, /Cannot resume while rebalance execution requires review/);
@@ -131,46 +164,37 @@ test('dashboard resume returns conflict when bot recovery lock refuses resume', 
 test('dashboard scan returns conflict instead of stale success while bot cycle is busy', async () => {
   await withServer(async ({ bot, calls }, base) => {
     bot.cycleActive = true;
-    const response = await fetch(base + '/api/control/scan', { method: 'POST' });
+    const response = await fetch(base + '/api/control/scan', { method: 'POST', headers: { origin: base } });
     assert.equal(response.status, 409);
     assert.equal(calls.scans.length, 0);
   });
 });
 
 
-test('dashboard requires token when manual capital control is armed even on loopback', async () => {
+test('loopback dashboard does not require a token for live or manual controls', async () => {
   const h = makeHarness();
   h.config.dashboardManualControlEnabled = true;
-  await assert.rejects(
-    h.server.start(),
-    /DASHBOARD_TOKEN is required whenever live writes or dashboard manual control is enabled/
-  );
-});
-
-test('dashboard requires token when live writes are enabled even on loopback', async () => {
-  const h = makeHarness();
   h.config.enableLiveWrites = true;
-  await assert.rejects(
-    h.server.start(),
-    /DASHBOARD_TOKEN is required whenever live writes or dashboard manual control is enabled/
-  );
-});
-
-test('dashboard allows sensitive loopback controls when token is configured', async () => {
-  const h = makeHarness();
-  h.config.dashboardManualControlEnabled = true;
-  h.config.dashboardToken = 'test-secret';
+  h.config.dashboardToken = 'stale-local-token';
   await h.server.start();
   try {
     const address = h.server.server.address();
     const base = 'http://127.0.0.1:' + address.port;
-    const unauthorized = await fetch(base + '/api/control/status');
-    assert.equal(unauthorized.status, 401);
-    const authorized = await fetch(base + '/api/control/status', {
-      headers: { 'x-dashboard-token': 'test-secret' }
-    });
-    assert.equal(authorized.status, 200);
+    const access = await fetch(base + '/api/auth/status');
+    assert.deepEqual(await access.json(), { tokenRequired: false });
+    const response = await fetch(base + '/api/control/status');
+    assert.equal(response.status, 200);
   } finally {
     await h.server.stop();
   }
+});
+
+test('dashboard still requires a token when bound outside loopback', async () => {
+  const h = makeHarness();
+  h.config.dashboardHost = '0.0.0.0';
+  await assert.rejects(h.server.start(), /DASHBOARD_TOKEN is required when dashboard binds outside loopback/);
+
+  h.config.dashboardToken = 'remote-test-token';
+  assert.equal(h.server.authorized({ headers: {} }), false);
+  assert.equal(h.server.authorized({ headers: { 'x-dashboard-token': 'remote-test-token' } }), true);
 });

@@ -1,6 +1,20 @@
 # Auto LP Bot — Fables.fi / Robinhood Chain
 
-> v0.5.0：在 v0.4.1 receipt-reconciled executor 上完成 deployment-aware local control center、observation-only manual scan、explicitly-armed manual rebalance 與完整 safety/readiness 顯示。
+> 目前工作目錄包含 Fables 池級 APR 與 RPC 控制，也支援 OOR 後自動投入最高有效 APR 池或指定池；本機預設每 5 分鐘評估區間，淺度 OOR 最長等待 30 分鐘。
+
+錢包助記詞／私鑰僅傳送至本機回環中控台；助記詞不會保存。設定 `PERSIST_RUNTIME_CREDENTIALS=true` 後，通過驗證的目前錢包私鑰／地址及 Robinhood RPC 會原子更新到 Git 忽略的本機 `.env`，並限制檔案 ACL；API 與日誌不回傳憑證。匯入或切換錢包會強制 `DRY_RUN=true`、關閉鏈上寫入與自動重新部署，並暫停執行；每次程序啟動仍保持暫停，需在條件通過後按下啟動。自訂 RPC 套用前會實際查詢 `eth_chainId`，並保留官方 RPC 作為讀取備援。
+
+池級 APR 取自 Fables 公開市場統計，沿用頁面公式「24 小時手續費 × 365 ÷ 目前 TVL」；這是近期年化估算，不代表個人實際收益或收益保證。APR 資料暫時無法取得時會留白，鏈上池子探索仍可獨立運作。
+
+OOR 再投入可設定為最高有效 APR 或指定池。最高 APR 候選需有新鮮統計、未暫停、TVL 達 `APR_POOL_MIN_TVL_USD`，且所有非零 Fables 登錄代幣餘額都能預先報價；跨池檢查未通過時會保留原 LP，不先提領。指定池可用關鍵字篩選 APR 排序下拉選單。預設區間檢查週期為 5 分鐘，深度 OOR 門檻仍需連續 2 次確認；未達深度門檻時最長等待 30 分鐘。
+
+## v0.6.0 — 本機錢包、池級 APR 與 RPC 控制
+
+- Fables 官方活躍池清單會顯示目前 Tick、TVL、24 小時成交量與手續費，以及池級 APR。
+- 可在中控台將活躍池加入或移出本機監控清單；清單依錢包分開保存。
+- 可在程序記憶體掛載多個錢包並切換目前監控錢包；每個地址使用獨立狀態與帳務紀錄。目前選取的簽署錢包可保存到受保護的本機 `.env`。
+- 可輸入自訂 Robinhood RPC；系統會先驗證鏈 ID 為 4663，並保留官方端點作為讀取備援。啟用持久化後，驗證通過的 RPC 會保存到本機 `.env`，不會由 API 回傳。
+- 錢包秘密資料只供目前程序的簽署器使用，不會寫入帳務、狀態、API 回應或紀錄檔。
 
 > Review correction: **dry-run 不得改變策略 state**。v0.3.4 起，`rebalance.dry_run` 只寫 ledger，不再重設 OOR timer、cooldown 或 rebalanceHistory；只有 executor 回報完整 `completed` 才能 commit strategy state。另將 pre-withdraw inventory / deposit plan 明確標為 provisional，live 執行前必須在 withdraw/swap receipt 後重算。
 
@@ -28,7 +42,7 @@ Manual Rebalance 不提供 bypass：In-Range Hold、OOR hysteresis、topology re
 - 31 次 180 分鐘內的 same-pool withdraw→re-deposit handoff 可重建；其中 30 次已有雙邊 operation inventory，**30 / 30 exact BigInt deposit plan feasible**；另 1 次為單邊 inventory，正確標示為 `NEEDS SWAP` 而非 math failure。
 - lifecycle replay 最後的 active ERC-6909 range/shares 與當前鏈上狀態 **完全一致**。
 - 人工下一個 range 只有 8 次剛好等於 BOT centered target；其餘差異反映人工使用不同寬度/置中方式，不視為 executor failure。
-- 最新 range-policy replay 已擴充到 16 個 LP epochs / 13 個 15 分鐘 OOR episodes。0.5% 第一次就搬會觸發 10 次；連續兩次確認只觸發 7 次，並保留 3 次自然回區間，因此維持 `15m / 0.5% / 90m / deep-confirm=2`。
+- 當時的 range-policy replay 已擴充到 16 個 LP epochs / 13 個 OOR episodes。舊版 15 分鐘採樣下，0.5% 第一次就搬會觸發 10 次；連續兩次確認只觸發 7 次，並保留 3 次自然回區間。這是歷史校準紀錄；目前預設改為 `5m / 0.5% / 30m / deep-confirm=2`。
 
 Executor 額外 hardening：
 
@@ -390,7 +404,9 @@ Snapshot 主要欄位：
 - `denominatorCoveragePct`：可可靠 USD 計價的 global swaps 比例。
 - `lastReconciliation`：最近一次官方 Points 與預測誤差。
 
-舊版 state 若把 `ACTUAL_POINTS_BASELINE_AT` 記在手動輸入時間，v0.5.1 啟動時會自動遷移到對應的 02:00 UTC campaign boundary。
+舊版 state 若把 `ACTUAL_POINTS_BASELINE_AT` 記在手動輸入時間，啟動時會自動遷移到對應的 02:00 UTC campaign boundary。
+
+中控台也會讀取 Fables 官方 Points API 的錢包結算分數，並比對 Fables 索引器的 LP 存提／領費紀錄與鏈上可領費用。官方分數作為基準；Points V2 仍以可驗證的鏈上個人 fee 與全市場 swap fee 計算待結算估值。交易對帳與費用倍率作為校正證據，不會在全市場分母或錢包覆蓋不完整時冒充精確分數；此時會顯示暫估與覆蓋狀態。
 
 ## 快速開始
 
@@ -502,7 +518,7 @@ npm run verify:guard
 - `POST /api/points/baseline`
 - `POST /api/cashflow`
 
-若 `DASHBOARD_HOST` 不是 loopback，或 `ENABLE_LIVE_WRITES=true` / `DASHBOARD_MANUAL_CONTROL_ENABLED=true`，程式都會強制要求 `DASHBOARD_TOKEN`；live/manual control 即使只綁 loopback 也不可無驗證。
+Dashboard 綁定 loopback（例如 `127.0.0.1`）時不要求 `DASHBOARD_TOKEN`，符合本機部署需求；若要綁定外部網路介面，必須設定權杖。
 
 ## 測試
 

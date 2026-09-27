@@ -23,7 +23,7 @@ import {
   buildExactDepositPlan,
   buildExactWithdrawBounds
 } from '../math/v4-fixed.js';
-import { buildCenteredRange } from '../math/ticks.js';
+import { buildTargetRange } from '../math/ticks.js';
 import { ZERO_ADDRESS } from '../constants.js';
 
 loadDotEnv();
@@ -276,10 +276,11 @@ for (let i = 0; i < events.length; i++) {
     let exactDeposit = null;
     let exactDepositFeasible = null;
     if (preDepositPrice && operation.raw0 > 0n && operation.raw1 > 0n) {
-      botTarget = buildCenteredRange(
+      botTarget = buildTargetRange(
         preDepositPrice.tick,
         depositPool.key.tickSpacing,
-        config.tightWidthBps
+        config.tightWidthBps,
+        config.rangePreset
       );
       try {
         exactDeposit = buildExactDepositPlan({

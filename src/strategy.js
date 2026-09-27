@@ -1,4 +1,4 @@
-import { buildCenteredRange, isLpOutOfRange, isOutsideRange } from './math/ticks.js';
+import { buildTargetRange, isLpOutOfRange, isOutsideRange } from './math/ticks.js';
 
 export function outOfRangeExcursionPct(currentTick, tickLower, tickUpper) {
   if (currentTick <= tickLower) {
@@ -15,13 +15,14 @@ export function evaluatePosition({
   tickSpacing,
   position,
   widthBps,
+  rangePreset = 'custom-bps',
   edgeBufferTicks = 0,
   lastEvaluationAt = 0,
   outOfRangeSince = 0,
   deepConfirmationsSeen = 0,
-  checkIntervalMs = 15 * 60 * 1000,
+  checkIntervalMs = 5 * 60 * 1000,
   shallowThresholdPct = 0.5,
-  maxWaitMs = 90 * 60 * 1000,
+  maxWaitMs = 30 * 60 * 1000,
   deepConfirmationsRequired = 2,
   cooldownUntil = 0,
   nowMs = Date.now()
@@ -32,13 +33,13 @@ export function evaluatePosition({
   const nearEdge = !outside && edgeBufferTicks > 0
     && isOutsideRange(currentTick, position.tickLower, position.tickUpper, edgeBufferTicks);
   const excursionPct = outOfRangeExcursionPct(currentTick, position.tickLower, position.tickUpper);
-  const target = buildCenteredRange(currentTick, tickSpacing, widthBps);
+  const target = buildTargetRange(currentTick, tickSpacing, widthBps, rangePreset);
   const cooldownActive = nowMs < cooldownUntil;
   const evaluationDue = !lastEvaluationAt || nowMs - lastEvaluationAt >= checkIntervalMs;
 
-  // Re-entry is an asynchronous safety reset, not a 15-minute policy sample.
+  // Re-entry is an asynchronous safety reset, not a 5-minute policy sample.
   // Any fast monitor observation back inside the original LP range breaks the OOR
-  // episode immediately, so a later breakout can never inherit an old 90m timer
+  // episode immediately, so a later breakout can never inherit an old 30m timer
   // or deep-confirmation count.
   if (!outside) {
     const evaluatedAt = evaluationDue ? nowMs : lastEvaluationAt;

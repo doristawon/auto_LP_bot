@@ -22,10 +22,10 @@ export async function verifyProviders(providers, chainId) {
   const results = [];
   for (let index = 0; index < providers.length; index += 1) {
     try {
-      const network = await providers[index].getNetwork();
-      results.push({ index, ok: Number(network.chainId) === chainId, chainId: Number(network.chainId) });
-    } catch (error) {
-      results.push({ index, ok: false, error: error.message });
+      const actualChainId = Number(BigInt(await providers[index].send('eth_chainId', [])));
+      results.push({ index, ok: actualChainId === chainId, chainId: actualChainId });
+    } catch {
+      results.push({ index, ok: false, error: 'unreachable' });
     }
   }
   if (!results.some((x) => x.ok)) throw new Error('No configured RPC endpoint is healthy on Robinhood Chain');

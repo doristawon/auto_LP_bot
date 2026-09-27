@@ -1,6 +1,7 @@
 import { Interface, formatUnits, parseUnits } from 'ethers';
 import { V4_QUOTER_ABI } from '../abi.js';
 import { UNISWAP_V4_QUOTER } from '../constants.js';
+import { buildV4PathKeys } from '../execution/investment-target.js';
 import { poolKeyArgs } from './fables.js';
 
 const iface = new Interface(V4_QUOTER_ABI);
@@ -50,6 +51,58 @@ export class V4QuoterAdapter {
       zeroForOne: tokenInIndex === 0
     };
   }
+
+  async quoteExactInputPathRaw(route, tokenIn, rawAmountIn, slippageBps = 50) {
+    if (!Array.isArray(route) || route.length === 0) throw new Error('A non-empty Fables route is required');
+    rawAmountIn = BigInt(rawAmountIn);
+    if (rawAmountIn <= 0n || rawAmountIn > MAX_UINT128) throw new Error('Quote amount must fit uint128');
+    const firstPool = route[0];
+    const lastPool = route[route.length - 1];
+    const inputAddress = String(tokenIn?.address || '').toLowerCase();
+    const outputAddress = nextTokenAddress(firstPool, inputAddress);
+    if (!outputAddress) throw new Error('Route input token does not belong to the first pool');
+    let cursor = outputAddress;
+    for (let index = 1; index < route.length; index++) {
+      const next = nextTokenAddress(route[index], cursor);
+      if (!next) throw new Error('Fables route token order is discontinuous');
+      cursor = next;
+    }
+    const outputToken = [lastPool.token0, lastPool.token1]
+      .find((token) => String(token.address).toLowerCase() === cursor);
+    if (!outputToken || tokenIn.decimals == null || outputToken.decimals == null) {
+      throw new Error('Route token metadata is unavailable');
+    }
+    const path = buildV4PathKeys(route, inputAddress);
+    const data = iface.encodeFunctionData('quoteExactInput', [[tokenIn.address, path, rawAmountIn]]);
+    const raw = await this.provider.call({ to: this.address, data });
+    const [rawAmountOut, gasEstimate] = iface.decodeFunctionResult('quoteExactInput', raw);
+    const safeBps = Math.max(0, Math.min(10_000, Number(slippageBps)));
+    const minRawAmountOut = BigInt(rawAmountOut) * BigInt(10_000 - safeBps) / 10_000n;
+    return {
+      quoter: this.address,
+      tokenIn: tokenIn.address,
+      tokenOut: outputToken.address,
+      symbolIn: tokenIn.symbol,
+      symbolOut: outputToken.symbol,
+      rawAmountIn: rawAmountIn.toString(),
+      rawAmountOut: BigInt(rawAmountOut).toString(),
+      minRawAmountOut: minRawAmountOut.toString(),
+      amountIn: Number(formatUnits(rawAmountIn, tokenIn.decimals)),
+      amountOut: Number(formatUnits(rawAmountOut, outputToken.decimals)),
+      minAmountOut: Number(formatUnits(minRawAmountOut, outputToken.decimals)),
+      slippageBps: safeBps,
+      gasEstimate: BigInt(gasEstimate).toString(),
+      path: route.map((pool) => String(pool.id))
+    };
+  }
+}
+
+function nextTokenAddress(pool, currencyIn) {
+  const token0 = String(pool?.token0?.address || '').toLowerCase();
+  const token1 = String(pool?.token1?.address || '').toLowerCase();
+  if (currencyIn === token0) return token1;
+  if (currencyIn === token1) return token0;
+  return '';
 }
 
 function decimalString(value, decimals) {

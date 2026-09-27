@@ -34,6 +34,29 @@ export function buildCenteredRange(currentTick, tickSpacing, widthBps) {
   return { tickLower, tickUpper, tickDelta: delta };
 }
 
+// Fables frontend's "Tight" preset: +/-1% converted to usable tick steps,
+// centered on the nearest usable tick (not floor/ceil of a BPS band).
+export function buildFablesTightRange(currentTick, tickSpacing) {
+  validateSpacing(tickSpacing);
+  const tickDelta = Math.max(
+    tickSpacing,
+    Math.round(Math.log1p(0.01) / LOG_1_0001 / tickSpacing) * tickSpacing
+  );
+  const center = Math.round(currentTick / tickSpacing) * tickSpacing;
+  const tickLower = clampUsableTick(center - tickDelta, tickSpacing, 'down');
+  const tickUpper = clampUsableTick(center + tickDelta, tickSpacing, 'up');
+  if (tickLower > currentTick || currentTick >= tickUpper) {
+    throw new Error('Fables Tight range cannot contain the current tick');
+  }
+  return { tickLower, tickUpper, tickDelta };
+}
+
+export function buildTargetRange(currentTick, tickSpacing, widthBps, preset = 'custom-bps') {
+  return preset === 'fables-tight'
+    ? buildFablesTightRange(currentTick, tickSpacing)
+    : buildCenteredRange(currentTick, tickSpacing, widthBps);
+}
+
 // Canonical Uniswap concentrated-liquidity membership rule:
 // lower tick is active/in-range, upper tick is exclusive.
 export function isLpOutOfRange(currentTick, tickLower, tickUpper) {

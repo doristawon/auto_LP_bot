@@ -15,7 +15,7 @@ const code = (await bot.providers.readProvider.getCode(config.walletAddress)).to
 const expected = ('0xef0100' + config.eip7702GuardAddress.slice(2)).toLowerCase();
 if (code !== expected) throw new Error(`Wallet delegation mismatch: expected ${expected}, got ${code}`);
 
-const iface = new Interface(EIP7702_GUARD_ABI);
+const iface = new Interface([...EIP7702_GUARD_ABI, 'error InRange(int24 currentTick,int24 tickLower,int24 tickUpper)']);
 const versionRaw = await bot.providers.readProvider.call({
   from: config.walletAddress,
   to: config.walletAddress,
@@ -73,7 +73,6 @@ if (!candidate) {
     config.fablesWalk
   ]);
   let blocked = false;
-  let errorMessage = null;
   try {
     await bot.providers.readProvider.call({
       from: config.walletAddress,
@@ -81,8 +80,10 @@ if (!candidate) {
       data
     });
   } catch (error) {
-    blocked = true;
-    errorMessage = error.shortMessage || error.message;
+    const raw = error.data || error.info?.error?.data || error.info?.error?.error?.data;
+    const parsed = typeof raw === 'string' ? iface.parseError(raw) : null;
+    blocked = parsed?.name === 'InRange';
+    if (!blocked) throw new Error('Atomic guard canary reverted for a reason other than InRange');
   }
   if (!blocked) throw new Error('Atomic guard canary FAILED: an In-Range guarded withdrawal eth_call unexpectedly succeeded');
   console.log(JSON.stringify({
@@ -93,6 +94,6 @@ if (!candidate) {
     tick: pool.tick,
     range: [position.tickLower, position.tickUpper],
     result: 'in-range-withdrawal-blocked',
-    error: errorMessage
+    revert: 'InRange'
   }, null, 2));
 }

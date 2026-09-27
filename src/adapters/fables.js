@@ -98,17 +98,16 @@ export class FablesAdapter {
 
     if (fromBlock <= latestBlock) {
       const walletTopic = zeroPadValue(this.config.walletAddress, 32).toLowerCase();
-      for (const [hookLower, hookAddress] of hookAddresses) {
-        const logs = await this.getLogsAdaptive({
-          address: hookAddress,
-          topics: [[depositedTopic, withdrawnTopic], walletTopic]
-        }, fromBlock, latestBlock);
-        for (const item of logs) {
-          const rangeId = item.topics?.[2]?.toLowerCase();
-          if (!rangeId) continue;
-          const key = rangeCandidateKey(hookLower, rangeId);
-          candidates.set(key, { hook: hookAddress, rangeId });
-        }
+      const logs = await this.getLogsAdaptive({
+        address: [...hookAddresses.values()],
+        topics: [[depositedTopic, withdrawnTopic], walletTopic]
+      }, fromBlock, latestBlock);
+      for (const item of logs) {
+        const hookAddress = hookAddresses.get(String(item.address || '').toLowerCase());
+        const rangeId = item.topics?.[2]?.toLowerCase();
+        if (!hookAddress || !rangeId) continue;
+        const key = rangeCandidateKey(hookAddress, rangeId);
+        candidates.set(key, { hook: hookAddress, rangeId });
       }
     }
 
@@ -360,16 +359,24 @@ export class FablesAdapter {
     const all = [];
     let cursor = fromBlock;
     let span = this.config.logChunkBlocks;
+    let maxSpan = this.config.logChunkBlocks;
     while (cursor <= toBlock) {
       const end = Math.min(toBlock, cursor + span - 1);
       try {
         const logs = await this.provider.getLogs({ ...filter, fromBlock: cursor, toBlock: end });
         all.push(...logs);
         cursor = end + 1;
-        if (span < this.config.logChunkBlocks) span = Math.min(this.config.logChunkBlocks, span * 2);
+        if (span < maxSpan) span = Math.min(maxSpan, span * 2);
       } catch (error) {
-        if (span <= this.config.minLogChunkBlocks) throw error;
-        span = Math.max(this.config.minLogChunkBlocks, Math.floor(span / 2));
+        const message = String(error?.message || '');
+        const advertisedLimit = /limited to\s+(\d+)\s+blocks/i.exec(message);
+        const capped = advertisedLimit ? Math.max(1, Number(advertisedLimit[1])) : 0;
+        if (capped && capped < span) {
+          maxSpan = Math.min(maxSpan, capped);
+          span = maxSpan;
+        }
+        else if (span > this.config.minLogChunkBlocks) span = Math.max(this.config.minLogChunkBlocks, Math.floor(span / 2));
+        else throw error;
         log('warn', 'rpc.log_chunk_reduced', { fromBlock: cursor, toBlock: end, nextSpan: span, error: error.message });
       }
     }
