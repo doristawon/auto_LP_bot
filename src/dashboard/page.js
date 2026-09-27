@@ -18,6 +18,7 @@ button,input,select{font:inherit;color:var(--text);background:#20231d;border:1px
 @media(max-width:1000px){.hero{grid-template-columns:1fr}.hero-actions{max-width:540px}.grid,.stats-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.row,.row-equal{grid-template-columns:1fr}}
 @media(max-width:620px){main{padding:16px 13px 42px}.top{align-items:flex-start}.brand-mark{width:36px;height:36px}.brand h1{font-size:20px}.top>.controls{width:100%;justify-content:space-between}.hero{gap:18px;padding:19px;border-radius:19px}.hero h2{font-size:27px}.hero-meta{gap:6px}.hero-meta span{font-size:11px;padding:6px 8px}.execution-button{min-width:0;font-size:13px;padding:9px 7px}.tab-nav{top:0;margin:12px -13px 14px;padding:8px 13px}.tab-button{padding:8px 10px;font-size:12px}.grid,.stats-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.grid .card{min-height:100px;padding:14px}.value{font-size:22px}.status-list{grid-template-columns:1fr}.card{padding:15px}.settings-row{align-items:stretch}.settings-row .field{min-width:0;flex:1 1 100%}.settings-row>button{align-self:flex-start}.settings-row>.small{max-width:none}.controls .field{min-width:0;flex:1 1 100%}#positions{min-width:1080px}th,td{padding:10px}.events table{min-width:850px}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important}}
+.hero-actions #scan{font-size:13px}@media(max-width:620px){.hero-actions #scan{font-size:12px}}
 </style>
 </head>
 <body><a class="skip-link" href="#mainContent">跳至主要內容</a><main id="mainContent">
@@ -28,7 +29,7 @@ button,input,select{font:inherit;color:var(--text);background:#20231d;border:1px
 <section id="authPanel" class="card section-gap" style="display:none"><h2>解鎖中控台</h2><p class="muted small">本機回環連線不需要權杖；只有非本機連線才需要輸入管理員提供的權杖。</p><div class="controls"><label class="field"><span>中控台權杖</span><input id="dashboardTokenInput" type="password" autocomplete="off" placeholder="輸入管理員提供的權杖"/></label><button id="saveDashboardToken" class="primary">解鎖中控台</button></div></section>
 <section class="hero" aria-label="指定池子與執行控制">
   <div><div class="hero-kicker">目前專注的池子</div><h2 id="focusPair">尚未指定池子</h2><div class="muted" id="focusSummary">正在讀取鏈上狀態…</div><div class="hero-meta"><span id="focusRange">Tight 區間 · --</span><span id="focusApr">池級 APR --</span><span id="focusWallet">錢包 --</span></div></div>
-  <div class="hero-actions"><button id="startExecution" class="execution-button start" disabled>啟動自動平衡</button><button id="pauseExecution" class="execution-button pause" disabled>暫停自動平衡</button><button id="scan" disabled>立即掃描 · 不交易</button></div>
+  <div class="hero-actions"><button id="startExecution" class="execution-button start" disabled>啟動自動平衡</button><button id="pauseExecution" class="execution-button pause" disabled>暫停自動平衡</button><button id="scan" title="立即掃描並更新本機狀態與事件紀錄；不會送出鏈上交易。" aria-label="立即掃描並更新本機狀態與事件紀錄，不會送出交易" disabled>掃描更新本機狀態／紀錄（不送交易）</button></div>
 </section>
 <span id="armed" hidden>--</span>
 <div id="startReadiness" class="note-box small muted" role="status">正在檢查啟動條件…</div>
@@ -247,15 +248,113 @@ function renderExecutionTargetStatus(markets){const el=$('executionTargetStatus'
 const startBlockerNames={'target-required':'尚未選擇自動平衡目標池','target-unavailable':'目標池不在最新池子清單','wallet-address-missing':'尚未掛載有效錢包地址','wallet-scanning':'錢包初次掃描尚未完成','wallet-failed':'錢包掃描失敗，請先重新掃描','wallet-not-ready':'錢包監控尚未就緒','active-lp-required':'此錢包尚無指定池子的 LP 部位','wallet-snapshot-stale':'錢包掃描資料過舊','rpc-not-ready':'沒有健康的 Robinhood Chain RPC','cycle-active':'目前有掃描週期進行中','recovery-required':'有尚待處理的交易復原流程','execution-busy':'目前有執行中的交易流程','live-writes-disabled':'實盤鏈上寫入尚未啟用','auto-redeploy-disabled':'自動重新部署尚未啟用','signer-required':'尚未掛載簽署錢包','guard-not-ready':'原子化安全防護尚未部署並驗證'};
 function renderStartReadiness(){const el=$('startReadiness');if(!el||!control)return;if(!control.executionPaused&&!control.recoveryRequired){el.textContent=(control.dryRun?'預演監控中':'實盤監控中')+' · '+(control.cycleActive?'正在更新鏈上資料；':'')+'區間內保留部位，達到區間外政策時才會再平衡。';el.className='note-box small muted';return}const readiness=control.startReadiness||{ready:false,blockers:['wallet-not-ready']};const labels=(readiness.blockers||[]).map(key=>startBlockerNames[key]||key);if(readiness.ready){el.textContent='啟動條件已通過。按下「啟動自動平衡」才會解除暫停；目前 '+(control.dryRun?'為預演模式，不會送出交易。':'為實盤模式，可能送出真實鏈上交易。');el.className='note-box small muted';return}el.textContent='尚未符合啟動條件：'+labels.join('；')+'。';el.className='note-box small muted'}
 function pointBucketRow(key,x){const status=x.source==='official'?'官方結算':(x.completed?(x.complete?'完整日估算':'資料不完整，暫估'):'當日預測');return'<tr><td>'+esc(key)+'</td><td>'+status+'</td><td>'+usd(x.userFeeUsd)+'</td><td>'+num(x.source==='official'?x.actualPoints:x.estimatedPoints)+'</td></tr>'}
+const eventReasonNames={
+  'absolute in-range hold':'部位仍在區間內，依安全政策保留',
+  'absolute in-range hold / position not oor-eligible':'部位仍在區間內或尚未符合區間外再平衡條件',
+  'wallet topology changed during cycle':'掃描期間錢包 LP 結構有變動，已停止再平衡',
+  'wallet topology cooldown':'錢包 LP 結構變動後仍在冷卻時間',
+  'execution paused':'自動平衡已暫停',
+  'global minimum rebalance interval':'尚未達到兩次再平衡的最短間隔',
+  'hourly rate limit':'已達每小時再平衡次數上限',
+  'investment target unavailable':'目前找不到可用的再投入目標池',
+  'fables pool paused':'Fables 交易池目前暫停',
+  'deep oor faded below threshold before execution':'執行前價格已回到深度區間外門檻內',
+  'deep oor faded below threshold before executor':'執行前價格已回到深度區間外門檻內',
+  'position-not-oor-eligible':'部位尚未符合區間外再平衡政策',
+  'latest-chain-state-not-eligible':'最新鏈上狀態尚未符合再平衡資格',
+  'wallet-topology-cooldown':'錢包 LP 結構變動後仍在冷卻時間',
+  'execution-paused':'自動平衡已暫停',
+  'global-min-rebalance-interval':'尚未達到兩次再平衡的最短間隔',
+  'hourly-rate-limit':'已達每小時再平衡次數上限',
+  'investment-target-unavailable':'目前找不到可用的再投入目標池',
+  'blocked':'未符合安全條件，暫不執行',
+  'failed':'執行失敗',
+  'completed':'流程已完成',
+  'dry-run':'預演完成，未送出交易',
+  'recovery_required':'需要人工復原',
+  'capital moved but execution did not complete':'資產已移動但流程未完成，需要人工復原',
+  'executor did not report a fully completed withdraw-swap-deposit cycle':'執行器未確認提領、兌換與存入流程完整完成',
+  'bootstrap recovery required':'首次建倉流程需要人工復原'
+};
+function safeEventText(value,maxLength=140){
+  let text=String(value==null?'':value)
+    .replace(/[\u0000-\u001f\u007f]+/g,' ')
+    .replace(/(https?:\/\/)[^\s/@]+@/gi,'$1[已隱去]@')
+    .replace(/([?&](?:token|key|api_?key|secret|password|auth|signature)=)[^&\s]*/gi,'$1[已隱去]')
+    .replace(/\b0x[a-f\d]{64}\b/gi,'[已隱去長識別值]')
+    .replace(/\s+/g,' ').trim();
+  return text.length>maxLength?text.slice(0,maxLength-1)+'…':text;
+}
+function transactionLabel(value){
+  const label=safeEventText(value,180);
+  if(!label)return'未提供交易類型';
+  const paired=label.match(/^(guardedWithdrawAndClaim|fablesDeposit):(.+)$/);
+  if(label==='guardedWithdrawAndClaim'||paired?.[1]==='guardedWithdrawAndClaim')return'提領 LP'+(paired?.[2]?' · '+paired[2]:'');
+  if(label==='fablesDeposit'||paired?.[1]==='fablesDeposit')return'存入 LP'+(paired?.[2]?' · '+paired[2]:'');
+  if(label==='v4SwapExactInputSingle')return'單池兌換';
+  const multi=label.match(/^v4MultiHopSwap:(.+)->(.+)$/);
+  if(multi)return'多池兌換 · '+multi[1]+' → '+multi[2];
+  const balance=label.match(/^v4BalanceSwap:(.+)->(.+)$/);
+  if(balance)return'餘額調整兌換 · '+balance[1]+' → '+balance[2];
+  const allowance=label.match(/^approve:([^:]+):(permit2|hook)(:reset)?$/);
+  if(allowance){const subject=allowance[2]==='permit2'?'Permit2':'Fables 池存入';return(allowance[3]?'重設 ':'授權 ')+allowance[1]+' 的 '+subject+' 權限'}
+  const permit=label.match(/^permit2:([^:]+):router$/);
+  if(permit)return'授權 Permit2 處理 '+permit[1];
+  return label;
+}
+function eventReason(value){
+  const text=safeEventText(value,280);
+  if(!text)return'未提供原因';
+  const normalized=text.toLowerCase();
+  if(eventReasonNames[normalized])return eventReasonNames[normalized];
+  if(errorNames[text])return errorNames[text];
+  if(normalized.startsWith('absolute in-range hold:'))return'部位仍在區間內，依安全政策保留';
+  if(normalized.startsWith('deep oor faded'))return'執行前價格已回到深度區間外門檻內';
+  if(normalized.startsWith('gas guard:'))return'Gas 價格超出上限 · '+safeEventText(text.slice(text.indexOf(':')+1),80);
+  const failedLabel=text.match(/^(.+?) failed(?::|$)/i);
+  if(failedLabel)return'鏈上交易失敗 · '+transactionLabel(failedLabel[1]);
+  return safeEventText(text,140);
+}
+function eventRange(target){
+  if(!target||target.tickLower==null||target.tickUpper==null)return'';
+  return' · 目標區間 '+safeEventText(target.tickLower,24)+'–'+safeEventText(target.tickUpper,24);
+}
+function eventPhase(value){
+  const names={
+    initialized:'流程已初始化',
+    withdraw_preflighted:'LP 提領預檢中',withdraw_sent:'已送出 LP 提領',withdraw_confirmed:'LP 提領已確認',
+    swap_preflighted:'兌換預檢中',swap_sent:'已送出兌換',swap_confirmed:'兌換已確認',
+    swap_not_required:'無需兌換',balance_swap_preflighted:'餘額調整兌換預檢中',
+    deposit_preflighted:'LP 存入預檢中',deposit_sent:'已送出 LP 存入',deposit_confirmed:'LP 存入已確認',
+    recovery_required:'等待人工復原'
+  };
+  const text=safeEventText(value,48);
+  return names[text]||text;
+}
 function eventDetail(e){
   if(e.type==='portfolio.snapshot')return'淨損益 '+usd(e.netPnlUsd)+' · 無常損失 '+usd(e.ilUsd)+' · 模擬積分 '+num(e.estimatedPoints);
   if(e.type==='wallet.lp_topology_changed')return'新增池 '+(e.added||[]).length+' 個／移除 '+(e.removed||[]).length+' 個 · 區間新增 '+(e.addedRanges||[]).length+' 個／移除 '+(e.removedRanges||[]).length+' 個';
   if(e.type==='rebalance.manual_requested')return'人工操作 · '+(e.pair||'')+(e.dryRun?' · 預演':' · 即時交易');
-  if(e.type==='rebalance.recovery_required')return'需要人工復原 · '+translateError(e.error||'');
-  if(e.type==='rebalance.blocked')return'安全條件阻擋 · '+translateError(e.reason||'');
+  if(e.type==='rebalance.dry_run')return'預演計畫 · '+safeEventText(e.pair||'',48)+eventRange(e.target)+' · 未送出交易';
+  if(e.type==='rebalance.completed')return'再平衡完成 · '+safeEventText(e.pair||'',48)+eventRange(e.target);
+  if(e.type==='rebalance.cross_pool_completed')return'跨池再投入完成 · '+safeEventText(e.sourcePair||'',48)+' → '+safeEventText(e.destinationPair||'',48)+(e.aprPct!=null?' · APR '+pct(e.aprPct):'')+eventRange(e.target);
+  if(e.type==='rebalance.recovery_required')return'需要人工復原'+(e.phase?' · '+eventPhase(e.phase):'')+' · '+eventReason(e.error||e.reason||e.status);
+  if(e.type==='rebalance.auto_paused')return'已自動暫停 · '+eventReason(e.reason||e.status);
+  if(e.type==='rebalance.uncommitted')return'策略狀態未提交 · '+eventReason(e.reason||e.status);
+  if(e.type==='rebalance.blocked')return'阻擋原因 · '+eventReason(e.reason||e.status||e.label||e.error);
+  if(e.type==='rebalance.failed')return'失敗原因 · '+eventReason(e.error||e.reason||e.status||e.label);
+  if(e.type==='bootstrap.completed')return'首次建倉完成 · '+safeEventText(e.pair||'',48)+(e.amountUSDG!=null?' · 投入 '+safeEventText(e.amountUSDG,30)+' USDG':'')+(e.shares!=null?' · LP shares '+safeEventText(e.shares,36):'')+eventRange(e.target);
+  if(e.type==='bootstrap.recovery_required')return'首次建倉需要人工復原'+(e.phase?' · '+eventPhase(e.phase):'')+' · '+eventReason(e.reason||e.error||e.status);
+  if(e.type==='cycle.failed')return'監控週期失敗 · '+eventReason(e.error||e.reason||e.status);
+  if(e.type==='tx.sent'||e.type==='tx.confirmed'){
+    const stage=e.type==='tx.sent'?'已送出':'已確認';
+    const block=e.type==='tx.confirmed'&&e.blockNumber!=null?' · 區塊 '+safeEventText(e.blockNumber,24):'';
+    return stage+' · '+transactionLabel(e.label||e.reason||e.status)+block;
+  }
   if(e.type==='pool.fee_unattributed')return'共用 Hook，無法歸屬到單一交易池';
-  const value=e.note||e.label||e.pair||e.reason||e.status||e.error||e.eventKey||'';
-  return translateError(value);
+  if(e.error)return eventReason(e.error);
+  const value=e.note||e.label||e.pair||e.reason||e.status||e.eventKey||'';
+  return value?safeEventText(value,140):'此事件沒有補充說明';
 }
 function eventRow(e){return'<tr><td>'+dt(e.ts)+'</td><td>'+esc(eventNames[e.type]||'其他事件')+'</td><td class="mono">'+(e.hash?esc(short(e.hash)):'')+'</td><td>'+(e.gasUsd!=null?usd(e.gasUsd):'')+'</td><td>'+(e.feeUsd!=null?usd(e.feeUsd):'')+'</td><td class="small">'+esc(eventDetail(e))+'</td></tr>'}
 function renderWallet(){if(!control)return;$('activeWallet').textContent=control.walletAddress||'--';const wi=control.walletImportState||{};const walletStates={ready:'監控就緒',scanning:'初次掃描中',failed:'掃描失敗'};const signer=control.signerConfigured?'簽署金鑰已掛載':'唯讀，未載入簽署金鑰';const persistence=control.credentialPersistenceEnabled?'本機 .env 保存已啟用':'只保留於本次程序';$('walletStatus').textContent=(walletStates[wi.status]||'狀態未知')+(wi.error?' · '+translateError(wi.error):'')+' · '+signer+' · '+persistence;$('rpcStatus').textContent=(control.rpc&&control.rpc.customConfigured?'自訂 RPC':'官方公開 RPC')+' · '+((control.rpc&&control.rpc.endpointCount)||1)+' 個端點 · 鏈 ID '+((control.rpc&&control.rpc.chainId)||4663);const select=$('walletProfile');const profiles=control.walletProfiles||[];const typeNames={mnemonic:'助記詞', 'private-key':'私鑰','watch-only':'唯讀地址',environment:'環境設定'};select.innerHTML=profiles.map(x=>'<option value="'+esc(x.address)+'" '+(x.active?'selected':'')+'>'+esc(x.address)+' · '+(typeNames[x.type]||'錢包')+(x.signerConfigured?' · 可簽署':' · 唯讀')+'</option>').join('');$('selectWallet').disabled=profiles.length<2||busy}
