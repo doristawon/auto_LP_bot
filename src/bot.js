@@ -199,7 +199,9 @@ export class AutoLpBot {
       startBlockers.push(`wallet-${this.walletImportState.status || 'not-ready'}`);
     }
     if (!this.rpcHealth.some((item) => item.ok && Number(item.chainId) === this.config.chainId)) startBlockers.push('rpc-not-ready');
-    if (this.cycleActive) startBlockers.push('cycle-active');
+    // Starting only lifts the pause flag. The running cycle still rechecks
+    // pool state, wallet topology, and the complete transaction path before
+    // moving funds, so a routine scan must not disable the start control.
     if (recoveryRequired) startBlockers.push('recovery-required');
     else if (executionBusy) startBlockers.push('execution-busy');
     if (!this.config.dryRun) {
