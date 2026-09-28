@@ -10,6 +10,7 @@ import { fetchWalletCashflowCandidates, fetchEthUsdCloseAt, fetchNativeBalanceAt
 import { buildUsdPriceMap } from './analytics/prices.js';
 import { spotToken1PerToken0 } from './analytics/liquidity.js';
 import { PortfolioAnalytics } from './analytics/portfolio.js';
+import { rebalanceTiming } from './dashboard/rebalance-timing.js';
 import { PointsTracker } from './analytics/points-tracker.js';
 import { POINTS_DAY_MS, pointsCampaignDayStartMs } from './analytics/points.js';
 import { valueSwapFeeInUsd } from './analytics/points-accounting.js';
@@ -115,6 +116,7 @@ export class AutoLpBot {
     this.rpcHealth = [];
     this.executionPaused = true;
     this.state.setSetting('executionPaused', true);
+    this.nextMonitorAt = null;
     this.snapshot = this.ledger.readSnapshot();
     this.running = false;
     this.cycleActive = false;
@@ -235,7 +237,7 @@ export class AutoLpBot {
       if (!guardConfigured || !guardVerifiedFlag || !guardRuntimeReady) startBlockers.push('guard-not-ready');
     }
 
-    return {
+    const status = {
       generatedAt: Date.now(),
       mode: this.config.dryRun ? 'dry-run' : 'live',
       walletAddress: this.config.walletAddress,
@@ -265,6 +267,7 @@ export class AutoLpBot {
       autoTopupSwapEnabled: this.config.autoTopupSwapEnabled,
       executionPaused: this.executionPaused,
       cycleActive: this.cycleActive,
+      nextMonitorAt: this.nextMonitorAt,
       signerConfigured,
       credentialPersistenceEnabled: Boolean(this.config.persistRuntimeCredentials),
       guard: {
@@ -308,6 +311,8 @@ export class AutoLpBot {
         ...rangePolicySnapshot(this.config)
       }
     };
+    status.rebalanceTiming = rebalanceTiming(status, this.snapshot, status.generatedAt);
+    return status;
   }
 
   getRuntimeIntervals() {
@@ -2113,6 +2118,7 @@ export class AutoLpBot {
     this.schedulePointsSimulation();
     while (this.running) {
       const started = Date.now();
+      this.nextMonitorAt = null;
       try {
         await this.runOnce();
         this.rpcTimeoutStreak = 0;
@@ -2126,15 +2132,22 @@ export class AutoLpBot {
         }
         this.ledger.append('cycle.failed', { error: rateLimited ? 'rpc-rate-limited' : error.message });
         log('error', 'cycle.failed', { error: rateLimited ? 'rpc-rate-limited' : error.stack || error.message });
-        if (rateLimited) await sleep(RPC_RATE_LIMIT_BACKOFF_MS);
-        else if (this.rpcTimeoutStreak >= 3) await sleep(Math.min(
+        let backoffMs = 0;
+        if (rateLimited) backoffMs = RPC_RATE_LIMIT_BACKOFF_MS;
+        else if (this.rpcTimeoutStreak >= 3) backoffMs = Math.min(
           RPC_RATE_LIMIT_BACKOFF_MS,
           RPC_TIMEOUT_BACKOFF_MS * (this.rpcTimeoutStreak - 2)
-        ));
+        );
+        if (backoffMs) {
+          this.nextMonitorAt = Date.now() + backoffMs;
+          await sleep(backoffMs);
+        }
       }
       const wait = Math.max(1000, this.config.pollIntervalMs - (Date.now() - started));
+      this.nextMonitorAt = Date.now() + wait;
       await sleep(wait);
     }
+    this.nextMonitorAt = null;
   }
 
   stop() {
