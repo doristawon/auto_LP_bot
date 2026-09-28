@@ -92,3 +92,18 @@ test('manual cost override is bound to one preview and capped at five percent', 
     previewId: preview.previewId, maxCostBps: 350 }), /預演已過期或目標變更/);
   assert.equal(h.executions, 0);
 });
+
+test('explicit manual preview ignores automatic rebalance cooldown and quota', async () => {
+  const h = harness();
+  h.bot.config.minRebalanceIntervalSec = 3600;
+  h.bot.config.maxRebalancesPerHour = 0;
+  h.bot.state.getSetting = (key, fallback) => key === 'walletTopologyCooldownUntil'
+    ? Date.now() + 3600_000 : fallback;
+  h.bot.state.recentRebalances = () => [{ ts: Date.now() }];
+  const preview = await h.bot.manualImmediateRotation({
+    poolId: sourceId, positionId, destinationPoolId: destinationId, previewOnly: true
+  });
+  assert.equal(preview.status, 'ready');
+  assert.ok(preview.expiresAt - Date.now() > 9 * 60_000);
+  assert.equal(h.executions, 0);
+});

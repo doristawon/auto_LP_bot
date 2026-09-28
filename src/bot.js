@@ -123,6 +123,7 @@ export class AutoLpBot {
     this.points = new PointsTracker(config, this.ledger, this.state);
     this.market = { refreshedAt: 0, stateRefreshedAt: 0, pools: [], prices: new Map(), latestBlock: 0, fablesStats: null };
     this.rpcHealth = [];
+    this.resumeExecutionAfterStartup = this.state.getSetting('executionPaused', true) === false;
     this.executionPaused = true;
     this.state.setSetting('executionPaused', true);
     this.nextMonitorAt = null;
@@ -166,6 +167,7 @@ export class AutoLpBot {
 
   setExecutionPaused(value, source = 'system') {
     const next = Boolean(value);
+    if (next && source === 'dashboard') this.resumeExecutionAfterStartup = false;
     if (!next) {
       const activeExecution = this.state.getSetting('activeRebalanceExecution', null);
       const terminal = new Set(['completed', 'failed']);
@@ -876,20 +878,8 @@ export class AutoLpBot {
       if (this.executionPaused || this.config.dryRun || !this.config.enableLiveWrites) {
         throw new Error('立即換倉需要未暫停的實盤執行狀態');
       }
-      if (Date.now() < Number(this.state.getSetting('walletTopologyCooldownUntil', 0) || 0)) {
-        throw new Error('錢包 LP 部位變動冷卻中，請稍後再預演');
-      }
-      const failureBackoff = rebalanceFailureMap(this.state)[rebalanceFailureKey(sourcePool, position)];
-      if (failureBackoff && Date.now() < Number(failureBackoff.nextRetryAt || 0)) {
-        throw new Error('來源 LP 再平衡失敗冷卻中');
-      }
-      const minIntervalMs = Math.max(0, Number(this.config.minRebalanceIntervalSec || 0) * 1000);
-      if (minIntervalMs > 0 && this.state.recentRebalances(minIntervalMs).length) {
-        throw new Error('尚未達到兩次再平衡的最短間隔');
-      }
-      if (this.state.recentRebalances().length >= this.config.maxRebalancesPerHour) {
-        throw new Error('已達每小時再平衡次數上限');
-      }
+      // Explicit manual rotation uses fresh position and full-sequence preflight.
+      // Automatic retry timers and rebalance quotas do not apply to this action.
       if (this.config.targetMode === 'wallet-active'
         && !(await this.revalidateTopologyBeforeExecution(snapshot.blockNumber, [{ pool: sourcePool, position }]))) {
         throw new Error('錢包 LP 部位在預演期間變動');
@@ -905,7 +895,7 @@ export class AutoLpBot {
         const result = await this.executor.preflightCrossPoolSequence(plan, destinationPool);
         const id = randomUUID();
         this.manualRotationPreview = {
-          id, expiresAt: Date.now() + 2 * 60_000,
+          id, expiresAt: Date.now() + 10 * 60_000,
           wallet: this.config.walletAddress.toLowerCase(), poolId, positionId,
           destinationPoolId, maxCostBps: costCapBps
         };
@@ -1641,7 +1631,7 @@ export class AutoLpBot {
     }
 
     const topologyCooldownUntil = Number(this.state.getSetting('walletTopologyCooldownUntil', 0) || 0);
-    if (Date.now() < topologyCooldownUntil) {
+    if (!manualImmediate && Date.now() < topologyCooldownUntil) {
       this.ledger.append('rebalance.blocked', {
         positionId: position.id,
         poolId: pool.id,
@@ -1656,13 +1646,13 @@ export class AutoLpBot {
     }
 
     const failureBackoff = rebalanceFailureMap(this.state)[rebalanceFailureKey(pool, position)];
-    if (failureBackoff && Date.now() < Number(failureBackoff.nextRetryAt || 0)) {
+    if (!manualImmediate && failureBackoff && Date.now() < Number(failureBackoff.nextRetryAt || 0)) {
       return { status: 'blocked', reason: 'rebalance-failure-backoff',
         nextRetryAt: failureBackoff.nextRetryAt, consecutiveFailures: failureBackoff.count };
     }
 
     const minIntervalMs = Math.max(0, Number(this.config.minRebalanceIntervalSec || 0) * 1000);
-    if (minIntervalMs > 0) {
+    if (!manualImmediate && minIntervalMs > 0) {
       const recentForInterval = this.state.recentRebalances(minIntervalMs);
       const latestSuccessful = recentForInterval.reduce(
         (latest, entry) => Number(entry.ts || 0) > Number(latest?.ts || 0) ? entry : latest,
@@ -1683,7 +1673,7 @@ export class AutoLpBot {
       }
     }
 
-    if (this.state.recentRebalances().length >= this.config.maxRebalancesPerHour) {
+    if (!manualImmediate && this.state.recentRebalances().length >= this.config.maxRebalancesPerHour) {
       this.ledger.append('rebalance.blocked', { positionId: position.id, reason: 'hourly rate limit', source });
       return { status: 'blocked', reason: 'hourly-rate-limit' };
     }
@@ -2454,6 +2444,11 @@ export class AutoLpBot {
       try {
         await this.runOnce();
         this.rpcTimeoutStreak = 0;
+        if (this.resumeExecutionAfterStartup) {
+          const restored = await this.startExecution('startup-restore');
+          if (restored.ok) this.resumeExecutionAfterStartup = false;
+          else log('warn', 'execution.startup_restore_waiting', { blockers: restored.blockers });
+        }
       }
       catch (error) {
         const rateLimited = isRpcRateLimitError(error);

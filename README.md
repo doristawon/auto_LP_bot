@@ -501,7 +501,7 @@ npm run verify:guard
 - `POST /api/control/resume`
 - `POST /api/control/scan` — refreshes local state without sending trades
 - `POST /api/control/rebalance` — requires `DASHBOARD_MANUAL_CONTROL_ENABLED=true` and JSON `confirm: "REBALANCE"`
-- `POST /api/control/rotate/preview` — read-only complete simulation for the saved specified pool; returns a two-minute one-use preview ID
+- `POST /api/control/rotate/preview` — read-only complete simulation for the saved specified pool; returns a ten-minute one-use preview ID
 - `POST /api/control/rotate/execute` — requires the preview ID, the same `maxCostBps`, and `confirm: "ROTATE_TO:<destinationPoolId>:<maxCostBps>"`; re-scans and re-simulates before live writes
 - `POST /api/points/baseline`
 - `POST /api/cashflow`

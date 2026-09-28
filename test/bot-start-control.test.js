@@ -68,3 +68,31 @@ test('start control still blocks an unfinished capital-moving execution', async 
   assert.equal(started.ok, false);
   assert.equal(bot.executionPaused, true);
 });
+
+test('startup restores a previously running bot only after its first successful scan', async () => {
+  const { bot } = makeBot();
+  let scans = 0;
+  let starts = 0;
+  bot.config.pollIntervalMs = 0;
+  bot.running = false;
+  bot.resumeExecutionAfterStartup = true;
+  bot.initialize = async () => {};
+  bot.schedulePointsSimulation = () => {};
+  bot.runOnce = async () => { scans++; bot.running = false; };
+  bot.startExecution = async (source) => {
+    assert.equal(source, 'startup-restore');
+    assert.equal(scans, 1);
+    starts++;
+    return { ok: true };
+  };
+  await bot.start();
+  assert.equal(starts, 1);
+  assert.equal(bot.resumeExecutionAfterStartup, false);
+});
+
+test('explicit dashboard pause cancels pending startup restore', () => {
+  const { bot } = makeBot();
+  bot.resumeExecutionAfterStartup = true;
+  bot.setExecutionPaused(true, 'dashboard');
+  assert.equal(bot.resumeExecutionAfterStartup, false);
+});
