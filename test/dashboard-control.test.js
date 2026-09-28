@@ -91,6 +91,29 @@ test('dashboard status exposes manual-control arming separately from bot readine
   });
 });
 
+test('dashboard transaction ledger excludes unrelated market swaps', async () => {
+  await withServer(async ({ bot }, base) => {
+    bot.ledger = {
+      list({ excludeTypes }) {
+        return [
+          { type: 'points.global_swap_fee', hash: 'market-swap' },
+          { type: 'tx.confirmed', hash: 'wallet-tx' }
+        ].filter((event) => !excludeTypes.has(event.type));
+      }
+    };
+    const response = await fetch(base + '/api/events?limit=250');
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.deepEqual(body.events.map((event) => event.hash), ['wallet-tx']);
+  });
+});
+
+test('dashboard names an unavailable custom RPC and its public fallback', () => {
+  const html = dashboardPage();
+  assert.match(html, /自訂 RPC 不可用，使用官方公開 RPC/);
+  assert.match(html, /全市場 Swap 僅供積分估算/);
+});
+
 test('dashboard accepts an explicit auto-APR or specified-pool reinvest target', async () => {
   await withServer(async ({ calls }, base) => {
     const response = await fetch(base + '/api/investment/target', {

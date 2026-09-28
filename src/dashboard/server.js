@@ -68,7 +68,12 @@ export class DashboardServer {
     }
     if (req.method === 'GET' && url.pathname === '/api/events') {
       const limit = Math.min(1000, Math.max(1, Number(url.searchParams.get('limit') || 250)));
-      return sendJson(res, 200, { events: this.ledger.list({ limit }) });
+      return sendJson(res, 200, {
+        events: this.ledger.list({
+          limit,
+          excludeTypes: new Set(['points.global_swap_fee', 'portfolio.snapshot'])
+        })
+      });
     }
     if (req.method === 'GET' && url.pathname === '/api/control/status') {
       const status = await this.bot.controlStatus();

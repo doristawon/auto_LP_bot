@@ -28,12 +28,12 @@ export class LedgerStore {
     if (this.seenKeys.has(eventKey)) return null;
     return this.append(type, { eventKey, ...data }, ts);
   }
-  list({ limit = 250, type = null } = {}) {
+  list({ limit = 250, type = null, excludeTypes = null } = {}) {
     this.syncEvents();
     const out = [];
     for (let i = this.events.length - 1; i >= 0 && out.length < limit; i -= 1) {
       const event = this.events[i];
-      if (!type || event.type === type) out.push(event);
+      if ((!type || event.type === type) && !excludeTypes?.has(event.type)) out.push(event);
     }
     return out;
   }

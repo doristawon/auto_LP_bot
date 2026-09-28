@@ -20,6 +20,7 @@ import {
 } from '../abi.js';
 import { POOLS_STORAGE_SLOT, ZERO_ADDRESS } from '../constants.js';
 import { log } from '../logger.js';
+import { isRpcRateLimitError, isRpcTimeoutError } from '../rpc/errors.js';
 
 const abiCoder = AbiCoder.defaultAbiCoder();
 const hookInterface = new Interface(HOOK_ABI);
@@ -191,12 +192,11 @@ export class FablesAdapter {
     return result;
   }
 
-  async readPoolState(pool) {
-    const hook = new Contract(pool.key.hooks, HOOK_ABI, this.provider);
-    const [poolManagerAddress, paused] = await Promise.all([
-      hook.poolManager(),
-      hook.paused()
-    ]);
+  async readPoolState(pool, sharedHookState = null) {
+    const [poolManagerAddress, paused] = sharedHookState || await (async () => {
+      const hook = new Contract(pool.key.hooks, HOOK_ABI, this.provider);
+      return Promise.all([hook.poolManager(), hook.paused()]);
+    })();
     const manager = new Contract(poolManagerAddress, POOL_MANAGER_ABI, this.provider);
     const slot = keccak256(abiCoder.encode(['bytes32', 'uint256'], [pool.id, POOLS_STORAGE_SLOT]));
     const words = await manager.extsload(slot, 4);
@@ -216,11 +216,21 @@ export class FablesAdapter {
 
   async hydratePoolStates(pools, concurrency = 4) {
     const out = [];
+    const hookStates = new Map();
+    const sharedHookState = (pool) => {
+      const key = pool.key.hooks.toLowerCase();
+      if (!hookStates.has(key)) {
+        const hook = new Contract(pool.key.hooks, HOOK_ABI, this.provider);
+        hookStates.set(key, Promise.all([hook.poolManager(), hook.paused()]));
+      }
+      return hookStates.get(key);
+    };
     for (let i = 0; i < pools.length; i += concurrency) {
       const batch = pools.slice(i, i + concurrency);
       const states = await Promise.all(batch.map(async (pool) => {
-        try { return { ...pool, state: await this.readPoolState(pool) }; }
+        try { return { ...pool, state: await this.readPoolState(pool, await sharedHookState(pool)) }; }
         catch (error) {
+          if (isRpcRateLimitError(error) || isRpcTimeoutError(error)) throw error;
           log('warn', 'pool.state_failed', { poolId: pool.id, error: error.message });
           return { ...pool, state: null };
         }
@@ -372,6 +382,7 @@ export class FablesAdapter {
         cursor = end + 1;
         if (span < maxSpan) span = Math.min(maxSpan, span * 2);
       } catch (error) {
+        if (isRpcRateLimitError(error)) throw error;
         const message = String(error?.message || '');
         const advertisedLimit = /limited to\s+(\d+)\s+blocks/i.exec(message);
         const capped = advertisedLimit ? Math.max(1, Number(advertisedLimit[1])) : 0;

@@ -10,6 +10,7 @@ import { buildUsdPriceMap } from './analytics/prices.js';
 import { spotToken1PerToken0 } from './analytics/liquidity.js';
 import { PortfolioAnalytics } from './analytics/portfolio.js';
 import { PointsTracker } from './analytics/points-tracker.js';
+import { POINTS_DAY_MS, pointsCampaignDayStartMs } from './analytics/points.js';
 import { valueSwapFeeInUsd } from './analytics/points-accounting.js';
 import { buildDepositPlan } from './analytics/rebalance-plan.js';
 import { chooseInvestmentAnchor, rankAprPools } from './execution/investment-target.js';
@@ -19,6 +20,7 @@ import { StateStore } from './state.js';
 import { normalizeRuntimeIntervals } from './config.js';
 import { persistRuntimeCredentials } from './runtime-credentials.js';
 import { DEFAULT_RPC_URL, ZERO_ADDRESS } from './constants.js';
+import { isRpcRateLimitError, isRpcTimeoutError } from './rpc/errors.js';
 import { isLpOutOfRange } from './math/ticks.js';
 import { buildExactWithdrawBounds } from './math/v4-fixed.js';
 import { HOOK_ABI } from './abi.js';
@@ -28,6 +30,8 @@ const hookInterface = new Interface(HOOK_ABI);
 const transferTopic = id('Transfer(address,address,uint256)').toLowerCase();
 const REBALANCE_FAILURE_BASE_MS = 60_000;
 const REBALANCE_FAILURE_MAX_MS = 30 * 60_000;
+const RPC_RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
+const RPC_TIMEOUT_BACKOFF_MS = 2 * 60_000;
 
 function rebalanceFailureKey(pool, position) {
   return `${String(pool.id).toLowerCase()}:${String(position.id).toLowerCase()}`;
@@ -105,7 +109,7 @@ export class AutoLpBot {
     this.quoter = new V4QuoterAdapter(this.providers.readProvider);
     this.analytics = new PortfolioAnalytics(config, this.ledger, this.state);
     this.points = new PointsTracker(config, this.ledger, this.state);
-    this.market = { refreshedAt: 0, pools: [], prices: new Map(), latestBlock: 0, fablesStats: null };
+    this.market = { refreshedAt: 0, stateRefreshedAt: 0, pools: [], prices: new Map(), latestBlock: 0, fablesStats: null };
     this.rpcHealth = [];
     this.executionPaused = true;
     this.state.setSetting('executionPaused', true);
@@ -243,7 +247,9 @@ export class AutoLpBot {
       })),
       rpc: {
         customConfigured: this.config.rpcUrls.some((url) => url !== DEFAULT_RPC_URL),
+        customHealthy: this.config.rpcUrls.some((url, index) => url !== DEFAULT_RPC_URL && this.rpcHealth[index]?.ok),
         endpointCount: this.config.rpcUrls.length,
+        activeEndpointCount: this.providers.rawProviders.length,
         chainId: this.config.chainId
       },
       runtimeIntervals: this.getRuntimeIntervals(),
@@ -746,15 +752,23 @@ export class AutoLpBot {
     if (!force && Date.now() - this.market.refreshedAt < this.config.marketRefreshMs) return this.market;
     log('info', 'market.refresh_started', { force });
     const latestBlock = await this.providers.readProvider.getBlockNumber();
-    const discovered = await this.fables.discoverAllPools();
-    const pools = await this.fables.hydratePoolStates(discovered);
+    const fullStateRefresh = force || !this.market.pools.length
+      || Date.now() - Number(this.market.stateRefreshedAt || 0) >= (this.config.marketStateRefreshMs || 5 * 60_000);
+    const pools = fullStateRefresh
+      ? await this.fables.hydratePoolStates(await this.fables.discoverAllPools())
+      : this.market.pools;
     let fablesStats = null;
     try { fablesStats = await fetchFablesPoolStats(); }
     catch (error) { log('warn', 'fables.stats_unavailable', { error: error.message }); }
     const prices = buildUsdPriceMap(pools, this.config.usdgAddress, { fablesStats });
-    this.market = { refreshedAt: Date.now(), pools, prices, latestBlock, fablesStats };
+    this.market = {
+      refreshedAt: Date.now(),
+      stateRefreshedAt: fullStateRefresh ? Date.now() : this.market.stateRefreshedAt,
+      pools, prices, latestBlock, fablesStats
+    };
     if (this.config.pointsGlobalSwapScanEnabled !== false) {
-      if (!this.globalPointScanPromise) {
+      const retryAt = Number(this.state.getSetting('pointsGlobalScanRetryAt', 0) || 0);
+      if (!this.globalPointScanPromise && Date.now() >= retryAt) {
         log('info', 'points.global_scan_started', { block: latestBlock, pools: pools.length });
         const scan = this.scanGlobalPointFees(pools, latestBlock)
           .catch((error) => log('warn', 'points.global_scan_failed', { error: error.message }))
@@ -770,6 +784,7 @@ export class AutoLpBot {
     log('info', 'market.refreshed', {
       block: latestBlock,
       pools: pools.length,
+      fullStateRefresh,
       pricedAssets: prices.size,
       targetMode: this.config.targetMode,
       targetPools: this.config.targetMode === 'wallet-active' ? null : this.fables.targetPools(pools).length
@@ -1478,6 +1493,8 @@ export class AutoLpBot {
     const fables = this.fables;
     const ledger = this.ledger;
     const config = { ...this.config };
+    const retryAt = Number(state.getSetting('pointsGlobalScanRetryAt', 0) || 0);
+    if (Date.now() < retryAt) return;
     // Backfill a bounded block window per market refresh. A new wallet can be
     // hundreds of thousands of blocks behind; blocking startup on that entire
     // history would leave the trading readiness scan unavailable for minutes.
@@ -1507,27 +1524,48 @@ export class AutoLpBot {
     try {
       swaps = await fables.scanGlobalSwaps(pools, fromBlock, scannedThroughBlock);
     } catch (error) {
+      const rateLimited = isRpcRateLimitError(error);
       log('warn', 'points.global_swap_scan_failed', {
         fromBlock,
         scannedThroughBlock,
-        error: error.message
+        error: rateLimited ? 'rpc-rate-limited' : error.message
       });
+      if (rateLimited || isRpcTimeoutError(error)) {
+        state.setSetting('pointsGlobalScanRetryAt', Date.now()
+          + (rateLimited ? RPC_RATE_LIMIT_BACKOFF_MS : RPC_TIMEOUT_BACKOFF_MS));
+      }
       state.setSetting('pointsGlobalScanProgress', {
         fromBlock, scannedThroughBlock, latestBlock, complete: false, inProgress: false,
-        error: error.message, at: Date.now()
+        error: rateLimited ? 'rpc-rate-limited' : error.message, at: Date.now()
       });
       return;
     }
 
+    let swapTimes;
+    try {
+      swapTimes = await this.campaignSwapTimestamps(swaps, latestBlock, state);
+    } catch (error) {
+      const rateLimited = isRpcRateLimitError(error);
+      if (rateLimited || isRpcTimeoutError(error)) {
+        state.setSetting('pointsGlobalScanRetryAt', Date.now()
+          + (rateLimited ? RPC_RATE_LIMIT_BACKOFF_MS : RPC_TIMEOUT_BACKOFF_MS));
+      }
+      state.setSetting('pointsGlobalScanProgress', {
+        fromBlock, scannedThroughBlock, latestBlock, complete: false, inProgress: false,
+        error: rateLimited ? 'rpc-rate-limited' : error.message, at: Date.now()
+      });
+      throw error;
+    }
     let priced = 0;
     let unpriced = 0;
-    for (const swap of swaps) {
+    for (let index = 0; index < swaps.length; index += 1) {
+      const swap = swaps[index];
       const valuation = valueSwapFeeInUsd({
         pool: swap.pool,
         swap,
         usdgAddress: config.usdgAddress
       });
-      const ts = await this.blockTimestamp(swap.blockNumber);
+      const ts = swapTimes[index];
       if (valuation.priced) priced += 1;
       else unpriced += 1;
       ledger.appendUnique(
@@ -1550,7 +1588,9 @@ export class AutoLpBot {
           inputToken: valuation.inputToken,
           inputAmount: valuation.inputAmount,
           feeAmount: valuation.feeAmount,
-          feeUsd: valuation.feeUsd
+          feeUsd: valuation.feeUsd,
+          timestampEstimated: swap.blockNumber !== swaps[0].blockNumber
+            && swap.blockNumber !== swaps.at(-1).blockNumber
         },
         ts
       );
@@ -1574,6 +1614,34 @@ export class AutoLpBot {
     if (swaps.length || unpriced) {
       log('info', 'points.global_scan', { fromBlock, scannedThroughBlock, latestBlock, complete, swaps: swaps.length, priced, unpriced });
     }
+  }
+
+  async campaignSwapTimestamps(swaps, latestBlock, state = this.state) {
+    if (!swaps.length) return [];
+    const firstBlock = swaps[0].blockNumber;
+    const lastBlock = swaps.at(-1).blockNumber;
+    const firstTime = await this.blockTimestamp(firstBlock);
+    const lastTime = lastBlock === firstBlock ? firstTime : await this.blockTimestamp(lastBlock);
+    let dayStart = pointsCampaignDayStartMs(firstTime);
+    if (dayStart == null) return swaps.map(() => firstTime);
+    const boundaries = [];
+    for (let boundary = dayStart + POINTS_DAY_MS; boundary <= lastTime; boundary += POINTS_DAY_MS) {
+      boundaries.push({
+        block: await this.blockAtOrAfterTimestamp(boundary, latestBlock, state),
+        dayStart: boundary
+      });
+    }
+    let boundaryIndex = 0;
+    return swaps.map((swap) => {
+      while (boundaryIndex < boundaries.length && swap.blockNumber >= boundaries[boundaryIndex].block) {
+        dayStart = boundaries[boundaryIndex].dayStart;
+        boundaryIndex += 1;
+      }
+      const fraction = lastBlock === firstBlock ? 0
+        : (swap.blockNumber - firstBlock) / (lastBlock - firstBlock);
+      const estimate = Math.round(firstTime + fraction * (lastTime - firstTime));
+      return Math.max(dayStart, Math.min(dayStart + POINTS_DAY_MS - 1, estimate));
+    });
   }
 
   async blockAtOrAfterTimestamp(timestampMs, latestBlock, state = this.state) {
@@ -1628,6 +1696,7 @@ export class AutoLpBot {
       let events;
       try { events = await this.fables.scanPoolFees(pool, fromBlock, latestBlock); }
       catch (error) {
+        if (isRpcRateLimitError(error) || isRpcTimeoutError(error)) throw error;
         log('warn', 'pool_fee.scan_failed', { poolId: pool.id, fromBlock, latestBlock, error: error.message });
         continue;
       }
@@ -1908,13 +1977,24 @@ export class AutoLpBot {
     this.schedulePointsSimulation();
     while (this.running) {
       const started = Date.now();
-      try { await this.runOnce(); }
+      try {
+        await this.runOnce();
+        this.rpcTimeoutStreak = 0;
+      }
       catch (error) {
+        const rateLimited = isRpcRateLimitError(error);
+        const timedOut = isRpcTimeoutError(error);
+        this.rpcTimeoutStreak = timedOut ? (this.rpcTimeoutStreak || 0) + 1 : 0;
         if (this.walletImportState.status === 'scanning') {
           this.walletImportState = { status: 'failed', address: this.config.walletAddress, error: 'Initial scan failed; check RPC health and logs' };
         }
-        this.ledger.append('cycle.failed', { error: error.message });
-        log('error', 'cycle.failed', { error: error.stack || error.message });
+        this.ledger.append('cycle.failed', { error: rateLimited ? 'rpc-rate-limited' : error.message });
+        log('error', 'cycle.failed', { error: rateLimited ? 'rpc-rate-limited' : error.stack || error.message });
+        if (rateLimited) await sleep(RPC_RATE_LIMIT_BACKOFF_MS);
+        else if (this.rpcTimeoutStreak >= 3) await sleep(Math.min(
+          RPC_RATE_LIMIT_BACKOFF_MS,
+          RPC_TIMEOUT_BACKOFF_MS * (this.rpcTimeoutStreak - 2)
+        ));
       }
       const wait = Math.max(1000, this.config.pollIntervalMs - (Date.now() - started));
       await sleep(wait);

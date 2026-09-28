@@ -14,6 +14,19 @@ test('ledger appends and deduplicates event keys', () => {
   assert.equal(ledger.sum('feeUsd', 'pool.fee'), 2);
 });
 
+test('ledger list can omit all-market points swaps without altering point accounting', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lp-ledger-'));
+  const ledger = new LedgerStore(dir);
+  ledger.append('tx.confirmed', { hash: 'wallet-tx' });
+  ledger.append('points.global_swap_fee', { feeUsd: 5 });
+  ledger.append('portfolio.snapshot', {});
+  assert.deepEqual(
+    ledger.list({ excludeTypes: new Set(['points.global_swap_fee', 'portfolio.snapshot']) }).map((event) => event.type),
+    ['tx.confirmed']
+  );
+  assert.equal(ledger.sum('feeUsd', 'points.global_swap_fee'), 5);
+});
+
 test('snapshot and baseline persist', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lp-ledger-'));
   const ledger = new LedgerStore(dir);

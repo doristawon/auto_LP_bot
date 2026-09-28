@@ -39,6 +39,8 @@ export function loadConfig() {
     pointsSimulationIntervalMs: envInt('POINTS_SIMULATION_INTERVAL_MS', 15_000)
   });
   const { marketRefreshMs, rangeCheckIntervalMs, pointsSimulationIntervalMs } = runtimeIntervals;
+  const marketStateRefreshMs = envInt('MARKET_STATE_REFRESH_MS', Math.max(marketRefreshMs, 5 * 60_000));
+  const pollIntervalMs = envInt('POLL_INTERVAL_MS', 60_000);
   const aprPoolMinTvlUsd = envNum('APR_POOL_MIN_TVL_USD', 30_000);
   const swapSlippageBps = envInt('SWAP_SLIPPAGE_BPS', 50);
   const maxSwapPriceImpactBps = envInt('MAX_SWAP_PRICE_IMPACT_BPS', 200);
@@ -77,6 +79,12 @@ export function loadConfig() {
     throw new Error('RANGE_PRESET must be custom-bps or fables-tight');
   }
   if (!(aprPoolMinTvlUsd > 0)) throw new Error('APR_POOL_MIN_TVL_USD must be > 0');
+  if (marketStateRefreshMs < 60_000 || marketStateRefreshMs > 60 * 60_000) {
+    throw new Error('MARKET_STATE_REFRESH_MS must be between 1 and 60 minutes');
+  }
+  if (pollIntervalMs < 5_000 || pollIntervalMs > 60 * 60_000) {
+    throw new Error('POLL_INTERVAL_MS must be between 5 seconds and 60 minutes');
+  }
   if (oorConfirmDelayMin <= 0) throw new Error('OOR_CONFIRM_DELAY_MIN must be > 0');
   if (swapSlippageBps < 0 || swapSlippageBps >= 10_000) throw new Error('SWAP_SLIPPAGE_BPS must be 0..9999');
   if (maxSwapPriceImpactBps < 0 || maxSwapPriceImpactBps > 1000) {
@@ -144,7 +152,7 @@ export function loadConfig() {
     targetPoolIds,
     rangePreset,
     positionIds: envList('POSITION_IDS', []).map(normalizeBytes32),
-    pollIntervalMs: envInt('POLL_INTERVAL_MS', 15_000),
+    pollIntervalMs,
     logChunkBlocks: envInt('LOG_CHUNK_BLOCKS', 5_000),
     minLogChunkBlocks: envInt('MIN_LOG_CHUNK_BLOCKS', 500),
     logFromBlock,
@@ -152,6 +160,7 @@ export function loadConfig() {
     manualTopologyCooldownSec: envInt('MANUAL_TOPOLOGY_COOLDOWN_SEC', 120),
     feeLogFromBlock: envInt('FEE_LOG_FROM_BLOCK', 0),
     marketRefreshMs,
+    marketStateRefreshMs,
     pointsSimulationIntervalMs,
     reorgLookbackBlocks: envInt('REORG_LOOKBACK_BLOCKS', 64),
     tightWidthBps: envInt('TIGHT_WIDTH_BPS', 120),
