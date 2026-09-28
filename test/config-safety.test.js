@@ -10,7 +10,7 @@ const BASE = {
 };
 
 function withEnv(extra, fn) {
-  const keys = new Set([...Object.keys(BASE), ...Object.keys(extra), 'TARGET_POOL_IDS', 'TARGET_SYMBOLS', 'TARGET_MODE', 'SWAP_SLIPPAGE_BPS', 'MAX_SWAP_PRICE_IMPACT_BPS', 'OOR_REBALANCE_SWAP_POOL_ID', 'OOR_REBALANCE_MAX_SWAP_PRICE_IMPACT_BPS', 'AUTO_TOPUP_SWAP_ENABLED', 'AUTO_TOPUP_SWAP_POOL_ID', 'AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS', 'PRIVATE_KEY', 'EIP7702_GUARD_ADDRESS', 'EIP7702_GUARD_VERIFIED', 'EIP7702_GUARD_VERIFIED_FOR', 'DASHBOARD_MANUAL_CONTROL_ENABLED', 'POINTS_GLOBAL_SWAP_SCAN_ENABLED', 'RPC_REQUEST_TIMEOUT_MS']);
+  const keys = new Set([...Object.keys(BASE), ...Object.keys(extra), 'TARGET_POOL_IDS', 'TARGET_SYMBOLS', 'TARGET_MODE', 'SWAP_SLIPPAGE_BPS', 'MAX_SWAP_PRICE_IMPACT_BPS', 'OOR_REBALANCE_SWAP_POOL_ID', 'OOR_REBALANCE_MAX_SWAP_PRICE_IMPACT_BPS', 'OOR_CONFIRM_DELAY_MIN', 'OOR_MAX_WAIT_MIN', 'AUTO_TOPUP_SWAP_ENABLED', 'AUTO_TOPUP_SWAP_POOL_ID', 'AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS', 'PRIVATE_KEY', 'EIP7702_GUARD_ADDRESS', 'EIP7702_GUARD_VERIFIED', 'EIP7702_GUARD_VERIFIED_FOR', 'DASHBOARD_MANUAL_CONTROL_ENABLED', 'POINTS_GLOBAL_SWAP_SCAN_ENABLED', 'RPC_REQUEST_TIMEOUT_MS']);
   const previous = Object.fromEntries([...keys].map((k) => [k, process.env[k]]));
   try {
     for (const key of keys) delete process.env[key];
@@ -58,6 +58,13 @@ test('RPC request timeout defaults to 30 seconds and is bounded', () => {
     () => withEnv({ TARGET_MODE: 'wallet-active', RPC_REQUEST_TIMEOUT_MS: '999' }, () => loadConfig()),
     /RPC_REQUEST_TIMEOUT_MS/
   );
+});
+
+test('OOR confirmation defaults to 15 minutes and ignores legacy max wait', () => {
+  const config = withEnv({ OOR_MAX_WAIT_MIN: '30' }, loadConfig);
+  assert.equal(config.oorConfirmDelayMin, 15);
+  assert.equal(config.oorConfirmDelayMs, 15 * 60_000);
+  assert.throws(() => withEnv({ OOR_CONFIRM_DELAY_MIN: '0' }, loadConfig), /OOR_CONFIRM_DELAY_MIN/);
 });
 
 test('invalid swap slippage fails closed', () => {

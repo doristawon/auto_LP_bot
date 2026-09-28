@@ -27,7 +27,7 @@ const position = {
   shares: 1_000_000_000_000_000_000n,
   outside: true,
   shouldRebalance: true,
-  rebalanceReason: 'oor_max_wait_expired'
+  rebalanceReason: 'oor_delay_confirmed'
 };
 
 function createHarness({ failSwap = false, failPreflight = false } = {}) {

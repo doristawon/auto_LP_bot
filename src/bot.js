@@ -13,7 +13,7 @@ import { PointsTracker } from './analytics/points-tracker.js';
 import { valueSwapFeeInUsd } from './analytics/points-accounting.js';
 import { buildDepositPlan } from './analytics/rebalance-plan.js';
 import { chooseInvestmentAnchor, rankAprPools } from './execution/investment-target.js';
-import { evaluatePosition, outOfRangeExcursionPct } from './strategy.js';
+import { evaluatePosition } from './strategy.js';
 import { LedgerStore } from './ledger.js';
 import { StateStore } from './state.js';
 import { normalizeRuntimeIntervals } from './config.js';
@@ -129,7 +129,22 @@ export class AutoLpBot {
   async initialize() {
     this.rpcHealth = await verifyProviders(this.providers.rawProviders, this.config.chainId);
     log('info', 'rpc.health', { endpoints: this.rpcHealth.map((x) => ({ index: x.index, ok: x.ok, chainId: x.chainId })) });
+    this.useHealthyRpcEndpoints();
     await this.refreshMarket(true);
+  }
+
+  useHealthyRpcEndpoints() {
+    const healthy = this.rpcHealth.filter((entry) => entry.ok).map((entry) => entry.index);
+    if (!healthy.length || (healthy.length === this.config.rpcUrls.length && healthy[0] === 0)) return;
+    const usableUrls = healthy.map((index) => this.config.rpcUrls[index]);
+    this.providers = createProviders({ ...this.config, rpcUrls: usableUrls });
+    this.fables = new FablesAdapter(this.providers.readProvider, this.config);
+    this.quoter = new V4QuoterAdapter(this.providers.readProvider);
+    this.executor = this.createExecutor();
+    log('warn', 'rpc.unhealthy_endpoints_skipped', {
+      configured: this.config.rpcUrls.length,
+      healthyIndices: healthy
+    });
   }
 
   setExecutionPaused(value, source = 'system') {
@@ -374,6 +389,7 @@ export class AutoLpBot {
     this.fables = new FablesAdapter(this.providers.readProvider, this.config);
     this.quoter = new V4QuoterAdapter(this.providers.readProvider);
     this.executor = this.createExecutor();
+    this.useHealthyRpcEndpoints();
     this.market.refreshedAt = 0;
     await this.refreshMarket(true);
     return { ok: true, chainId: this.config.chainId, endpointCount: urls.length };
@@ -769,7 +785,14 @@ export class AutoLpBot {
     }
     this.cycleActive = true;
     try {
-      await this.refreshMarket(false);
+      try {
+        await this.refreshMarket(false);
+      } catch (error) {
+        if (!this.market.pools.length) throw error;
+        // A registry/APR refresh failure must not freeze fresh on-chain LP checks.
+        // APR rotation still rejects stale statistics in rankAprPools.
+        log('warn', 'market.refresh_failed_using_cached_pools', { error: error.message });
+      }
       const latestBlock = await this.providers.readProvider.getBlockNumber();
       this.market.latestBlock = latestBlock;
       const selection = await this.resolveTargetPools(latestBlock);
@@ -1085,11 +1108,8 @@ export class AutoLpBot {
       edgeBufferTicks: this.config.edgeBufferTicks,
       lastEvaluationAt: Number(stored.lastRangeEvaluationAt || 0),
       outOfRangeSince: Number(stored.outOfRangeSince || 0),
-      deepConfirmationsSeen: Number(stored.deepOutOfRangeConfirmations || stored.outOfRangeConfirmations || 0),
       checkIntervalMs: this.config.rangeCheckIntervalMs,
-      shallowThresholdPct: this.config.oorShallowThresholdPct,
-      maxWaitMs: this.config.oorMaxWaitMs,
-      deepConfirmationsRequired: this.config.oorDeepConfirmations,
+      confirmDelayMs: this.config.oorConfirmDelayMs,
       cooldownUntil: stored.cooldownUntil || 0,
       nowMs
     });
@@ -1097,8 +1117,6 @@ export class AutoLpBot {
       outside: evaluation.outside,
       nearEdge: Boolean(evaluation.nearEdge),
       excursionPct: evaluation.excursionPct,
-      confirmations: evaluation.deepConfirmations,
-      deepConfirmations: evaluation.deepConfirmations,
       outOfRangeSince: evaluation.outOfRangeSince,
       outOfRangeElapsedMin: evaluation.outOfRangeElapsedMs / 60000,
       evaluationDue: evaluation.evaluationDue,
@@ -1111,8 +1129,8 @@ export class AutoLpBot {
       target: evaluation.target
     });
     this.state.setPosition(stateKey, {
-      outOfRangeConfirmations: evaluation.deepConfirmations,
-      deepOutOfRangeConfirmations: evaluation.deepConfirmations,
+      outOfRangeConfirmations: 0,
+      deepOutOfRangeConfirmations: 0,
       outOfRangeSince: evaluation.outOfRangeSince,
       lastRangeEvaluationAt: evaluation.evaluatedAt,
       lastExcursionPct: evaluation.excursionPct,
@@ -1128,7 +1146,6 @@ export class AutoLpBot {
       outside: evaluation.outside,
       excursionPct: evaluation.excursionPct,
       outOfRangeElapsedMin: evaluation.outOfRangeElapsedMs / 60000,
-      deepConfirmations: evaluation.deepConfirmations,
       evaluationDue: evaluation.evaluationDue,
       shouldRebalance: pool.state?.paused === false && evaluation.shouldRebalance,
       rebalanceReason: pool.state?.paused === false ? evaluation.rebalanceReason : null,
@@ -1428,41 +1445,7 @@ export class AutoLpBot {
       return false;
     }
 
-    if (outside) {
-      const excursionPct = outOfRangeExcursionPct(
-        latestState.tick,
-        position.tickLower,
-        position.tickUpper
-      );
-      if (
-        position.rebalanceReason === 'deep_oor_confirmed'
-        && excursionPct <= this.config.oorShallowThresholdPct
-      ) {
-        const stateKey = positionStateKey(pool, position);
-        this.state.setPosition(stateKey, {
-          outOfRangeConfirmations: 0,
-          deepOutOfRangeConfirmations: 0,
-          lastExcursionPct: excursionPct,
-          lastTick: latestState.tick
-        });
-        this.ledger.append('rebalance.blocked', {
-          positionId: position.id,
-          poolId: pool.id,
-          reason: 'deep OOR faded below threshold before execution',
-          latestTick: latestState.tick,
-          excursionPct,
-          thresholdPct: this.config.oorShallowThresholdPct
-        });
-        log('info', 'rebalance.deep_oor_faded', {
-          pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
-          positionId: position.id,
-          latestTick: latestState.tick,
-          excursionPct
-        });
-        return false;
-      }
-      return true;
-    }
+    if (outside) return true;
 
     const stateKey = positionStateKey(pool, position);
     this.state.setPosition(stateKey, {
@@ -1970,8 +1953,8 @@ function snapshotPool(pool) {
     paused: pool.state?.paused ?? null,
     positions: (pool.positions || []).map((p) => ({
       id: p.id, shares: p.shares.toString(), tickLower: p.tickLower, tickUpper: p.tickUpper,
-      outside: p.outside, nearEdge: Boolean(p.nearEdge), excursionPct: p.excursionPct, confirmations: p.confirmations,
-      deepConfirmations: p.deepConfirmations, outOfRangeSince: p.outOfRangeSince,
+      outside: p.outside, nearEdge: Boolean(p.nearEdge), excursionPct: p.excursionPct,
+      outOfRangeSince: p.outOfRangeSince,
       outOfRangeElapsedMin: p.outOfRangeElapsedMin, evaluationDue: p.evaluationDue,
       lastRangeEvaluationAt: p.lastRangeEvaluationAt, nextRangeEvaluationAt: p.nextRangeEvaluationAt,
       shouldRebalance: p.shouldRebalance, rebalanceReason: p.rebalanceReason,
@@ -2008,9 +1991,7 @@ function rangePolicySnapshot(config) {
   return {
     rangePreset: config.rangePreset,
     evaluationIntervalMs: config.rangeCheckIntervalMs,
-    shallowThresholdPct: config.oorShallowThresholdPct,
-    maxWaitMin: config.oorMaxWaitMin,
-    deepConfirmationsRequired: config.oorDeepConfirmations,
+    confirmDelayMin: config.oorConfirmDelayMin,
     monitorPollIntervalMs: config.pollIntervalMs
   };
 }

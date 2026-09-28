@@ -77,7 +77,7 @@ Dashboard 僅綁定 `127.0.0.1` 時不需要 `DASHBOARD_TOKEN`，符合本機部
 
 `AUTO_TOPUP_ENABLED=true` 會把目前唯一、仍在區間內的 LP 交易對閒置代幣投入原區間，保留 `AUTO_TOPUP_DUST_BPS` 零頭與 `AUTO_TOPUP_MIN_GAS_ETH` Gas。預設不換幣；若要處理比例不符的餘額，須另外設定 `AUTO_TOPUP_SWAP_ENABLED=true`、**單一** `AUTO_TOPUP_SWAP_POOL_ID` 及該池的 `AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS`。一般再平衡仍受獨立的 `MAX_SWAP_PRICE_IMPACT_BPS` 限制。
 
-同池 OOR 再平衡會在撤出舊 LP 前，透過 `eth_simulateV1` 預演 guarded 撤池、必要的授權與換幣、重新存入 tight 區間，並檢查 Gas 預算；任何預演失敗都保留舊 LP。`npm run preflight:oor` 可唯讀檢查目前唯一的 OOR 部位。`-- --diagnostic-max-bps=350` 只調整該次診斷的報價上限，**不會**改變實盤設定。若要為單一池設定獨立實盤上限，需同時指定 `OOR_REBALANCE_SWAP_POOL_ID` 與 `OOR_REBALANCE_MAX_SWAP_PRICE_IMPACT_BPS`；其他池仍使用 `MAX_SWAP_PRICE_IMPACT_BPS`。當深度 OOR 達到連續確認門檻後，資格會維持到回到原區間、冷卻或下次政策評估更新，避免監控畫面掃描把交易資格洗掉。
+同池 OOR 再平衡會在撤出舊 LP 前，透過 `eth_simulateV1` 預演 guarded 撤池、必要的授權與換幣、重新存入 tight 區間，並檢查 Gas 預算；任何預演失敗都保留舊 LP。`npm run preflight:oor` 可唯讀檢查目前唯一的 OOR 部位。`-- --diagnostic-max-bps=350` 只調整該次診斷的報價上限，**不會**改變實盤設定。若要為單一池設定獨立實盤上限，需同時指定 `OOR_REBALANCE_SWAP_POOL_ID` 與 `OOR_REBALANCE_MAX_SWAP_PRICE_IMPACT_BPS`；其他池仍使用 `MAX_SWAP_PRICE_IMPACT_BPS`。首次觀測到 OOR 後滿 `OOR_CONFIRM_DELAY_MIN` 分鐘，下一次成功讀取鏈上 Tick 時若仍在原 LP 區間外，才具備自動撤池資格；任何一次讀到回到區間內都會清除計時。複查受監控週期與 RPC 可用性影響，可能晚於 15 分鐘。
 
 部分 Solady ERC20 將 ERC20→Permit2 授權固定為無限額，並拒絕 `approve(Permit2, ...)`。機器人只有在現有授權確為 `uint256.max` 且唯讀呼叫回傳 `Permit2AllowanceIsFixedAtInfinity()` 時才跳過該層重設；Permit2→Router 仍必須設定定額與有效期限。
 

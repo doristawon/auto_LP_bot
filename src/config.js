@@ -29,7 +29,7 @@ export function loadConfig() {
   const pointsGlobalSwapScanEnabled = envBool('POINTS_GLOBAL_SWAP_SCAN_ENABLED', true);
   const targetMode = (process.env.TARGET_MODE?.trim() || 'wallet-active').toLowerCase();
   const logFromBlock = envInt('LOG_FROM_BLOCK', 44_000_000);
-  const oorMaxWaitMin = envInt('OOR_MAX_WAIT_MIN', 30);
+  const oorConfirmDelayMin = envInt('OOR_CONFIRM_DELAY_MIN', 15);
   const targetSymbols = envList('TARGET_SYMBOLS', []).map((x) => x.toUpperCase());
   const targetPoolIds = envList('TARGET_POOL_IDS', []).map((x) => x.toLowerCase());
   const rangePreset = (process.env.RANGE_PRESET?.trim() || 'custom-bps').toLowerCase();
@@ -39,9 +39,7 @@ export function loadConfig() {
     pointsSimulationIntervalMs: envInt('POINTS_SIMULATION_INTERVAL_MS', 15_000)
   });
   const { marketRefreshMs, rangeCheckIntervalMs, pointsSimulationIntervalMs } = runtimeIntervals;
-  const oorShallowThresholdPct = envNum('OOR_SHALLOW_THRESHOLD_PCT', 0.5);
   const aprPoolMinTvlUsd = envNum('APR_POOL_MIN_TVL_USD', 30_000);
-  const oorDeepConfirmations = envInt('OOR_DEEP_CONFIRMATIONS', envInt('OUT_OF_RANGE_CONFIRMATIONS', 2));
   const swapSlippageBps = envInt('SWAP_SLIPPAGE_BPS', 50);
   const maxSwapPriceImpactBps = envInt('MAX_SWAP_PRICE_IMPACT_BPS', 200);
   const oorRebalanceSwapPoolId = process.env.OOR_REBALANCE_SWAP_POOL_ID?.trim().toLowerCase() || '';
@@ -78,12 +76,8 @@ export function loadConfig() {
   if (!['custom-bps', 'fables-tight'].includes(rangePreset)) {
     throw new Error('RANGE_PRESET must be custom-bps or fables-tight');
   }
-  if (!(oorShallowThresholdPct >= 0 && oorShallowThresholdPct <= 100)) {
-    throw new Error('OOR_SHALLOW_THRESHOLD_PCT must be between 0 and 100');
-  }
   if (!(aprPoolMinTvlUsd > 0)) throw new Error('APR_POOL_MIN_TVL_USD must be > 0');
-  if (oorMaxWaitMin <= 0) throw new Error('OOR_MAX_WAIT_MIN must be > 0');
-  if (oorDeepConfirmations < 1) throw new Error('OOR_DEEP_CONFIRMATIONS must be >= 1');
+  if (oorConfirmDelayMin <= 0) throw new Error('OOR_CONFIRM_DELAY_MIN must be > 0');
   if (swapSlippageBps < 0 || swapSlippageBps >= 10_000) throw new Error('SWAP_SLIPPAGE_BPS must be 0..9999');
   if (maxSwapPriceImpactBps < 0 || maxSwapPriceImpactBps > 1000) {
     throw new Error('MAX_SWAP_PRICE_IMPACT_BPS must be 0..1000');
@@ -163,11 +157,9 @@ export function loadConfig() {
     tightWidthBps: envInt('TIGHT_WIDTH_BPS', 120),
     edgeBufferTicks: envInt('EDGE_BUFFER_TICKS', 0),
     rangeCheckIntervalMs,
-    oorShallowThresholdPct,
     aprPoolMinTvlUsd,
-    oorMaxWaitMin,
-    oorMaxWaitMs: oorMaxWaitMin * 60 * 1000,
-    oorDeepConfirmations,
+    oorConfirmDelayMin,
+    oorConfirmDelayMs: oorConfirmDelayMin * 60 * 1000,
     minRebalanceIntervalSec: envInt('MIN_REBALANCE_INTERVAL_SEC', 300),
     maxRebalancesPerHour: envInt('MAX_REBALANCES_PER_HOUR', 3),
     swapSlippageBps,
