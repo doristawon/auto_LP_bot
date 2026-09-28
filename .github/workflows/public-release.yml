@@ -17,6 +17,8 @@ on:
       - "package.json"
       - "package-lock.json"
       - "Dockerfile"
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
