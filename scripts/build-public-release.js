@@ -86,7 +86,7 @@ function sanitizeText(rel, input) {
 
   if (rel === 'README.md') {
     text = text.replace(/^# Auto LP Bot — Fables\.fi \/ Robinhood Chain\s*/m,
-      '# Auto LP Bot — Fables.fi / Robinhood Chain\n\n> Public release: this snapshot contains no production wallet identity, private transaction fixture, portfolio amount, local credential, or private repository history. Configure your own wallet and RPC only in a Git-ignored local \`.env\`.\n\n');
+      '# Auto LP Bot — Fables.fi / Robinhood Chain\n\n> Public release: this snapshot contains no production wallet identity, private transaction fixture, portfolio amount, local credential, or private repository history. Configure your own wallet and RPC only in a Git-ignored local `.env`.\n\n');
     text = text.replace(/\bMOO\b/g, 'TOKEN_A');
     text = text.replace(/\bZZZ\b/g, 'TOKEN_B');
   }
@@ -106,7 +106,7 @@ function sanitizeText(rel, input) {
   return text;
 }
 
-const syntheticDepositTest = String.raw\`import test from 'node:test';
+const syntheticDepositTest = String.raw`import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Interface, id } from 'ethers';
 
@@ -160,9 +160,9 @@ test('synthetic deposit fixture round-trips through the verified ABI', () => {
   assert.equal(BigInt(decoded[5]), fixture.amount1Max);
   assert.equal(Number(decoded[6]), fixture.deadline);
 });
-\`;
+`;
 
-const syntheticWithdrawTest = String.raw\`import test from 'node:test';
+const syntheticWithdrawTest = String.raw`import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Interface, id } from 'ethers';
 import { FablesAdapter } from '../src/adapters/fables.js';
@@ -219,7 +219,7 @@ test('adapter encodes a deterministic synthetic withdraw fixture', () => {
   assert.equal(Number(decoded[7]), 2000000000);
   assert.equal(Number(decoded[8]), 1000);
 });
-\`;
+`;
 
 function writeFile(rel, content) {
   const dest = path.join(out, rel);
@@ -236,7 +236,7 @@ for (const rel of trackedFiles()) {
   const stat = fs.statSync(source);
   if (!stat.isFile()) continue;
   const content = fs.readFileSync(source);
-  if (content.includes(0)) throw new Error(\`Binary tracked file not supported in public release: \${rel}\`);
+  if (content.includes(0)) throw new Error(`Binary tracked file not supported in public release: \${rel}`);
   writeFile(rel, sanitizeText(rel, content.toString('utf8')));
 }
 
@@ -253,15 +253,17 @@ pkg.scripts.check = pkg.scripts.check
   .join(' && ');
 fs.writeFileSync(packagePath, JSON.stringify(pkg, null, 2) + '\n');
 
-writeFile('SECURITY.md', \`# Security
-
-This public repository intentionally excludes production wallet identities, private transaction fixtures, portfolio snapshots, local credentials, and private Git history.
-
-- Never commit a private key, mnemonic, dashboard token, managed RPC credential, or local \\\`.env\\\`.
-- Use a dedicated hot wallet with limited capital.
-- Keep \\\`DRY_RUN=true\\\`, \\\`ENABLE_LIVE_WRITES=false\\\`, and \\\`ENABLE_AUTO_REDEPLOY=false\\\` until the documented guard and canary checks have passed.
-- Treat copied transaction calldata, wallet addresses, screenshots, logs, and accounting exports as potentially identifying data before publishing them.
-\`);
+writeFile('SECURITY.md', [
+  '# Security',
+  '',
+  'This public repository intentionally excludes production wallet identities, private transaction fixtures, portfolio snapshots, local credentials, and private Git history.',
+  '',
+  '- Never commit a private key, mnemonic, dashboard token, managed RPC credential, or local .env.',
+  '- Use a dedicated hot wallet with limited capital.',
+  '- Keep DRY_RUN=true, ENABLE_LIVE_WRITES=false, and ENABLE_AUTO_REDEPLOY=false until the documented guard and canary checks have passed.',
+  '- Treat copied transaction calldata, wallet addresses, screenshots, logs, and accounting exports as potentially identifying data before publishing them.',
+  ''
+].join('\n'));
 
 const files = [];
 function walk(dir) {
@@ -303,10 +305,10 @@ for (const file of files) {
   const text = fs.readFileSync(file, 'utf8');
   const lower = text.toLowerCase();
   for (const exact of forbiddenExact) {
-    if (lower.includes(exact.toLowerCase())) findings.push(\`\${rel}: forbidden exact value \${exact}\`);
+    if (lower.includes(exact.toLowerCase())) findings.push(`\${rel}: forbidden exact value \${exact}`);
   }
   for (const re of secretPatterns) {
-    if (re.test(text)) findings.push(\`\${rel}: suspicious secret/private-path pattern \${re}\`);
+    if (re.test(text)) findings.push(`\${rel}: suspicious secret/private-path pattern \${re}`);
   }
 }
 
@@ -328,8 +330,8 @@ writeFile('PUBLIC_RELEASE_MANIFEST.md',
   + '- Private/real-wallet CI workflows and trigger files: excluded.\n'
   + '- Local credentials, data, state, logs and artifacts: excluded by tracked-file build and .gitignore.\n'
   + '- Private commit history and author email metadata: not included.\n\n'
-  + \`Tracked public files: \${manifest.length}\n\`
+  + `Tracked public files: \${manifest.length}\n`
 );
 
-console.log(\`Public release built: \${manifest.length} files\`);
+console.log(`Public release built: \${manifest.length} files`);
 console.log('Privacy scan: PASS');
