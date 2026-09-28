@@ -40,7 +40,7 @@ test('APR ranking excludes stale, paused, empty, and undersized pools', () => {
   assert.deepEqual(rankAprPools({ pools, stats: { ...stats, observedAt: nowMs - 600_000 }, nowMs }).map((item) => item.pool.id), []);
 });
 
-test('live APR mode keeps the existing LP pool while cross-pool execution cannot be simulated', () => {
+test('live APR mode reports the highest route-compatible candidate for full preflight', () => {
   const nowMs = Date.now();
   const source = pool('source', token(USDG, 'USDG'), token(MOO, 'MOO'));
   const higher = pool('higher', token(USDG, 'USDG'), token(UBIK, 'UBIK'));
@@ -59,13 +59,66 @@ test('live APR mode keeps the existing LP pool while cross-pool execution cannot
     snapshot: { portfolio: { positions: [{ poolId: 'source', shares: '1' }] } },
     getInvestmentTargetSettings() { return { mode: 'apr-highest', poolId: '' }; }
   };
-  assert.equal(AutoLpBot.prototype.resolveInvestmentTarget.call(bot, source).id, 'source');
+  assert.equal(AutoLpBot.prototype.resolveInvestmentTarget.call(bot, source).id, 'higher');
   const target = AutoLpBot.prototype.getInvestmentTargetSnapshot.call(bot);
-  assert.equal(target.poolId, 'source');
-  assert.match(target.executionConstraint, /cross-pool-live-unavailable/);
+  assert.equal(target.poolId, 'higher');
+  assert.match(target.executionConstraint, /complete live sequence preflight/);
 
   bot.config.dryRun = true;
   assert.equal(AutoLpBot.prototype.resolveInvestmentTarget.call(bot, source).id, 'higher');
+});
+
+test('APR execution skips candidates whose complete preflight fails', async () => {
+  const nowMs = Date.now();
+  const source = pool('source', token(USDG, 'USDG'), token(MOO, 'MOO'));
+  const high = pool('high', token(USDG, 'USDG'), token(UBIK, 'UBIK'));
+  const middle = pool('middle', token(USDG, 'USDG'), token(ZZZ, 'ZZZ'));
+  const checked = [];
+  const events = [];
+  const bot = {
+    config: { marketRefreshMs: 300_000, aprPoolMinTvlUsd: 30_000 },
+    market: {
+      pools: [source, high, middle],
+      fablesStats: { observedAt: nowMs, pools: new Map([
+        ['high', { aprPct: 300, tvlUsd: 100_000, fees24hUsd: 30 }],
+        ['middle', { aprPct: 200, tvlUsd: 100_000, fees24hUsd: 20 }],
+        ['source', { aprPct: 100, tvlUsd: 100_000, fees24hUsd: 10 }]
+      ]) }
+    },
+    executor: { async preflightCrossPoolSequence(_plan, destination) {
+      checked.push(destination.id);
+      if (destination.id === 'high') throw new Error('price impact exceeds limit');
+    } },
+    ledger: { append(type, data) { events.push({ type, data }); } }
+  };
+  const selected = await AutoLpBot.prototype.resolveExecutableInvestmentTarget.call(bot, source,
+    { id: 'position' });
+  assert.equal(selected.id, 'middle');
+  assert.deepEqual(checked, ['high', 'middle']);
+  assert.ok(events.some((entry) => entry.type === 'investment.cross_pool_candidate_ready'));
+});
+
+test('APR execution skips native ETH pools before expensive preflight', async () => {
+  const nowMs = Date.now();
+  const source = pool('source', token(USDG, 'USDG'), token(MOO, 'MOO'));
+  const native = pool('native', token('0x0000000000000000000000000000000000000000', 'ETH'), token(USDG, 'USDG'));
+  const erc20 = pool('erc20', token(USDG, 'USDG'), token(UBIK, 'UBIK'));
+  const checked = [];
+  const bot = {
+    config: { marketRefreshMs: 300_000, aprPoolMinTvlUsd: 30_000 },
+    market: { pools: [source, native, erc20], fablesStats: {
+      observedAt: nowMs, pools: new Map([
+        ['native', { aprPct: 500, tvlUsd: 100_000, fees24hUsd: 50 }],
+        ['erc20', { aprPct: 300, tvlUsd: 100_000, fees24hUsd: 30 }]
+      ])
+    } },
+    executor: { async preflightCrossPoolSequence(_plan, destination) { checked.push(destination.id); } },
+    ledger: { append() {} }
+  };
+  const selected = await AutoLpBot.prototype.resolveExecutableInvestmentTarget.call(bot, source,
+    { id: 'position' });
+  assert.equal(selected.id, 'erc20');
+  assert.deepEqual(checked, ['erc20']);
 });
 
 test('Fables route search returns the shortest connected route and ordered path keys', () => {

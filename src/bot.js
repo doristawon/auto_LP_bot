@@ -16,6 +16,7 @@ import { POINTS_DAY_MS, pointsCampaignDayStartMs } from './analytics/points.js';
 import { valueSwapFeeInUsd } from './analytics/points-accounting.js';
 import { buildDepositPlan } from './analytics/rebalance-plan.js';
 import { chooseInvestmentAnchor, rankAprPools } from './execution/investment-target.js';
+import { probePoolSwapCosts } from './execution/pool-quote-probes.js';
 import { evaluatePosition } from './strategy.js';
 import { LedgerStore } from './ledger.js';
 import { StateStore } from './state.js';
@@ -25,16 +26,22 @@ import { DEFAULT_RPC_URL, ZERO_ADDRESS } from './constants.js';
 import { isRpcRateLimitError, isRpcTimeoutError } from './rpc/errors.js';
 import { isLpOutOfRange } from './math/ticks.js';
 import { buildExactWithdrawBounds } from './math/v4-fixed.js';
-import { HOOK_ABI } from './abi.js';
+import { EIP7702_GUARD_ABI, HOOK_ABI } from './abi.js';
 import { log, registerSensitiveValues, sanitize } from './logger.js';
 
 const hookInterface = new Interface(HOOK_ABI);
+const guardInterface = new Interface(EIP7702_GUARD_ABI);
 const transferTopic = id('Transfer(address,address,uint256)').toLowerCase();
 const PROLOGUE_FEE_DISTRIBUTOR = '0xc9ecc11728a4955b31f77c077b97fec521d78760';
 const REBALANCE_FAILURE_BASE_MS = 60_000;
 const REBALANCE_FAILURE_MAX_MS = 30 * 60_000;
 const RPC_RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
 const RPC_TIMEOUT_BACKOFF_MS = 2 * 60_000;
+
+function hasNativeCurrency(pool) {
+  return [pool?.token0, pool?.token1].some((token) =>
+    String(token?.address || '').toLowerCase() === ZERO_ADDRESS);
+}
 
 function rebalanceFailureKey(pool, position) {
   return `${String(pool.id).toLowerCase()}:${String(position.id).toLowerCase()}`;
@@ -291,6 +298,7 @@ export class AutoLpBot {
         withdrawSlippageBps: this.config.withdrawSlippageBps,
         swapSlippageBps: this.config.swapSlippageBps,
         maxSwapPriceImpactBps: this.config.maxSwapPriceImpactBps,
+        crossPoolMaxSwapPriceImpactBps: this.config.crossPoolMaxSwapPriceImpactBps,
         depositSlippageBps: this.config.depositSlippageBps,
         minRebalanceIntervalSec: this.config.minRebalanceIntervalSec,
         maxRebalancesPerHour: this.config.maxRebalancesPerHour
@@ -512,10 +520,9 @@ export class AutoLpBot {
     const sourcePool = currentPosition
       ? this.market.pools.find((pool) => pool.id.toLowerCase() === String(currentPosition.poolId).toLowerCase())
       : null;
-    const crossPoolLiveUnavailable = Boolean(sourcePool && this.config.enableLiveWrites && !this.config.dryRun);
     const aprSelected = ranked.find(({ pool }) => {
+      if (hasNativeCurrency(pool) || (sourcePool && hasNativeCurrency(sourcePool))) return false;
       if (!sourcePool) return true;
-      if (crossPoolLiveUnavailable && pool.id.toLowerCase() !== sourcePool.id.toLowerCase()) return false;
       try {
         chooseInvestmentAnchor(
           [sourcePool.token0, sourcePool.token1, pool.token0, pool.token1],
@@ -524,7 +531,7 @@ export class AutoLpBot {
         );
         return true;
       } catch { return false; }
-    })?.pool || (crossPoolLiveUnavailable ? sourcePool : null);
+    })?.pool;
     const selected = settings.mode === 'specific-pool'
       ? this.market.pools.find((pool) => pool.id.toLowerCase() === settings.poolId)
       : aprSelected;
@@ -540,8 +547,8 @@ export class AutoLpBot {
       tvlUsd: tvlStats?.tvlUsd ?? null,
       statsObservedAt: this.market.fablesStats?.aprObservedAt ?? null,
       minTvlUsd: this.config.aprPoolMinTvlUsd,
-      executionConstraint: crossPoolLiveUnavailable && settings.mode === 'apr-highest'
-        ? 'cross-pool-live-unavailable; current LP pool is the executable fallback'
+      executionConstraint: settings.mode === 'apr-highest'
+        ? 'cross-pool candidates require a complete live sequence preflight'
         : null
     };
   }
@@ -554,6 +561,9 @@ export class AutoLpBot {
       if (selected.state?.paused !== false || BigInt(selected.state?.liquidity || 0) <= 0n) {
         throw new Error('指定的再投入池已暫停或沒有可用流動性');
       }
+      if (hasNativeCurrency(selected) || hasNativeCurrency(sourcePool)) {
+        throw new Error('原生 ETH 池尚未支援自動跨池實盤');
+      }
       chooseInvestmentAnchor(
         [sourcePool.token0, sourcePool.token1, selected.token0, selected.token1],
         selected,
@@ -562,10 +572,6 @@ export class AutoLpBot {
       return selected;
     }
     if (settings.mode !== 'apr-highest') throw new Error('未知的再投入模式');
-    // The cross-pool executor has no live post-withdraw sequence simulation.
-    // Never select a destination that the live executor will always reject.
-    // Keep the existing LP capital in its pool and build the new Tight range there.
-    if (this.config.enableLiveWrites && !this.config.dryRun) return sourcePool;
     const ranked = rankAprPools({
       pools: this.market.pools,
       stats: this.market.fablesStats,
@@ -574,6 +580,7 @@ export class AutoLpBot {
       minTvlUsd: this.config.aprPoolMinTvlUsd
     });
     for (const candidate of ranked) {
+      if (hasNativeCurrency(candidate.pool) || hasNativeCurrency(sourcePool)) continue;
       try {
         chooseInvestmentAnchor(
           [sourcePool.token0, sourcePool.token1, candidate.pool.token0, candidate.pool.token1],
@@ -584,6 +591,47 @@ export class AutoLpBot {
       } catch {}
     }
     throw new Error('沒有 APR 資料新鮮、TVL 達標且資產兌換路徑可用的 Fables 池；保留原 LP');
+  }
+
+  async resolveExecutableInvestmentTarget(sourcePool, position) {
+    const ranked = rankAprPools({
+      pools: this.market.pools,
+      stats: this.market.fablesStats,
+      nowMs: Date.now(),
+      maxStatsAgeMs: Math.max(5 * 60 * 1000, this.config.marketRefreshMs * 3),
+      minTvlUsd: this.config.aprPoolMinTvlUsd
+    });
+    const skipped = [];
+    for (const candidate of ranked) {
+      const pool = candidate.pool;
+      if (pool.id.toLowerCase() === sourcePool.id.toLowerCase()) return pool;
+      if (hasNativeCurrency(pool) || hasNativeCurrency(sourcePool)) {
+        skipped.push({ poolId: pool.id, pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+          reason: '原生 ETH 池尚未支援跨池實盤' });
+        continue;
+      }
+      try {
+        await this.executor.preflightCrossPoolSequence({
+          pool: sourcePool, position, routingPools: this.market.pools
+        }, pool);
+        this.ledger.append('investment.cross_pool_candidate_ready', {
+          sourcePoolId: sourcePool.id, destinationPoolId: pool.id,
+          pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+          aprPct: candidate.aprPct, candidatesSkipped: skipped.length
+        });
+        return pool;
+      } catch (error) {
+        skipped.push({ poolId: pool.id, pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+          reason: sanitize(error.message) });
+      }
+    }
+    this.ledger.append('investment.cross_pool_candidates_skipped', {
+      sourcePoolId: sourcePool.id, positionId: position.id,
+      considered: ranked.length, skipped: skipped.slice(0, 20)
+    });
+    // Keep the original OOR LP in a fresh Tight range when no higher APR pool
+    // has a fully simulated route. This avoids withdrawing into an unsafe path.
+    return sourcePool;
   }
 
   applyStoredExecutionTarget() {
@@ -618,6 +666,7 @@ export class AutoLpBot {
       if (pool.state?.paused !== false || BigInt(pool.state?.liquidity || 0) <= 0n) {
         throw new Error('指定池已暫停或目前沒有流動性，不能作為再投入目標');
       }
+      if (hasNativeCurrency(pool)) throw new Error('原生 ETH 池尚未支援自動跨池實盤');
     }
     this.state.setSetting('investmentTargetMode', normalizedMode);
     if (pool) this.state.setSetting('investmentTargetPoolId', normalizedPoolId);
@@ -839,6 +888,28 @@ export class AutoLpBot {
     return fablesStats;
   }
 
+  async refreshPoolQuoteProbes() {
+    if (this.cycleActive) throw new Error('Wait for the current wallet scan or execution to finish');
+    if (this.poolQuoteProbePromise) return this.poolQuoteProbePromise;
+    const probe = probePoolSwapCosts({
+      pools: this.market.pools,
+      quoter: this.quoter,
+      usdPrices: this.market.prices,
+      usdgAddress: this.config.usdgAddress,
+      slippageBps: this.config.swapSlippageBps
+    }).then((quotes) => {
+      this.state.setSetting('poolQuoteProbes', quotes);
+      this.ledger.append('market.pool_quote_probes_refreshed', {
+        total: Object.keys(quotes).length,
+        quoted: Object.values(quotes).filter((entry) => entry.status === 'quoted').length,
+        approximatelyThreePercent: Object.values(quotes).filter((entry) => entry.approximatelyThreePercent).length
+      });
+      return quotes;
+    }).finally(() => { this.poolQuoteProbePromise = null; });
+    this.poolQuoteProbePromise = probe;
+    return probe;
+  }
+
   async runOnce(options = {}) {
     const executeRebalances = options.executeRebalances !== false;
     if (this.cycleActive) {
@@ -902,6 +973,7 @@ export class AutoLpBot {
           this.trackFeeAccrual(pool, position);
         }
       }
+      await this.backfillGuardedWithdrawFees();
 
       const uniqueTokens = uniqueTargetTokens(accountingPools);
       if (!uniqueTokens.some((token) => token.address.toLowerCase() === ZERO_ADDRESS)) {
@@ -1489,20 +1561,18 @@ export class AutoLpBot {
     let destinationPool;
     try {
       const investmentMode = this.getInvestmentTargetSettings().mode;
-      const samePoolLiveFallback = investmentMode === 'apr-highest'
-        && this.config.enableLiveWrites && !this.config.dryRun;
-      if (!samePoolLiveFallback) {
-        try { await this.refreshAprForRebalance(); }
-        catch (error) {
-          log('warn', 'fables.stats_unavailable_for_rebalance', { error: error.message });
-          if (investmentMode === 'apr-highest') throw error;
-        }
+      try { await this.refreshAprForRebalance(); }
+      catch (error) {
+        log('warn', 'fables.stats_unavailable_for_rebalance', { error: error.message });
+        if (investmentMode === 'apr-highest') throw error;
       }
-      destinationPool = this.resolveInvestmentTarget(pool);
-      if (samePoolLiveFallback) {
+      destinationPool = investmentMode === 'apr-highest' && this.config.enableLiveWrites && !this.config.dryRun
+        ? await this.resolveExecutableInvestmentTarget(pool, position)
+        : this.resolveInvestmentTarget(pool);
+      if (investmentMode === 'apr-highest' && destinationPool.id.toLowerCase() === pool.id.toLowerCase()) {
         this.ledger.append('rebalance.target_fallback', {
           sourcePoolId: pool.id, destinationPoolId: pool.id, positionId: position.id,
-          reason: 'live cross-pool execution lacks complete post-withdraw sequence simulation'
+          reason: 'no higher APR pool passed the complete cross-pool sequence preflight'
         });
       }
     } catch (error) {
@@ -1883,6 +1953,9 @@ export class AutoLpBot {
   }
 
   async recordLifecycleLogs(pool, logs) {
+    const unresolvedKeys = new Set(this.ledger.all()
+      .filter((event) => event.type === 'points.withdraw_fee_unresolved')
+      .map((event) => `${event.hash}:${event.logIndex}`));
     for (const entry of logs) {
       const kind = lifecycleEventType(entry);
       if (!kind) continue;
@@ -1891,7 +1964,9 @@ export class AutoLpBot {
       const eventKey = `lifecycle:${entry.transactionHash}:${logIndex}`;
       const feeKey = `points-withdraw-fee:${entry.transactionHash}:${logIndex}`;
       const needsLifecycle = !this.ledger.seenKeys.has(eventKey);
-      const needsWithdrawalFee = kind === 'withdraw' && !this.ledger.seenKeys.has(feeKey);
+      const needsWithdrawalFee = kind === 'withdraw'
+        && !this.ledger.seenKeys.has(feeKey)
+        && !unresolvedKeys.has(`${entry.transactionHash}:${logIndex}`);
       if (!needsLifecycle && !needsWithdrawalFee) continue;
 
       const ts = await this.blockTimestamp(entry.blockNumber);
@@ -1941,6 +2016,7 @@ export class AutoLpBot {
         if (result.ok) {
           this.ledger.appendUnique(feeKey, 'points.withdraw_fee_reconciled', feeEventData, ts);
         } else {
+          unresolvedKeys.add(`${entry.transactionHash}:${logIndex}`);
           this.ledger.appendUnique(
             `points-withdraw-fee-unresolved:${entry.transactionHash}:${logIndex}:${result.reason || 'unknown'}`,
             'points.withdraw_fee_unresolved',
@@ -1960,14 +2036,10 @@ export class AutoLpBot {
     }
   }
 
-  reconcileWithdrawalUserFees(pool, rangeId, entry, receipt, tx, ts) {
+  reconcileWithdrawalUserFees(pool, rangeId, entry, receipt, tx, ts, options = {}) {
     if (!rangeId || !receipt || !tx) return { ok: false, reason: 'missing-withdrawal-receipt-or-transaction' };
-    let decoded;
-    try { decoded = hookInterface.parseTransaction({ data: tx.data, value: tx.value }); }
-    catch { return { ok: false, reason: 'withdrawal-calldata-decode-failed' }; }
-    if (!decoded || decoded.name !== 'withdrawAndClaim') {
-      return { ok: false, reason: `unsupported-withdrawal-call:${decoded?.name || 'unknown'}` };
-    }
+    const decoded = this.decodeWithdrawalCall(pool, tx);
+    if (!decoded.ok) return decoded;
 
     const preSwap = this.lastPointSwapBefore(pool.id, Number(entry.blockNumber), Number(entry.index ?? 0));
     if (!preSwap?.sqrtPriceX96) return { ok: false, reason: 'missing-pre-withdraw-swap-state' };
@@ -1991,7 +2063,7 @@ export class AutoLpBot {
     const claimed1 = actual.raw1 > principal.expected1 ? actual.raw1 - principal.expected1 : 0n;
 
     const feeStateKey = `feeState:${pool.id.toLowerCase()}:${rangeId.toLowerCase()}`;
-    const previous = this.state.getSetting(feeStateKey, null);
+    const previous = options.previousOwed || this.state.getSetting(feeStateKey, null);
     if (!previous) return { ok: false, reason: 'missing-pre-withdraw-user-fee-state' };
 
     const previousOwed0 = BigInt(previous.owed0 || 0);
@@ -2033,12 +2105,11 @@ export class AutoLpBot {
       );
     }
 
-    this.state.setSetting(feeStateKey, {
-      owed0: '0',
-      owed1: '0',
-      shares: '0',
-      at: ts
-    });
+    if (!options.historical) {
+      this.state.setSetting(feeStateKey, {
+        owed0: '0', owed1: '0', shares: '0', at: ts
+      });
+    }
 
     return {
       ok: true,
@@ -2053,6 +2124,112 @@ export class AutoLpBot {
       unseen1: unseen1.toString(),
       feeUsd
     };
+  }
+
+  async backfillGuardedWithdrawFees() {
+    const startMs = this.points.predictionStartMs(Date.now());
+    const rows = this.ledger.all();
+    const pending = rows.filter((event) => event.type === 'points.withdraw_fee_unresolved'
+      && event.ts >= startMs
+      && String(event.reason || '').startsWith('unsupported-withdrawal-call:')
+      && !this.ledger.seenKeys.has(`points-withdraw-fee:${event.hash}:${event.logIndex}`))
+      .sort((a, b) => a.ts - b.ts);
+    for (const event of pending) {
+      const noteBlocked = (reason) => this.ledger.appendUnique(
+        `points-withdraw-backfill-blocked:${event.hash}:${event.logIndex}:${String(reason).split(':')[0]}`,
+        'points.withdraw_fee_backfill_blocked', {
+          poolId: event.poolId, positionId: event.positionId, hash: event.hash,
+          logIndex: event.logIndex, reason: sanitize(reason)
+        }, event.ts);
+      const pool = this.market.pools.find((item) => item.id.toLowerCase() === String(event.poolId).toLowerCase());
+      if (!pool) { noteBlocked('pool-not-in-current-registry'); continue; }
+      const decreases = rows.filter((item) => item.type === 'fee.owed_decrease'
+        && item.poolId?.toLowerCase() === String(event.poolId).toLowerCase()
+        && item.positionId?.toLowerCase() === String(event.positionId).toLowerCase()
+        && item.ts >= event.ts && item.ts <= event.ts + 15 * 60_000);
+      const saved = this.state.getSetting(
+        `feeState:${String(event.poolId).toLowerCase()}:${String(event.positionId).toLowerCase()}`, null);
+      const snapshotIsPreWithdrawal = saved && Number(saved.at) <= event.ts
+        && event.ts - Number(saved.at) <= 5 * 60_000
+        && BigInt(saved.shares || 0) > 0n;
+      const previousOwed = decreases.length === 1
+        ? { owed0: decreases[0].previousOwed0, owed1: decreases[0].previousOwed1 }
+        : decreases.length === 0 && snapshotIsPreWithdrawal
+          ? { owed0: saved.owed0, owed1: saved.owed1 }
+          : null;
+      if (!previousOwed) { noteBlocked(`matched-owed-decreases:${decreases.length};snapshot:${snapshotIsPreWithdrawal ? 'eligible' : 'unavailable'}`); continue; }
+      if (previousOwed.owed0 == null || previousOwed.owed1 == null) {
+        noteBlocked('missing-historical-owed-amounts'); continue;
+      }
+      try {
+        const [receipt, tx] = await Promise.all([
+          this.providers.readProvider.getTransactionReceipt(event.hash),
+          this.providers.readProvider.getTransaction(event.hash)
+        ]);
+        const result = this.reconcileWithdrawalUserFees(pool, event.positionId, {
+          blockNumber: event.blockNumber, index: event.logIndex, transactionHash: event.hash
+        }, receipt, tx, event.ts, {
+          previousOwed,
+          historical: true
+        });
+        if (!result.ok) { noteBlocked(result.reason || 'reconciliation-failed'); continue; }
+        this.ledger.appendUnique(`points-withdraw-fee:${event.hash}:${event.logIndex}`,
+          'points.withdraw_fee_reconciled', {
+            poolId: event.poolId, pair: event.pair, positionId: event.positionId,
+            hash: event.hash, blockNumber: event.blockNumber, logIndex: event.logIndex,
+            historical: true, ...result
+          }, event.ts);
+      } catch (error) {
+        log('warn', 'points.withdraw_fee_backfill_failed', {
+          poolId: event.poolId, positionId: event.positionId,
+          reason: sanitize(error.message)
+        });
+      }
+    }
+    const broken = this.state.getSetting('pointsUserCoverageBrokenV2', null);
+    if (!broken || Number(broken.at) < startMs) return;
+    const all = this.ledger.all();
+    const unresolved = all.some((event) => event.type === 'points.withdraw_fee_unresolved'
+      && event.ts >= startMs
+      && !this.ledger.seenKeys.has(`points-withdraw-fee:${event.hash}:${event.logIndex}`));
+    const unmatchedDecrease = all.some((event) => event.type === 'fee.owed_decrease'
+      && event.ts >= startMs
+      && !all.some((candidate) => candidate.type === 'points.withdraw_fee_reconciled'
+        && candidate.poolId?.toLowerCase() === event.poolId?.toLowerCase()
+        && candidate.positionId?.toLowerCase() === event.positionId?.toLowerCase()
+        && candidate.ts <= event.ts && event.ts <= candidate.ts + 15 * 60_000));
+    if (!unresolved && !unmatchedDecrease
+      && ['withdraw-fee-unresolved', 'active-position-owed-decrease'].includes(broken.reason)) {
+      this.state.setSetting('pointsUserCoverageBrokenV2', null);
+      this.points.invalidate();
+      this.ledger.append('points.user_coverage_restored', { from: startMs, through: Date.now() });
+    }
+  }
+
+  decodeWithdrawalCall(pool, tx) {
+    const target = String(tx?.to || '').toLowerCase();
+    const wallet = this.config.walletAddress.toLowerCase();
+    const hook = pool.key.hooks.toLowerCase();
+    const call = { data: tx?.data, value: tx?.value || 0n };
+    let decoded = null;
+    try {
+      if (target === hook) decoded = hookInterface.parseTransaction(call);
+      else if (target === wallet) decoded = guardInterface.parseTransaction(call);
+    } catch { return { ok: false, reason: 'withdrawal-calldata-decode-failed' }; }
+    const allowed = target === hook ? 'withdrawAndClaim' : target === wallet ? 'guardedWithdrawAndClaim' : null;
+    if (!decoded || decoded.name !== allowed) {
+      return { ok: false, reason: `unsupported-withdrawal-call:${decoded?.name || 'unknown'}` };
+    }
+    const key = decoded.args[0];
+    if (String(key.currency0).toLowerCase() !== pool.key.currency0.toLowerCase()
+      || String(key.currency1).toLowerCase() !== pool.key.currency1.toLowerCase()
+      || Number(key.fee) !== Number(pool.key.fee)
+      || Number(key.tickSpacing) !== Number(pool.key.tickSpacing)
+      || String(key.hooks).toLowerCase() !== hook
+      || String(decoded.args[4]).toLowerCase() !== wallet) {
+      return { ok: false, reason: 'withdrawal-pool-key-or-recipient-mismatch' };
+    }
+    return { ok: true, args: decoded.args, guarded: target === wallet };
   }
 
   lastPointSwapBefore(poolId, blockNumber, logIndex) {

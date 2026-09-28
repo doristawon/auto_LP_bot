@@ -23,6 +23,22 @@ export function rankAprPools({
   );
 }
 
+export function assertCrossPoolWeightedQuoteCost(legs, portfolioUsd, maxImpactBps, slippageBps = 0) {
+  if (!Array.isArray(legs) || !Number.isFinite(portfolioUsd) || portfolioUsd <= 0
+    || !Number.isFinite(Number(maxImpactBps)) || Number(maxImpactBps) < 0
+    || !Number.isFinite(Number(slippageBps)) || Number(slippageBps) < 0
+    || !legs.every(({ inputUsd, impactBps }) => Number.isFinite(inputUsd)
+      && inputUsd > 0 && Number.isFinite(impactBps) && impactBps >= 0)) {
+    throw new Error('Cross-pool quote cost is incomplete');
+  }
+  const total = legs.reduce((sum, { inputUsd, impactBps }) =>
+    sum + inputUsd * (impactBps + Number(slippageBps)) / portfolioUsd, 0);
+  if (total > Number(maxImpactBps)) {
+    throw new Error(`Cross-pool weighted quoted swap cost ${total.toFixed(2)} bps exceeds ${maxImpactBps} bps`);
+  }
+  return total;
+}
+
 export function findV4Route(pools, tokenInAddress, tokenOutAddress, maxHops = 3) {
   const tokenIn = String(tokenInAddress || '').toLowerCase();
   const tokenOut = String(tokenOutAddress || '').toLowerCase();

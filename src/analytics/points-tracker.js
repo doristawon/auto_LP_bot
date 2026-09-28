@@ -30,6 +30,11 @@ export class PointsTracker {
     this.lastSimulationAt = 0;
 
     this.migratePointBaselines(config);
+    const savedOfficial = this.state.getSetting('pointsOfficial', null);
+    if (savedOfficial?.wallet === String(config.walletAddress || '').toLowerCase()
+      && Number.isFinite(Number(savedOfficial.settledAt))) {
+      this.applyOfficialSettlement(savedOfficial, null);
+    }
 
   }
 
@@ -229,9 +234,10 @@ export class PointsTracker {
     if (officialResult.status === 'fulfilled') {
       this.applyOfficialSettlement(officialResult.value, walletResult.status === 'fulfilled' ? walletResult.value : null);
     }
-    this.evidenceError = [officialResult, walletResult]
-      .filter((result) => result.status === 'rejected')
-      .map((result) => result.reason?.message || 'points evidence unavailable').join('; ') || null;
+    this.evidenceError = [
+      officialResult.status === 'rejected' ? '官方分數來源暫時不可用' : null,
+      walletResult.status === 'rejected' ? '錢包費用佐證暫時不可用' : null
+    ].filter(Boolean).join('；') || null;
     this.invalidate();
     return this.evidenceError ? { ok: false, error: this.evidenceError } : { ok: true };
   }
@@ -255,9 +261,18 @@ export class PointsTracker {
       this.setActualBaseline(totalPoints, new Date(official.settledAt).toISOString());
     }
 
-    if (priorForWallet && Number(priorForWallet.settledAt) < official.settledAt) {
-      const addedPoints = Number(official.lpPoints || 0) - Number(priorForWallet.lpPoints || 0);
-      const addedFees = Number(official.settledFeesUsd || 0) - Number(priorForWallet.settledFeesUsd || 0);
+    // The bot may restart between settlements. Recover the prior official
+    // checkpoint from this wallet's ledger instead of retaining an obsolete
+    // first-day calibration merely because pointsOfficial is already current.
+    const ledgerPrior = this.ledger.all()
+      .filter((event) => event.type === 'points.official_settlement'
+        && Number(event.settledAt) < official.settledAt)
+      .sort((a, b) => Number(b.settledAt) - Number(a.settledAt))[0];
+    const previousSettlement = ledgerPrior || (priorForWallet
+      && Number(priorForWallet.settledAt) < official.settledAt ? priorForWallet : null);
+    if (previousSettlement) {
+      const addedPoints = Number(official.lpPoints || 0) - Number(previousSettlement.lpPoints || 0);
+      const addedFees = Number(official.settledFeesUsd || 0) - Number(previousSettlement.settledFeesUsd || 0);
       if (addedPoints >= 0 && addedFees > 0.005) {
         this.state.setSetting('pointsCalibration', {
           wallet: official.wallet,
@@ -433,8 +448,31 @@ export class PointsTracker {
     const calibratedPointsPerFeeUsd = matchingCalibration && settledBudget > 0
       ? Number(matchingCalibration.pointsPerFeeUsd) * currentBudget / settledBudget
       : null;
+    const predictionStartMs = Date.parse(snapshot.predictionStartAt);
+    const trackingStartedMs = Date.parse(snapshot.userTrackingStartedAt || '');
+    const brokenAtMs = Date.parse(snapshot.userCoverageBrokenAt || '');
+    const localFeeCoverageComplete = Number.isFinite(trackingStartedMs)
+      && trackingStartedMs <= predictionStartMs
+      && (!Number.isFinite(brokenAtMs) || brokenAtMs < predictionStartMs);
+    const calibratedEstimatedDelta = matchingCalibration && settledBudget > 0
+      && Number.isFinite(Number(matchingCalibration.pointsPerFeeUsd))
+      && localFeeCoverageComplete
+      ? Object.values(snapshot.buckets).reduce((sum, bucket) => {
+        const dayBudget = dailyPointBudget(Number(bucket.timestampMs));
+        return sum + Number(bucket.userFeeUsd || 0)
+          * Number(matchingCalibration.pointsPerFeeUsd) * dayBudget / settledBudget;
+      }, 0)
+      : null;
+    const calibratedEstimatedTotal = calibratedEstimatedDelta == null || snapshot.actualBaseline <= 0
+      ? null : snapshot.actualBaseline + calibratedEstimatedDelta;
     const buckets = { ...snapshot.buckets };
-    for (const bucket of Object.values(buckets)) bucket.source = 'estimate';
+    for (const bucket of Object.values(buckets)) {
+      bucket.source = 'estimate';
+      bucket.calibratedPoints = localFeeCoverageComplete && matchingCalibration && settledBudget > 0
+        ? Number(bucket.userFeeUsd || 0) * Number(matchingCalibration.pointsPerFeeUsd)
+          * dailyPointBudget(Number(bucket.timestampMs)) / settledBudget
+        : null;
+    }
     for (const day of official?.history || []) {
       const key = pointsCampaignDayKey(Number(day.settledAt) - 1);
       if (!key) continue;
@@ -456,6 +494,8 @@ export class PointsTracker {
       walletFeeEvidence: matchingEvidence,
       unsettledFeeUsd,
       calibratedPointsPerFeeUsd,
+      calibratedEstimatedDelta,
+      calibratedEstimatedTotal,
       calibrationSource: matchingCalibration?.source || null,
       evidenceError: this.evidenceError,
       simulatedAt: this.lastSimulationAt,

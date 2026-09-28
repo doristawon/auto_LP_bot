@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Interface, id, zeroPadValue } from 'ethers';
 import { AutoLpBot } from '../src/bot.js';
-import { HOOK_ABI } from '../src/abi.js';
+import { EIP7702_GUARD_ABI, HOOK_ABI } from '../src/abi.js';
 import { buildExactWithdrawBounds, getSqrtPriceAtTick } from '../src/math/v4-fixed.js';
 
 const WALLET = '0x00000000000000000000000000000000000000AA';
@@ -107,7 +107,7 @@ test('withdrawAndClaim reconciles only the fee earned since last owed snapshot',
     rangeId,
     entry,
     receipt,
-    { data, value: 0n },
+    { to: HOOK, data, value: 0n },
     Date.parse('2026-09-26T12:00:00Z')
   );
 
@@ -130,14 +130,106 @@ test('withdraw reconciliation fails closed when pre-withdraw swap state is unava
   const result = bot.reconcileWithdrawalUserFees(
     {
       id: '0x' + '44'.repeat(32),
+      key: { currency0: MEME, currency1: USDG, fee: 3000, tickSpacing: 1, hooks: HOOK },
       token0: { address: MEME, symbol: 'MEME', decimals: 6 },
       token1: { address: USDG, symbol: 'USDG', decimals: 6 }
     },
     '0x' + '55'.repeat(32),
     { blockNumber: 100, index: 1 },
     { logs: [] },
-    { data: '0x1234', value: 0n },
+    { to: HOOK, data: '0x1234', value: 0n },
     Date.now()
   );
   assert.equal(result.ok, false);
+});
+
+test('guarded EIP-7702 withdrawal decodes with exact pool and wallet recipient', () => {
+  const bot = Object.create(AutoLpBot.prototype);
+  bot.config = { walletAddress: WALLET };
+  const pool = { key: { currency0: MEME, currency1: USDG,
+    fee: 3000, tickSpacing: 1, hooks: HOOK } };
+  const data = new Interface(EIP7702_GUARD_ABI).encodeFunctionData('guardedWithdrawAndClaim', [
+    [MEME, USDG, 3000, 1, HOOK], -100, 100, 1000n, WALLET,
+    0n, 0n, 9999999999n, 1000
+  ]);
+  const decoded = bot.decodeWithdrawalCall(pool, { to: WALLET, data, value: 0n });
+  assert.equal(decoded.ok, true);
+  assert.equal(decoded.guarded, true);
+  const wrongPool = { key: { ...pool.key, currency1: MEME } };
+  assert.equal(bot.decodeWithdrawalCall(wrongPool, { to: WALLET, data, value: 0n }).ok, false);
+});
+
+test('guarded withdrawal backfill requires a matching historical owed decrease', async () => {
+  const at = Date.parse('2026-09-28T04:00:00Z');
+  const hash = '0x' + '44'.repeat(32);
+  const poolId = '0x' + '11'.repeat(32);
+  const positionId = '0x' + '22'.repeat(32);
+  const rows = [
+    { type: 'points.withdraw_fee_unresolved', ts: at, poolId, positionId,
+      hash, blockNumber: 123, logIndex: 4, reason: 'unsupported-withdrawal-call:unknown' },
+    { type: 'fee.owed_decrease', ts: at + 60_000, poolId, positionId,
+      previousOwed0: '123', previousOwed1: '456' }
+  ];
+  const settings = new Map([['pointsUserCoverageBrokenV2', { at, reason: 'withdraw-fee-unresolved' }]]);
+  const seenKeys = new Set();
+  const bot = Object.create(AutoLpBot.prototype);
+  bot.points = { predictionStartMs() { return at - 1; }, invalidate() {} };
+  bot.market = { pools: [{ id: poolId }] };
+  bot.providers = { readProvider: {
+    async getTransactionReceipt() { return {}; }, async getTransaction() { return {}; }
+  } };
+  bot.state = {
+    getSetting(key, fallback = null) { return settings.has(key) ? settings.get(key) : fallback; },
+    setSetting(key, value) { settings.set(key, value); }
+  };
+  bot.ledger = {
+    seenKeys, all() { return [...rows]; },
+    appendUnique(key, type, data, ts) { seenKeys.add(key); rows.push({ type, ts, ...data }); },
+    append(type, data) { rows.push({ type, ...data }); }
+  };
+  bot.reconcileWithdrawalUserFees = (_pool, _id, _entry, _receipt, _tx, _at, options) => {
+    assert.deepEqual(options.previousOwed, { owed0: '123', owed1: '456' });
+    assert.equal(options.historical, true);
+    return { ok: true, unseen0: '0', unseen1: '0', feeUsd: 0 };
+  };
+  await bot.backfillGuardedWithdrawFees();
+  assert.ok(seenKeys.has(`points-withdraw-fee:${hash}:4`));
+  assert.equal(settings.get('pointsUserCoverageBrokenV2'), null);
+});
+
+test('guarded withdrawal backfill accepts only a recent same-position pre-withdraw snapshot', async () => {
+  const at = Date.parse('2026-09-28T04:00:00Z');
+  const hash = '0x' + '55'.repeat(32);
+  const poolId = '0x' + '11'.repeat(32);
+  const positionId = '0x' + '22'.repeat(32);
+  const key = `feeState:${poolId}:${positionId}`;
+  for (const snapshotAt of [at + 1, at - 6 * 60_000, at - 72_000]) {
+    const rows = [{ type: 'points.withdraw_fee_unresolved', ts: at, poolId, positionId,
+      hash, blockNumber: 123, logIndex: 4, reason: 'unsupported-withdrawal-call:unknown' }];
+    const seenKeys = new Set();
+    const bot = Object.create(AutoLpBot.prototype);
+    bot.points = { predictionStartMs() { return at - 1; }, invalidate() {} };
+    bot.market = { pools: [{ id: poolId }] };
+    bot.providers = { readProvider: {
+      async getTransactionReceipt() { return {}; }, async getTransaction() { return {}; }
+    } };
+    bot.state = {
+      getSetting(settingKey) { return settingKey === key
+        ? { owed0: '123', owed1: '456', shares: '1000', at: snapshotAt } : null; },
+      setSetting() {}
+    };
+    bot.ledger = {
+      seenKeys, all() { return [...rows]; },
+      appendUnique(eventKey, type, data, ts) {
+        if (seenKeys.has(eventKey)) return;
+        seenKeys.add(eventKey); rows.push({ type, ts, ...data });
+      }
+    };
+    bot.reconcileWithdrawalUserFees = (_pool, _id, _entry, _receipt, _tx, _at, options) => {
+      assert.deepEqual(options.previousOwed, { owed0: '123', owed1: '456' });
+      return { ok: true, feeUsd: 0 };
+    };
+    await bot.backfillGuardedWithdrawFees();
+    assert.equal(seenKeys.has(`points-withdraw-fee:${hash}:4`), snapshotAt === at - 72_000);
+  }
 });

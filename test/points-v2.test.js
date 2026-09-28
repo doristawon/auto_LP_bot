@@ -187,6 +187,56 @@ test('snapshot reuses cached simulation unless force is explicitly requested', (
   assert.ok(allCalls > callsAfterFirstSimulation);
 });
 
+test('official calibration recovers the latest daily delta from wallet settlement history', () => {
+  const wallet = '0x0000000000000000000000000000000000000001';
+  const firstAt = Date.parse('2026-09-27T02:00:00Z');
+  const latestAt = firstAt + 24 * 60 * 60 * 1000;
+  const latest = { wallet, settledAt: latestAt, lpPoints: 17331,
+    referralPoints: 0, settledFeesUsd: 114.03, history: [] };
+  const state = fakeState({
+    actualPointsBaseline: 17331, actualPointsBaselineAt: new Date(latestAt).toISOString(),
+    pointsOfficial: latest,
+    pointsCalibration: { wallet, pointsPerFeeUsd: 241.66, source: 'first-wallet-lp-day' }
+  });
+  const ledger = fakeLedger([
+    event(firstAt, 'points.official_settlement', {
+      settledAt: firstAt, lpPoints: 116, settledFeesUsd: 0.48
+    }),
+    event(latestAt, 'points.official_settlement', {
+      settledAt: latestAt, lpPoints: 17331, settledFeesUsd: 114.03
+    })
+  ]);
+  const tracker = new PointsTracker({ walletAddress: wallet }, ledger, state);
+  tracker.applyOfficialSettlement(latest, null);
+  const calibration = state.getSetting('pointsCalibration');
+  assert.equal(calibration.source, 'consecutive-official-settlements');
+  assert.equal(calibration.points, 17215);
+  assert.ok(Math.abs(calibration.pointsPerFeeUsd - 17215 / 113.55) < 1e-9);
+});
+
+test('calibrated live estimate remains available when market fee denominator is incomplete', () => {
+  const wallet = '0x0000000000000000000000000000000000000001';
+  const boundary = Date.parse('2026-09-28T02:00:00Z');
+  const state = fakeState({
+    actualPointsBaseline: 17331,
+    actualPointsBaselineAt: new Date(boundary).toISOString(),
+    pointsUserTrackingStartedAtV2: boundary - 60_000,
+    pointsOfficial: { wallet, lpPoints: 17331, referralPoints: 0,
+      settledAt: boundary, settledFeesUsd: 114.03, history: [] },
+    pointsCalibration: { wallet, pointsPerFeeUsd: 17215 / 113.55,
+      programmeDayEnd: boundary, source: 'consecutive-official-settlements' }
+  });
+  const tracker = new PointsTracker({ walletAddress: wallet }, fakeLedger([
+    event(boundary + 60_000, 'fee.accrual', { feeUsd: 2 }),
+    event(boundary + 60_000, 'points.global_swap_fee', { priced: false, feeUsd: null })
+  ]), state);
+  const snapshot = tracker.snapshot({ atMs: boundary + 2 * 60_000, force: true });
+  const rate = (17215 / 113.55) * dailyPointBudget(boundary) / dailyPointBudget(boundary - 1);
+  assert.equal(snapshot.estimatedTotal, null);
+  assert.ok(Math.abs(snapshot.calibratedEstimatedTotal - (17331 + 2 * rate)) < 1e-9);
+  assert.ok(snapshot.buckets[new Date(boundary).toISOString()].calibratedPoints > 0);
+});
+
 function event(ts, type, extra = {}) {
   return { ts, type, ...extra };
 }

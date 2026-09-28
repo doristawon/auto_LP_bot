@@ -44,6 +44,7 @@ export function loadConfig() {
   const aprPoolMinTvlUsd = envNum('APR_POOL_MIN_TVL_USD', 30_000);
   const swapSlippageBps = envInt('SWAP_SLIPPAGE_BPS', 50);
   const maxSwapPriceImpactBps = envInt('MAX_SWAP_PRICE_IMPACT_BPS', 200);
+  const crossPoolMaxSwapPriceImpactBps = envInt('CROSS_POOL_MAX_SWAP_PRICE_IMPACT_BPS', 350);
   const oorRebalanceSwapPoolId = process.env.OOR_REBALANCE_SWAP_POOL_ID?.trim().toLowerCase() || '';
   const oorRebalanceMaxSwapPriceImpactBps = envInt('OOR_REBALANCE_MAX_SWAP_PRICE_IMPACT_BPS', maxSwapPriceImpactBps);
   const autoTopupMaxSwapPriceImpactBps = envInt('AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS', maxSwapPriceImpactBps);
@@ -89,6 +90,9 @@ export function loadConfig() {
   if (swapSlippageBps < 0 || swapSlippageBps >= 10_000) throw new Error('SWAP_SLIPPAGE_BPS must be 0..9999');
   if (maxSwapPriceImpactBps < 0 || maxSwapPriceImpactBps > 1000) {
     throw new Error('MAX_SWAP_PRICE_IMPACT_BPS must be 0..1000');
+  }
+  if (crossPoolMaxSwapPriceImpactBps < 0 || crossPoolMaxSwapPriceImpactBps > 1000) {
+    throw new Error('CROSS_POOL_MAX_SWAP_PRICE_IMPACT_BPS must be 0..1000');
   }
   if (oorRebalanceMaxSwapPriceImpactBps < 0 || oorRebalanceMaxSwapPriceImpactBps > 1000) {
     throw new Error('OOR_REBALANCE_MAX_SWAP_PRICE_IMPACT_BPS must be 0..1000');
@@ -173,6 +177,7 @@ export function loadConfig() {
     maxRebalancesPerHour: envInt('MAX_REBALANCES_PER_HOUR', 3),
     swapSlippageBps,
     maxSwapPriceImpactBps,
+    crossPoolMaxSwapPriceImpactBps,
     oorRebalanceSwapPoolId,
     oorRebalanceMaxSwapPriceImpactBps,
     depositSlippageBps,

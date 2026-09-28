@@ -5,7 +5,7 @@ import { DashboardServer } from '../src/dashboard/server.js';
 import { dashboardPage } from '../src/dashboard/page.js';
 
 function makeHarness() {
-  const calls = { scans: [], manual: [], pause: [], investmentTarget: [], manualBaselines: [] };
+  const calls = { scans: [], manual: [], pause: [], investmentTarget: [], manualBaselines: [], quoteRefreshes: 0, evidenceRefreshes: 0 };
   const config = {
     dashboardEnabled: true,
     dashboardHost: '127.0.0.1',
@@ -14,6 +14,10 @@ function makeHarness() {
     dashboardManualControlEnabled: false
   };
   const bot = {
+    config: { walletAddress: '0x0000000000000000000000000000000000000001' },
+    providers: { readProvider: {} },
+    market: { pools: [], prices: new Map() },
+    updatePointsSnapshot() {},
     snapshot: {
       generatedAt: 1,
       blockNumber: 100,
@@ -31,6 +35,10 @@ function makeHarness() {
     async runOnce(options) {
       calls.scans.push(options);
       return { blockNumber: 123, generatedAt: 456 };
+    },
+    async refreshPoolQuoteProbes() {
+      calls.quoteRefreshes++;
+      return { a: { status: 'quoted' }, b: { status: 'unavailable' } };
     },
     setExecutionPaused(value, source) {
       calls.pause.push({ value, source });
@@ -53,7 +61,10 @@ function makeHarness() {
     list() { return []; },
     append() {}
   };
-  const pointsTracker = { setManualBaseline(points, at) { calls.manualBaselines.push({ points, at }); return { points, at, source: 'manual-fallback' }; } };
+  const pointsTracker = {
+    setManualBaseline(points, at) { calls.manualBaselines.push({ points, at }); return { points, at, source: 'manual-fallback' }; },
+    async refreshEvidence(args) { calls.evidenceRefreshes++; assert.equal(args.force, true); return { ok: true }; }
+  };
   bot.points = pointsTracker;
   const server = new DashboardServer(config, bot, ledger, pointsTracker);
   return { server, config, bot, calls };
@@ -78,6 +89,32 @@ test('dashboard scan is observation-only and never requests execution', async ()
     assert.equal(calls.scans.length, 1);
     assert.equal(calls.scans[0].executeRebalances, false);
     assert.equal(calls.scans[0].source, 'dashboard-scan');
+  });
+});
+
+test('pool quote refresh is a separate read-only action', async () => {
+  await withServer(async ({ calls }, base) => {
+    const response = await fetch(base + '/api/pools/quotes/refresh', {
+      method: 'POST', headers: { origin: base }
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).quoted, 1);
+    assert.equal(calls.quoteRefreshes, 1);
+    assert.equal(calls.scans.length, 0);
+    assert.equal(calls.manual.length, 0);
+  });
+});
+
+test('points evidence refresh reads without triggering wallet scan or trade', async () => {
+  await withServer(async ({ calls }, base) => {
+    const response = await fetch(base + '/api/points/evidence/refresh', {
+      method: 'POST', headers: { origin: base }
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).ok, true);
+    assert.equal(calls.evidenceRefreshes, 1);
+    assert.equal(calls.scans.length, 0);
+    assert.equal(calls.manual.length, 0);
   });
 });
 

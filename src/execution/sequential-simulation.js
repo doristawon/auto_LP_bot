@@ -2,8 +2,8 @@
 // broadcasts them, but the provider must support the method and report every
 // receipt successful before a multi-step live top-up can begin.
 export async function simulateSequentialCalls(provider, { walletAddress, chainId, calls }) {
-  if (!Array.isArray(calls) || calls.length < 1 || calls.length > 16) {
-    throw new Error('Sequential simulation requires 1..16 calls');
+  if (!Array.isArray(calls) || calls.length < 1 || calls.length > 32) {
+    throw new Error('Sequential simulation requires 1..32 calls');
   }
   const actualChainId = BigInt(await provider.send('eth_chainId', []));
   if (actualChainId !== BigInt(chainId)) throw new Error('Sequential simulation RPC chainId mismatch');

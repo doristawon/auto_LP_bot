@@ -34,7 +34,8 @@ import { buildTargetRange, isLpInRange, isLpOutOfRange } from '../math/ticks.js'
 import {
   buildCrossPoolFundingScope,
   buildV4PathKeys,
-  chooseInvestmentAnchor
+  chooseInvestmentAnchor,
+  assertCrossPoolWeightedQuoteCost
 } from '../execution/investment-target.js';
 import { log } from '../logger.js';
 
@@ -1598,6 +1599,282 @@ export class RebalanceExecutor {
     return impactBps;
   }
 
+  async quoteCrossPoolRoute(route, tokenIn, amountIn, maxImpactBps, withdrawCall = null) {
+    if (!Array.isArray(route) || !route.length || route.length > 3) {
+      throw new Error('Cross-pool route must contain 1..3 active Fables pools');
+    }
+    amountIn = BigInt(amountIn);
+    if (amountIn <= 0n || amountIn > MAX_UINT128) throw new Error('Cross-pool route input is outside uint128 bounds');
+    let cursor = tokenIn.address.toLowerCase();
+    let spotOutput = amountIn;
+    const q192 = 1n << 192n;
+    for (const pool of route) {
+      if (pool.token0.address.toLowerCase() === ZERO_ADDRESS || pool.token1.address.toLowerCase() === ZERO_ADDRESS) {
+        throw new Error('Native-token cross-pool route is not enabled');
+      }
+      const state = await this.fables.readPoolState(pool);
+      if (state.paused !== false || BigInt(state.liquidity || 0) <= 0n) {
+        throw new Error('Cross-pool route contains a paused or empty pool');
+      }
+      const zeroForOne = cursor === pool.token0.address.toLowerCase();
+      if (!zeroForOne && cursor !== pool.token1.address.toLowerCase()) {
+        throw new Error('Cross-pool route token order is discontinuous');
+      }
+      const squared = BigInt(state.sqrtPriceX96) ** 2n;
+      spotOutput = zeroForOne ? spotOutput * squared / q192 : spotOutput * q192 / squared;
+      cursor = (zeroForOne ? pool.token1 : pool.token0).address.toLowerCase();
+    }
+    if (spotOutput <= 0n) throw new Error('Cross-pool route spot output rounds to zero');
+    // If this path uses the source pool, quote against the state *after* the
+    // guarded withdrawal. A pre-withdrawal quote can materially understate
+    // impact because withdrawing the LP also removes its active liquidity.
+    const quoteProvider = withdrawCall ? {
+      call: async ({ to, data }) => {
+        const receipts = await simulateSequentialCalls(this.writeProvider, {
+          walletAddress: this.config.walletAddress,
+          chainId: this.config.chainId,
+          calls: [withdrawCall, { to, data, value: 0n, gasLimit: 3_000_000 }]
+        });
+        return receipts[1].returnData;
+      }
+    } : null;
+    const quoter = quoteProvider ? new V4QuoterAdapter(quoteProvider, this.quoter.address) : this.quoter;
+    const quote = route.length === 1
+      ? await quoter.quoteExactInputSingleRaw(route[0],
+        tokenIn.address.toLowerCase() === route[0].token0.address.toLowerCase() ? 0 : 1,
+        amountIn, this.config.swapSlippageBps)
+      : await quoter.quoteExactInputPathRaw(route, tokenIn, amountIn, this.config.swapSlippageBps);
+    if (BigInt(quote.rawAmountIn) !== amountIn || BigInt(quote.minRawAmountOut) <= 0n
+      || quote.tokenOut.toLowerCase() !== cursor) {
+      throw new Error('Cross-pool route quote amount or output does not match the selected path');
+    }
+    const amountOut = BigInt(quote.rawAmountOut);
+    const impactBps = amountOut >= spotOutput ? 0n : (spotOutput - amountOut) * 10_000n / spotOutput;
+    if (impactBps > BigInt(maxImpactBps)) {
+      throw new Error(`Cross-pool route cost ${impactBps} bps exceeds ${maxImpactBps} bps`);
+    }
+    const request = route.length === 1
+      ? this.router.buildV4ExactInputSingle({ pool: route[0], quote, deadline: this.deadline() })
+      : this.router.buildV4ExactInputPath({ route, tokenIn, quote, deadline: this.deadline() });
+    return { route, tokenIn, quote, request, impactBps: Number(impactBps), rawAmountIn: amountIn };
+  }
+
+  async preflightCrossPoolSequence(plan, destinationPool) {
+    const sourcePool = plan.pool;
+    const sourceState = await this.assertPlanStillOutOfRange(plan, 'cross-pool-sequence-preflight');
+    const destinationState = await this.fables.readPoolState(destinationPool);
+    if (destinationState.paused !== false || BigInt(destinationState.liquidity || 0) <= 0n) {
+      throw new Error('Destination pool is paused or empty');
+    }
+    const trackedTokens = uniquePairTokens(sourcePool, destinationPool);
+    if (trackedTokens.some((token) => token.address.toLowerCase() === ZERO_ADDRESS)) {
+      throw new Error('Native-token cross-pool execution is not enabled');
+    }
+    const before = await this.readRawTokenBalances(trackedTokens);
+    const balanceCall = (token) => ({
+      to: token.address,
+      data: erc20Interface.encodeFunctionData('balanceOf', [this.config.walletAddress]),
+      value: 0n, gasLimit: 100_000
+    });
+    const deadline = this.deadline();
+    const bounds = buildExactWithdrawBounds({
+      sqrtPriceX96: sourceState.sqrtPriceX96,
+      tickLower: plan.position.tickLower,
+      tickUpper: plan.position.tickUpper,
+      liquidity: BigInt(plan.position.shares),
+      slippageBps: this.config.withdrawSlippageBps
+    });
+    const guardedData = guardInterface.encodeFunctionData('guardedWithdrawAndClaim', [[
+      sourcePool.key.currency0, sourcePool.key.currency1, sourcePool.key.fee,
+      sourcePool.key.tickSpacing, sourcePool.key.hooks
+    ], plan.position.tickLower, plan.position.tickUpper, BigInt(plan.position.shares),
+    this.config.walletAddress, bounds.amount0Min, bounds.amount1Min,
+    BigInt(deadline), this.config.fablesWalk]);
+    const withdrawCall = { to: this.config.walletAddress, data: guardedData, value: 0n, gasLimit: 1_500_000 };
+    const simulationArgs = { walletAddress: this.config.walletAddress, chainId: this.config.chainId };
+    const withdrawnSimulation = await simulateSequentialCalls(this.writeProvider, {
+      ...simulationArgs, calls: [withdrawCall, ...trackedTokens.map(balanceCall)]
+    });
+    const postWithdraw = new Map(trackedTokens.map((token, index) => [
+      token.address.toLowerCase(),
+      BigInt(erc20Interface.decodeFunctionResult('balanceOf', withdrawnSimulation[index + 1].returnData)[0])
+    ]));
+    const sourceAddresses = [sourcePool.token0.address.toLowerCase(), sourcePool.token1.address.toLowerCase()];
+    const withdrawn = sourceAddresses.map((address) => (postWithdraw.get(address) || 0n) - (before.get(address) || 0n));
+    if (withdrawn.some((value) => value < 0n) || withdrawn.every((value) => value === 0n)) {
+      throw new Error('Cross-pool preflight did not return non-negative LP inventory');
+    }
+    const dustRawByAddress = Object.fromEntries(trackedTokens.map((token) => {
+      const address = token.address.toLowerCase();
+      const reserveBps = address === this.config.usdgAddress.toLowerCase()
+        ? BigInt(this.config.autoTopupDustBps ?? 25) : 0n;
+      return [address, (postWithdraw.get(address) || 0n) * reserveBps / 10_000n];
+    }));
+    const funding = buildCrossPoolFundingScope({
+      sourcePool, destinationPool, walletBalances: before,
+      expectedWithdraw: { raw0: withdrawn[0], raw1: withdrawn[1] }, dustRawByAddress
+    });
+    const destinationAddresses = new Set([
+      destinationPool.token0.address.toLowerCase(), destinationPool.token1.address.toLowerCase()
+    ]);
+    const conversionAssets = funding.filter((entry) =>
+      sourceAddresses.includes(entry.address) && !destinationAddresses.has(entry.address)
+      && entry.maxSpendRaw > 0n);
+    const anchor = conversionAssets.length
+      ? chooseInvestmentAnchor(conversionAssets.map((entry) => entry.token),
+        destinationPool, (plan.routingPools || []).filter((pool) =>
+          pool.id.toLowerCase() !== destinationPool.id.toLowerCase()
+          && pool.token0.address.toLowerCase() !== ZERO_ADDRESS
+          && pool.token1.address.toLowerCase() !== ZERO_ADDRESS), 3)
+      : { anchor: destinationPool.token0, routes: new Map() };
+    const maxImpactBps = this.config.crossPoolMaxSwapPriceImpactBps ?? 350;
+    const projected = new Map(funding.map((entry) => [entry.address, entry.maxSpendRaw]));
+    const routeSwaps = [];
+    for (const entry of conversionAssets) {
+      const route = anchor.routes.get(entry.address);
+      const routeUsesSource = route.some((pool) => pool.id.toLowerCase() === sourcePool.id.toLowerCase());
+      const swap = await this.quoteCrossPoolRoute(route, entry.token, entry.maxSpendRaw,
+        maxImpactBps, routeUsesSource ? withdrawCall : null);
+      if (swap.quote.tokenOut.toLowerCase() !== anchor.anchor.address.toLowerCase()) {
+        throw new Error('Cross-pool route quote does not reach the chosen anchor');
+      }
+      routeSwaps.push(swap);
+      projected.set(entry.address, 0n);
+      const anchorAddress = anchor.anchor.address.toLowerCase();
+      projected.set(anchorAddress, (projected.get(anchorAddress) || 0n) + BigInt(swap.quote.minRawAmountOut));
+    }
+    const destinationInventory = {
+      raw0: projected.get(destinationPool.token0.address.toLowerCase()) || 0n,
+      raw1: projected.get(destinationPool.token1.address.toLowerCase()) || 0n
+    };
+    const initialTarget = buildTargetRange(destinationState.tick, destinationPool.key.tickSpacing,
+      this.config.tightWidthBps, this.config.rangePreset);
+    const balancePlan = await buildExactBalancedSwapPlan({
+      pool: destinationPool, quoter: this.quoter,
+      rawAmount0: destinationInventory.raw0, rawAmount1: destinationInventory.raw1,
+      sqrtPriceX96: destinationState.sqrtPriceX96,
+      tickLower: initialTarget.tickLower, tickUpper: initialTarget.tickUpper,
+      slippageBps: this.config.swapSlippageBps, maxPriceImpactBps: maxImpactBps,
+      preferRemainderTokenIndex: destinationPool.token0.address.toLowerCase() === this.config.usdgAddress.toLowerCase()
+        ? 0 : destinationPool.token1.address.toLowerCase() === this.config.usdgAddress.toLowerCase() ? 1 : null,
+      preferredRemainderBps: this.config.autoTopupDustBps ?? 25
+    });
+    if (balancePlan.blockedReason) throw new Error(`Cross-pool balance quote is blocked: ${balancePlan.blockedReason}`);
+    const usdValue = (token, raw) => {
+      const price = Number(this.getUsdPrice?.(token.address));
+      const value = Number(formatUnits(BigInt(raw), token.decimals)) * price;
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new Error(`Cross-pool USD valuation is unavailable for ${token.symbol}`);
+      }
+      return value;
+    };
+    const portfolioUsd = funding.filter((entry) => entry.maxSpendRaw > 0n)
+      .reduce((sum, entry) => sum + usdValue(entry.token, entry.maxSpendRaw), 0);
+    const costLegs = routeSwaps.map((swap) => ({
+      inputUsd: usdValue(swap.tokenIn, swap.rawAmountIn), impactBps: swap.impactBps
+    }));
+    if (balancePlan.direction !== 'none') {
+      const inputToken = balancePlan.tokenIn === 0 ? destinationPool.token0 : destinationPool.token1;
+      costLegs.push({ inputUsd: usdValue(inputToken, balancePlan.rawAmountIn),
+        impactBps: balancePlan.priceImpactBps });
+    }
+    // Each leg is weighted by the share of the complete redeployed wallet
+    // inventory it trades. Add the configured minOut slippage on each leg so
+    // the ceiling bounds the worst permitted whole-wallet conversion loss.
+    const totalImpactBps = assertCrossPoolWeightedQuoteCost(costLegs,
+      portfolioUsd, maxImpactBps, this.config.swapSlippageBps);
+    const balanceSwap = balancePlan.direction === 'none' ? null : {
+      plan: balancePlan,
+      request: this.router.buildV4ExactInputSingle({ pool: destinationPool, quote: balancePlan.quote, deadline })
+    };
+    const projectedAfterSwaps = { ...destinationInventory };
+    if (balanceSwap) {
+      if (balancePlan.tokenIn === 0) {
+        projectedAfterSwaps.raw0 -= balancePlan.rawAmountIn;
+        projectedAfterSwaps.raw1 += BigInt(balancePlan.quote.minRawAmountOut);
+      } else {
+        projectedAfterSwaps.raw1 -= balancePlan.rawAmountIn;
+        projectedAfterSwaps.raw0 += BigInt(balancePlan.quote.minRawAmountOut);
+      }
+    }
+    const zeroDeposit = { amount0Max: 0n, amount1Max: 0n };
+    const swapApprovals = [];
+    for (const swap of routeSwaps) {
+      const firstPool = swap.route[0];
+      const tokenInIndex = firstPool.token0.address.toLowerCase() === swap.tokenIn.address.toLowerCase() ? 0 : 1;
+      swapApprovals.push(...await this.buildTopUpApprovalRequests(firstPool,
+        { direction: 'route', tokenIn: tokenInIndex, rawAmountIn: swap.rawAmountIn }, zeroDeposit));
+    }
+    if (balanceSwap) swapApprovals.push(...await this.buildTopUpApprovalRequests(
+      destinationPool, balancePlan, zeroDeposit));
+    const swapCalls = [
+      ...routeSwaps.map((swap) => ({ to: swap.request.router, data: swap.request.data,
+        value: swap.request.value, gasLimit: Number(TOP_UP_SWAP_GAS_LIMIT) })),
+      ...(balanceSwap ? [{ to: balanceSwap.request.router, data: balanceSwap.request.data,
+        value: balanceSwap.request.value, gasLimit: Number(TOP_UP_SWAP_GAS_LIMIT) }] : [])
+    ];
+    const toSimulationCall = ({ tx }) => ({ to: tx.to, data: tx.data,
+      value: tx.value || 0n, gasLimit: Number(TOP_UP_APPROVAL_GAS_RESERVE) });
+    const swapSimulation = await simulateSequentialCalls(this.writeProvider, {
+      ...simulationArgs,
+      calls: [...swapApprovals.map(toSimulationCall), withdrawCall, ...swapCalls,
+        balanceCall(destinationPool.token0), balanceCall(destinationPool.token1)]
+    });
+    const simulatedRaw0 = BigInt(erc20Interface.decodeFunctionResult('balanceOf', swapSimulation.at(-2).returnData)[0]);
+    const simulatedRaw1 = BigInt(erc20Interface.decodeFunctionResult('balanceOf', swapSimulation.at(-1).returnData)[0]);
+    if (simulatedRaw0 - (dustRawByAddress[destinationPool.token0.address.toLowerCase()] || 0n) < projectedAfterSwaps.raw0
+      || simulatedRaw1 - (dustRawByAddress[destinationPool.token1.address.toLowerCase()] || 0n) < projectedAfterSwaps.raw1) {
+      throw new Error('Cross-pool simulated swap inventory is below the conservative minOut inventory');
+    }
+    let finalPrice = { tick: destinationState.tick, sqrtPriceX96: destinationState.sqrtPriceX96 };
+    for (const receipt of swapSimulation) for (const logEntry of receipt.logs || []) {
+      try {
+        const event = swapEventInterface.parseLog(logEntry);
+        if (String(event.args.id).toLowerCase() === destinationPool.id.toLowerCase()) {
+          finalPrice = { tick: Number(event.args.tick), sqrtPriceX96: BigInt(event.args.sqrtPriceX96) };
+        }
+      } catch {}
+    }
+    const finalTarget = buildTargetRange(finalPrice.tick, destinationPool.key.tickSpacing,
+      this.config.tightWidthBps, this.config.rangePreset);
+    const depositPlan = buildExactDepositPlan({
+      rawAmount0: projectedAfterSwaps.raw0, rawAmount1: projectedAfterSwaps.raw1,
+      sqrtPriceX96: finalPrice.sqrtPriceX96,
+      tickLower: finalTarget.tickLower, tickUpper: finalTarget.tickUpper,
+      slippageBps: this.config.depositSlippageBps,
+      liquidityReserveBps: this.config.depositLiquidityReserveBps
+    });
+    this.assertValidDeposit(depositPlan, 'Cross-pool sequence deposit plan is invalid');
+    const depositApprovals = await this.buildTopUpApprovalRequests(destinationPool,
+      { direction: 'none' }, depositPlan);
+    const depositData = this.fables.encodeDeposit(destinationPool, finalTarget,
+      depositPlan.liquidity, depositPlan.amount0Max, depositPlan.amount1Max, deadline);
+    const fullSimulation = await simulateSequentialCalls(this.writeProvider, {
+      ...simulationArgs,
+      calls: [...swapApprovals.map(toSimulationCall), ...depositApprovals.map(toSimulationCall),
+        withdrawCall, ...swapCalls,
+        { to: destinationPool.key.hooks, data: depositData, value: 0n,
+          gasLimit: Number(TOP_UP_DEPOSIT_GAS_LIMIT) }]
+    });
+    const deposited = this.findWalletDepositEvent(destinationPool, fullSimulation.at(-1));
+    if (!deposited || deposited.liquidity <= 0n) {
+      throw new Error('Full cross-pool sequence did not mint a destination LP position');
+    }
+    return {
+      status: 'full-sequence-simulated', sourcePoolId: sourcePool.id, destinationPoolId: destinationPool.id,
+      positionId: plan.position.id, guardedData, before, postWithdraw, funding,
+      routeSwaps, balanceSwap, depositPlan, finalTarget, deadline,
+      simulatedGasUsed: fullSimulation.reduce((total, receipt) =>
+        total + BigInt(receipt.gasUsed || 0), 0n).toString(),
+      simulatedCallCount: fullSimulation.length,
+      pendingApprovalCount: swapApprovals.length + depositApprovals.length,
+      routeImpactBps: routeSwaps.map((swap) => swap.impactBps),
+      balanceImpactBps: balancePlan.priceImpactBps ?? null,
+      totalImpactBps,
+      mintedLiquidity: deposited.liquidity.toString()
+    };
+  }
+
   samePoolRebalanceMaxImpactBps(pool) {
     const defaultLimit = this.config.maxSwapPriceImpactBps ?? 200;
     const scopedPoolId = String(this.config.oorRebalanceSwapPoolId || '').toLowerCase();
@@ -1622,22 +1899,216 @@ export class RebalanceExecutor {
   }
 
   async executeCrossPool(plan, destinationPool) {
-    const preview = await this.previewCrossPoolExecution(plan, destinationPool);
-    if (this.config.dryRun || !this.config.enableLiveWrites) return preview;
-
-    // The available RPC path cannot simulate a deposit against balances that
-    // would only exist after a withdrawal, and no state override is configured.
-    // Keep the complete plan for review, but never withdraw first and discover
-    // an unsimulatable swap/deposit afterwards.
-    const reason = 'Live cross-pool execution is blocked until the complete post-withdraw swap and deposit can be simulated before withdrawal';
-    const blockedPlan = {
-      ...(preview.plan || {}),
-      status: 'blocked',
-      liveWriteGate: 'post-withdraw-state-simulation-unavailable',
-      reason
+    if (this.config.dryRun || !this.config.enableLiveWrites) {
+      return this.previewCrossPoolExecution(plan, destinationPool);
+    }
+    await this.assertLiveReady(plan);
+    this.assertNoUnfinishedExecution();
+    let phase = 'prepared';
+    let journal = {
+      id: `${Date.now()}:${plan.pool.id}:${plan.position.id}:${destinationPool.id}`,
+      phase, startedAt: Date.now(), poolId: plan.pool.id,
+      destinationPoolId: destinationPool.id,
+      sourcePair: `${plan.pool.token0.symbol}/${plan.pool.token1.symbol}`,
+      destinationPair: `${destinationPool.token0.symbol}/${destinationPool.token1.symbol}`,
+      oldPosition: { id: plan.position.id, tickLower: plan.position.tickLower,
+        tickUpper: plan.position.tickUpper, shares: String(plan.position.shares) },
+      tx: { routeSwaps: [] }
     };
-    this.ledger.append('rebalance.cross_pool_live_blocked', blockedPlan);
-    return { status: 'blocked', reason, plan: blockedPlan };
+    this.saveJournal(journal);
+    try {
+      let preflight = await this.preflightCrossPoolSequence(plan, destinationPool);
+      journal = this.patchJournal(journal, {
+        phase: 'cross_pool_preflighted',
+        preflight: {
+          simulatedCallCount: preflight.simulatedCallCount,
+          simulatedGasUsed: preflight.simulatedGasUsed,
+          routeImpactBps: preflight.routeImpactBps,
+          balanceImpactBps: preflight.balanceImpactBps,
+          target: preflight.finalTarget,
+          mintedLiquidity: preflight.mintedLiquidity
+        }
+      });
+      for (const swap of preflight.routeSwaps) {
+        await this.ensureSwapAllowances(swap.tokenIn, swap.rawAmountIn);
+      }
+      if (preflight.balanceSwap) {
+        const token = preflight.balanceSwap.plan.tokenIn === 0
+          ? destinationPool.token0 : destinationPool.token1;
+        await this.ensureSwapAllowances(token, preflight.balanceSwap.plan.rawAmountIn);
+      }
+      await this.ensureHookAllowance(destinationPool.token0, destinationPool.key.hooks,
+        preflight.depositPlan.amount0Max);
+      await this.ensureHookAllowance(destinationPool.token1, destinationPool.key.hooks,
+        preflight.depositPlan.amount1Max);
+      journal = this.patchJournal(journal, { phase: 'approvals_ready' });
+
+      // Approvals may take blocks. Rebuild and simulate the entire transaction
+      // sequence against their actual on-chain allowance state before moving LP.
+      preflight = await this.preflightCrossPoolSequence(plan, destinationPool);
+      if (preflight.pendingApprovalCount > 0) {
+        // An approval quote changed while permissions were being mined. Fail
+        // before withdrawal; the next monitor cycle can re-quote from scratch.
+        throw new Error('Cross-pool approvals changed during preflight; retry before moving LP');
+      }
+      const feeOverrides = await this.getPinnedFeeOverrides();
+      await this.assertTopUpGasBudget({
+        reserveWei: this.config.topUpMinGasReserveWei,
+        maxFeePerGas: feeOverrides.maxFeePerGas || feeOverrides.gasPrice,
+        futureGasLimit: BigInt(preflight.simulatedGasUsed) * 3n / 2n,
+        phase: 'cross-pool-before-withdrawal'
+      });
+      journal = this.patchJournal(journal, {
+        phase: 'sequence_preflighted',
+        preflight: {
+          simulatedCallCount: preflight.simulatedCallCount,
+          simulatedGasUsed: preflight.simulatedGasUsed,
+          routeImpactBps: preflight.routeImpactBps,
+          balanceImpactBps: preflight.balanceImpactBps,
+          target: preflight.finalTarget,
+          mintedLiquidity: preflight.mintedLiquidity
+        }
+      });
+      await this.assertPlanStillOutOfRange(plan, 'cross-pool-after-sequence-preflight');
+      const withdrawReceipt = await this.sendVerifiedTx({
+        label: 'crossPoolGuardedWithdrawAndClaim',
+        to: this.config.walletAddress,
+        data: preflight.guardedData,
+        value: 0n,
+        onSent: (hash) => {
+          phase = 'withdraw_sent';
+          journal = this.patchJournal(journal, { phase, tx: { ...journal.tx, withdraw: hash } });
+        }
+      });
+      phase = 'withdraw_confirmed';
+      journal = this.patchJournal(journal, {
+        phase, tx: { ...journal.tx, withdraw: withdrawReceipt.hash || journal.tx.withdraw }
+      });
+      const oldShares = await this.readPositionShares(plan.pool, plan.position.id);
+      if (oldShares !== 0n) throw new Error(`Old LP shares remain after cross-pool withdrawal: ${oldShares}`);
+      const routeHashes = [];
+      for (const swap of preflight.routeSwaps) {
+        const beforeInput = await this.readRawTokenBalance(swap.tokenIn);
+        const outputToken = [destinationPool.token0, destinationPool.token1]
+          .find((token) => token.address.toLowerCase() === swap.quote.tokenOut.toLowerCase());
+        if (!outputToken || beforeInput < swap.rawAmountIn) {
+          throw new Error('Cross-pool conversion input or output token changed after withdrawal');
+        }
+        const beforeOutput = await this.readRawTokenBalance(outputToken);
+        const receipt = await this.sendVerifiedTx({
+          label: `crossPoolRoute:${swap.tokenIn.symbol}->${outputToken.symbol}`,
+          to: swap.request.router, data: swap.request.data, value: swap.request.value,
+          onSent: (hash) => {
+            phase = 'route_swap_sent';
+            journal = this.patchJournal(journal, { phase,
+              tx: { ...journal.tx, routeSwaps: [...routeHashes, hash] } });
+          }
+        });
+        const afterInput = await this.readRawTokenBalance(swap.tokenIn);
+        const afterOutput = await this.readRawTokenBalance(outputToken);
+        if (beforeInput - afterInput !== swap.rawAmountIn
+          || afterOutput - beforeOutput < BigInt(swap.quote.minRawAmountOut)) {
+          throw new Error('Cross-pool route receipt balances differ from exact-input minOut');
+        }
+        routeHashes.push(receipt.hash || journal.tx.routeSwaps.at(-1));
+        phase = 'route_swap_confirmed';
+        journal = this.patchJournal(journal, { phase,
+          tx: { ...journal.tx, routeSwaps: [...routeHashes] } });
+      }
+      if (preflight.balanceSwap) {
+        const beforeBalances = await this.readRawPairBalances(destinationPool);
+        const swap = preflight.balanceSwap;
+        const receipt = await this.sendVerifiedTx({
+          label: 'crossPoolBalanceSwap', to: swap.request.router,
+          data: swap.request.data, value: swap.request.value,
+          onSent: (hash) => {
+            phase = 'swap_sent';
+            journal = this.patchJournal(journal, { phase, tx: { ...journal.tx, swap: hash } });
+          }
+        });
+        const afterBalances = await this.readRawPairBalances(destinationPool);
+        this.assertSwapReceiptBalances(destinationPool, swap.plan, beforeBalances, afterBalances);
+        phase = 'swap_confirmed';
+        journal = this.patchJournal(journal, { phase,
+          tx: { ...journal.tx, swap: receipt.hash || journal.tx.swap } });
+      }
+      const finalBalances = await this.readRawPairBalances(destinationPool);
+      const dust = new Map(preflight.funding.map((entry) => [entry.address, entry.dustRaw]));
+      const inventory = {
+        raw0: finalBalances.raw0 - (dust.get(destinationPool.token0.address.toLowerCase()) || 0n),
+        raw1: finalBalances.raw1 - (dust.get(destinationPool.token1.address.toLowerCase()) || 0n)
+      };
+      if (inventory.raw0 < 0n || inventory.raw1 < 0n) {
+        throw new Error('Cross-pool destination inventory fell below retained dust');
+      }
+      const destinationState = await this.fables.readPoolState(destinationPool);
+      if (destinationState.paused !== false) throw new Error('Destination pool paused before deposit');
+      const target = buildTargetRange(destinationState.tick, destinationPool.key.tickSpacing,
+        this.config.tightWidthBps, this.config.rangePreset);
+      const depositPlan = buildExactDepositPlan({
+        rawAmount0: inventory.raw0, rawAmount1: inventory.raw1,
+        sqrtPriceX96: destinationState.sqrtPriceX96,
+        tickLower: target.tickLower, tickUpper: target.tickUpper,
+        slippageBps: this.config.depositSlippageBps,
+        liquidityReserveBps: this.config.depositLiquidityReserveBps
+      });
+      this.assertValidDeposit(depositPlan, 'Actual cross-pool deposit plan is invalid');
+      await this.ensureHookAllowance(destinationPool.token0, destinationPool.key.hooks,
+        depositPlan.amount0Max);
+      await this.ensureHookAllowance(destinationPool.token1, destinationPool.key.hooks,
+        depositPlan.amount1Max);
+      const depositData = this.fables.encodeDeposit(destinationPool, target,
+        depositPlan.liquidity, depositPlan.amount0Max, depositPlan.amount1Max, this.deadline());
+      journal = this.patchJournal(journal, { phase: 'deposit_preflighted', target,
+        depositPlan: serializeDepositPlan(depositPlan) });
+      const depositReceipt = await this.sendVerifiedTx({
+        label: 'crossPoolFablesDeposit', to: destinationPool.key.hooks,
+        data: depositData, value: 0n,
+        onSent: (hash) => {
+          phase = 'deposit_sent';
+          journal = this.patchJournal(journal, { phase, tx: { ...journal.tx, deposit: hash } });
+        }
+      });
+      phase = 'deposit_confirmed';
+      const depositEvent = this.findWalletDepositEvent(destinationPool, depositReceipt);
+      if (!depositEvent) throw new Error('Cross-pool deposit receipt lacks the wallet deposit event');
+      const mintedRange = await this.fables.readRangeKey(destinationPool, depositEvent.rangeId);
+      if (!mintedRange.exists || !samePoolKeyLocal(mintedRange.key, destinationPool.key)
+        || Number(mintedRange.tickLower) !== target.tickLower
+        || Number(mintedRange.tickUpper) !== target.tickUpper) {
+        throw new Error('Cross-pool deposit minted an unexpected PoolKey or range');
+      }
+      const shares = await this.readPositionShares(destinationPool, depositEvent.rangeId);
+      if (shares <= 0n) throw new Error('Cross-pool deposit confirmed without new LP shares');
+      journal = this.patchJournal(journal, { phase: 'completed', completedAt: Date.now(),
+        tx: { ...journal.tx, deposit: depositReceipt.hash || journal.tx.deposit },
+        newPosition: { id: depositEvent.rangeId, shares: shares.toString(), target } });
+      this.clearJournal();
+      this.ledger.append('rebalance.cross_pool_completed', {
+        sourcePoolId: plan.pool.id, destinationPoolId: destinationPool.id,
+        sourcePair: journal.sourcePair, destinationPair: journal.destinationPair,
+        oldPositionId: plan.position.id, newPositionId: depositEvent.rangeId,
+        withdrawHash: journal.tx.withdraw, routeSwapHashes: routeHashes,
+        balanceSwapHash: journal.tx.swap || null, depositHash: journal.tx.deposit,
+        target, aprPct: plan.destinationStats?.aprPct ?? null
+      });
+      return { status: 'completed', withdrawHash: journal.tx.withdraw,
+        routeSwapHashes: routeHashes, swapHash: journal.tx.swap || null,
+        depositHash: journal.tx.deposit, newPositionId: depositEvent.rangeId, target };
+    } catch (error) {
+      const moved = error.code === 'BROADCAST_OUTCOME_UNCERTAIN' || [
+        'withdraw_sent', 'withdraw_confirmed', 'route_swap_sent', 'route_swap_confirmed',
+        'swap_sent', 'swap_confirmed', 'deposit_preflighted', 'deposit_sent', 'deposit_confirmed'
+      ].includes(phase);
+      if (moved) {
+        journal = this.patchJournal(journal, { phase: 'recovery_required',
+          failedAt: Date.now(), error: error.message });
+        this.ledger.append('rebalance.recovery_required', jsonSafe(journal));
+      } else {
+        this.patchJournal(journal, { phase: 'failed', failedAt: Date.now(), error: error.message });
+      }
+      throw error;
+    }
   }
 
   async readRawTokenBalances(tokens) {

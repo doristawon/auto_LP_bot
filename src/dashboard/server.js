@@ -120,6 +120,31 @@ export class DashboardServer {
         generatedAt: snapshot?.generatedAt ?? null
       });
     }
+    if (req.method === 'POST' && url.pathname === '/api/pools/quotes/refresh') {
+      try {
+        const quotes = await this.bot.refreshPoolQuoteProbes();
+        return sendJson(res, 200, { ok: true, quoted: Object.values(quotes).filter((entry) => entry.status === 'quoted').length });
+      } catch (error) {
+        return sendJson(res, 409, { error: sanitize(error.message) });
+      }
+    }
+    if (req.method === 'POST' && url.pathname === '/api/points/evidence/refresh') {
+      try {
+        if (this.bot.cycleActive) throw new Error('Wait for the current wallet scan to finish');
+        const result = await this.bot.points.refreshEvidence({
+          address: this.bot.config.walletAddress,
+          provider: this.bot.providers.readProvider,
+          pools: this.bot.market.pools,
+          prices: this.bot.market.prices,
+          force: true
+        });
+        this.bot.updatePointsSnapshot(true);
+        return sendJson(res, 200, { ok: result?.ok === true,
+          error: result?.error || null });
+      } catch (error) {
+        return sendJson(res, 409, { error: sanitize(error.message) });
+      }
+    }
     if (req.method === 'POST' && url.pathname === '/api/settings/rpc') {
       const body = await readJsonBody(req);
       try {
@@ -315,6 +340,7 @@ function liveMarketSnapshot(bot) {
   const pools = bot?.market?.pools || [];
   const stats = bot?.market?.fablesStats;
   const watched = new Set((bot?.state?.getSetting('watchedPoolIds', []) || []).map((id) => String(id).toLowerCase()));
+  const quoteProbes = bot?.state?.getSetting('poolQuoteProbes', {}) || {};
   return pools.map((pool) => {
     const id = String(pool.id || '').toLowerCase();
     const poolStats = stats?.pools?.get(id) || null;
@@ -323,6 +349,8 @@ function liveMarketSnapshot(bot) {
       pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
       token0: pool.token0.symbol,
       token1: pool.token1.symbol,
+      nativeCurrency: [pool.token0, pool.token1].some((token) =>
+        String(token.address).toLowerCase() === '0x0000000000000000000000000000000000000000'),
       tick: pool.state?.tick ?? null,
       paused: pool.state?.paused ?? null,
       watched: watched.has(id),
@@ -333,7 +361,8 @@ function liveMarketSnapshot(bot) {
       statsObservedAt: stats?.observedAt ?? null,
       statsSource: stats?.source ?? null,
       statsTvlAvailable: stats?.tvlAvailable ?? null,
-      statsVolumeAvailable: stats?.volumeAvailable ?? null
+      statsVolumeAvailable: stats?.volumeAvailable ?? null,
+      swapCostProbe: quoteProbes[id] || null
     };
   });
 }
