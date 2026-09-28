@@ -512,8 +512,10 @@ export class AutoLpBot {
     const sourcePool = currentPosition
       ? this.market.pools.find((pool) => pool.id.toLowerCase() === String(currentPosition.poolId).toLowerCase())
       : null;
+    const crossPoolLiveUnavailable = Boolean(sourcePool && this.config.enableLiveWrites && !this.config.dryRun);
     const aprSelected = ranked.find(({ pool }) => {
       if (!sourcePool) return true;
+      if (crossPoolLiveUnavailable && pool.id.toLowerCase() !== sourcePool.id.toLowerCase()) return false;
       try {
         chooseInvestmentAnchor(
           [sourcePool.token0, sourcePool.token1, pool.token0, pool.token1],
@@ -522,7 +524,7 @@ export class AutoLpBot {
         );
         return true;
       } catch { return false; }
-    })?.pool;
+    })?.pool || (crossPoolLiveUnavailable ? sourcePool : null);
     const selected = settings.mode === 'specific-pool'
       ? this.market.pools.find((pool) => pool.id.toLowerCase() === settings.poolId)
       : aprSelected;
@@ -537,7 +539,10 @@ export class AutoLpBot {
       aprPct: stats?.aprPct ?? null,
       tvlUsd: tvlStats?.tvlUsd ?? null,
       statsObservedAt: this.market.fablesStats?.aprObservedAt ?? null,
-      minTvlUsd: this.config.aprPoolMinTvlUsd
+      minTvlUsd: this.config.aprPoolMinTvlUsd,
+      executionConstraint: crossPoolLiveUnavailable && settings.mode === 'apr-highest'
+        ? 'cross-pool-live-unavailable; current LP pool is the executable fallback'
+        : null
     };
   }
 
@@ -557,6 +562,10 @@ export class AutoLpBot {
       return selected;
     }
     if (settings.mode !== 'apr-highest') throw new Error('未知的再投入模式');
+    // The cross-pool executor has no live post-withdraw sequence simulation.
+    // Never select a destination that the live executor will always reject.
+    // Keep the existing LP capital in its pool and build the new Tight range there.
+    if (this.config.enableLiveWrites && !this.config.dryRun) return sourcePool;
     const ranked = rankAprPools({
       pools: this.market.pools,
       stats: this.market.fablesStats,
@@ -1479,12 +1488,23 @@ export class AutoLpBot {
     }
     let destinationPool;
     try {
-      try { await this.refreshAprForRebalance(); }
-      catch (error) {
-        log('warn', 'fables.stats_unavailable_for_rebalance', { error: error.message });
-        if (this.getInvestmentTargetSettings().mode === 'apr-highest') throw error;
+      const investmentMode = this.getInvestmentTargetSettings().mode;
+      const samePoolLiveFallback = investmentMode === 'apr-highest'
+        && this.config.enableLiveWrites && !this.config.dryRun;
+      if (!samePoolLiveFallback) {
+        try { await this.refreshAprForRebalance(); }
+        catch (error) {
+          log('warn', 'fables.stats_unavailable_for_rebalance', { error: error.message });
+          if (investmentMode === 'apr-highest') throw error;
+        }
       }
       destinationPool = this.resolveInvestmentTarget(pool);
+      if (samePoolLiveFallback) {
+        this.ledger.append('rebalance.target_fallback', {
+          sourcePoolId: pool.id, destinationPoolId: pool.id, positionId: position.id,
+          reason: 'live cross-pool execution lacks complete post-withdraw sequence simulation'
+        });
+      }
     } catch (error) {
       const backoff = recordRebalanceFailure(this.state, this.ledger, pool, position, error.message);
       this.ledger.append('rebalance.blocked', {
@@ -1531,12 +1551,12 @@ export class AutoLpBot {
       // Only a fully completed state machine may commit a rebalance to strategy state.
       if (result.status !== 'completed') {
         recordRebalanceFailure(this.state, this.ledger, pool, position,
-          `executor returned ${String(result.status || 'unknown')}`);
+          result.reason || result.error || `executor returned ${String(result.status || 'unknown')}`);
         this.ledger.append('rebalance.uncommitted', {
           positionId: position.id,
           poolId: pool.id,
           status: result.status,
-          reason: 'executor did not report a fully completed withdraw-swap-deposit cycle'
+          reason: sanitize(String(result.reason || result.error || 'executor did not report a fully completed withdraw-swap-deposit cycle'))
         });
         return result;
       }

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { AutoLpBot } from '../src/bot.js';
 import {
   rankAprPools,
   findV4Route,
@@ -37,6 +38,34 @@ test('APR ranking excludes stale, paused, empty, and undersized pools', () => {
   };
   assert.deepEqual(rankAprPools({ pools, stats, nowMs, minTvlUsd: 30_000 }).map((item) => item.pool.id), ['high', 'low']);
   assert.deepEqual(rankAprPools({ pools, stats: { ...stats, observedAt: nowMs - 600_000 }, nowMs }).map((item) => item.pool.id), []);
+});
+
+test('live APR mode keeps the existing LP pool while cross-pool execution cannot be simulated', () => {
+  const nowMs = Date.now();
+  const source = pool('source', token(USDG, 'USDG'), token(MOO, 'MOO'));
+  const higher = pool('higher', token(USDG, 'USDG'), token(UBIK, 'UBIK'));
+  const bot = {
+    config: { enableLiveWrites: true, dryRun: false, marketRefreshMs: 300_000, aprPoolMinTvlUsd: 30_000 },
+    market: {
+      pools: [source, higher],
+      fablesStats: {
+        observedAt: nowMs, aprObservedAt: nowMs,
+        pools: new Map([
+          ['source', { aprPct: 100, tvlUsd: 100_000, fees24hUsd: 10 }],
+          ['higher', { aprPct: 200, tvlUsd: 100_000, fees24hUsd: 20 }]
+        ])
+      }
+    },
+    snapshot: { portfolio: { positions: [{ poolId: 'source', shares: '1' }] } },
+    getInvestmentTargetSettings() { return { mode: 'apr-highest', poolId: '' }; }
+  };
+  assert.equal(AutoLpBot.prototype.resolveInvestmentTarget.call(bot, source).id, 'source');
+  const target = AutoLpBot.prototype.getInvestmentTargetSnapshot.call(bot);
+  assert.equal(target.poolId, 'source');
+  assert.match(target.executionConstraint, /cross-pool-live-unavailable/);
+
+  bot.config.dryRun = true;
+  assert.equal(AutoLpBot.prototype.resolveInvestmentTarget.call(bot, source).id, 'higher');
 });
 
 test('Fables route search returns the shortest connected route and ordered path keys', () => {

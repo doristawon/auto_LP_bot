@@ -223,6 +223,33 @@ test('a failed preflight backs off instead of retrying on the next monitor cycle
   assert.equal(events.filter((event) => event.type === 'rebalance.backoff').length, 1);
 });
 
+test('blocked executor reason is retained in the rebalance backoff', async () => {
+  const settings = new Map();
+  const events = [];
+  const bot = {
+    state: {
+      getSetting(key, fallback) { return settings.has(key) ? settings.get(key) : fallback; },
+      setSetting(key, value) { settings.set(key, value); },
+      recentRebalances() { return []; }
+    },
+    ledger: { append(type, data) { events.push({ type, data }); } },
+    executionPaused: false,
+    market: { pools: [pool], fablesStats: { pools: new Map() } },
+    config: { maxRebalancesPerHour: 3, minRebalanceIntervalSec: 300 },
+    getInvestmentTargetSettings() { return { mode: 'apr-highest', poolId: '' }; },
+    async refreshAprForRebalance() {},
+    resolveInvestmentTarget(sourcePool) { return sourcePool; },
+    async assertStillOutOfRangeBeforeRebalance() { return true; },
+    executor: { async execute() { return { status: 'blocked', reason: 'price impact exceeds limit' }; } }
+  };
+  const result = await AutoLpBot.prototype.maybeRebalance.call(bot, pool, { ...position });
+  assert.equal(result.status, 'blocked');
+  assert.equal(events.find((event) => event.type === 'rebalance.backoff').data.reason,
+    'price impact exceeds limit');
+  assert.equal(events.find((event) => event.type === 'rebalance.uncommitted').data.reason,
+    'price impact exceeds limit');
+});
+
 
 test('minimum rebalance interval is global across newly minted range IDs', async () => {
   const events = [];
