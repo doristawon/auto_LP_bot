@@ -267,7 +267,8 @@ export class DashboardServer {
         const result = await this.bot.manualImmediateRotation({
           poolId: body.poolId, positionId: body.positionId,
           destinationPoolId: body.destinationPoolId,
-          maxCostBps: body.maxCostBps, previewId: body.previewId, previewOnly: false
+          maxCostBps: body.maxCostBps, previewId: body.previewId,
+          previewOnly: false, directExecute: body.direct === true
         });
         return sendJson(res, result?.status === 'completed' ? 200 : 409,
           { ok: result?.status === 'completed', result });

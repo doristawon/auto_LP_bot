@@ -822,7 +822,7 @@ export class AutoLpBot {
   }
 
   async manualImmediateRotation({ poolId, positionId, destinationPoolId, previewId = '',
-    previewOnly = false, maxCostBps = null }) {
+    previewOnly = false, directExecute = false, maxCostBps = null }) {
     poolId = String(poolId || '').toLowerCase();
     positionId = String(positionId || '').toLowerCase();
     destinationPoolId = String(destinationPoolId || '').toLowerCase();
@@ -836,7 +836,7 @@ export class AutoLpBot {
     if (!this.config.dashboardManualControlEnabled) throw new Error('人工交易控制尚未啟用');
     if (this.cycleActive) throw new Error('目前有鏈上掃描或交易流程，請稍後重試');
     let approved = null;
-    if (!previewOnly) {
+    if (!previewOnly && !directExecute) {
       approved = this.manualRotationPreview;
       this.manualRotationPreview = null;
       if (!approved || approved.id !== previewId || approved.expiresAt < Date.now()
@@ -910,6 +910,11 @@ export class AutoLpBot {
           maxCostBps: costCapBps,
           target: result.finalTarget
         };
+      }
+      if (directExecute) {
+        await this.executor.assertLiveReady(plan);
+        this.executor.assertNoUnfinishedExecution();
+        await this.executor.preflightCrossPoolSequence(plan, destinationPool);
       }
       this.ledger.append('rebalance.manual_immediate_requested', {
         poolId, positionId, destinationPoolId,

@@ -107,3 +107,13 @@ test('explicit manual preview ignores automatic rebalance cooldown and quota', a
   assert.ok(preview.expiresAt - Date.now() > 9 * 60_000);
   assert.equal(h.executions, 0);
 });
+
+test('direct manual rotation executes after a fresh full sequence check without a preview token', async () => {
+  const h = harness();
+  const result = await h.bot.manualImmediateRotation({
+    poolId: sourceId, positionId, destinationPoolId: destinationId,
+    maxCostBps: 500, directExecute: true
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(h.executions, 1);
+});

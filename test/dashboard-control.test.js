@@ -235,6 +235,11 @@ test('immediate rotation requires manual arming, a preview and exact destination
     assert.equal(executed.status, 200);
     assert.equal(calls.rotation.length, 2);
     assert.equal(calls.rotation[1].previewOnly, false);
+    const direct = await post('/api/control/rotate/execute', {
+      ...body, direct: true, confirm: 'ROTATE_TO:' + body.destinationPoolId + ':350'
+    });
+    assert.equal(direct.status, 200);
+    assert.equal(calls.rotation[2].directExecute, true);
   });
 });
 
