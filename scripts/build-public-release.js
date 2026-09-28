@@ -236,7 +236,7 @@ for (const rel of trackedFiles()) {
   const stat = fs.statSync(source);
   if (!stat.isFile()) continue;
   const content = fs.readFileSync(source);
-  if (content.includes(0)) throw new Error(`Binary tracked file not supported in public release: \${rel}`);
+  if (content.includes(0)) throw new Error(`Binary tracked file not supported in public release: ${rel}`);
   writeFile(rel, sanitizeText(rel, content.toString('utf8')));
 }
 
@@ -305,10 +305,10 @@ for (const file of files) {
   const text = fs.readFileSync(file, 'utf8');
   const lower = text.toLowerCase();
   for (const exact of forbiddenExact) {
-    if (lower.includes(exact.toLowerCase())) findings.push(`\${rel}: forbidden exact value \${exact}`);
+    if (lower.includes(exact.toLowerCase())) findings.push(`${rel}: forbidden exact value ${exact}`);
   }
   for (const re of secretPatterns) {
-    if (re.test(text)) findings.push(`\${rel}: suspicious secret/private-path pattern \${re}`);
+    if (re.test(text)) findings.push(`${rel}: suspicious secret/private-path pattern ${re}`);
   }
 }
 
@@ -330,8 +330,8 @@ writeFile('PUBLIC_RELEASE_MANIFEST.md',
   + '- Private/real-wallet CI workflows and trigger files: excluded.\n'
   + '- Local credentials, data, state, logs and artifacts: excluded by tracked-file build and .gitignore.\n'
   + '- Private commit history and author email metadata: not included.\n\n'
-  + `Tracked public files: \${manifest.length}\n`
+  + `Tracked public files: ${manifest.length}\n`
 );
 
-console.log(`Public release built: \${manifest.length} files`);
+console.log(`Public release built: ${manifest.length} files`);
 console.log('Privacy scan: PASS');
