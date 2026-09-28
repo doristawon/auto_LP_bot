@@ -53,6 +53,11 @@ jobs:
           npm run compile:guard
           npm test
 
+      - name: Remove validation-only generated files
+        run: |
+          rm -rf public-release/node_modules
+          rm -rf public-release/artifacts
+
       - name: Final privacy scan summary
         run: |
           test -f public-release/PUBLIC_RELEASE_MANIFEST.md
