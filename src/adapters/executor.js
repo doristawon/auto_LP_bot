@@ -42,6 +42,7 @@ import { log } from '../logger.js';
 const erc20Interface = new Interface(ERC20_ABI);
 const permit2Interface = new Interface(PERMIT2_ABI);
 const guardInterface = new Interface(EIP7702_GUARD_ABI);
+const hookInterface = new Interface(HOOK_ABI);
 const swapEventInterface = new Interface([
   'event Swap(bytes32 indexed id,address indexed sender,int128 amount0,int128 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint24 fee)'
 ]);
@@ -49,6 +50,19 @@ const depositedTopic = id(DEPOSITED_EVENT).toLowerCase();
 const TOP_UP_DEPOSIT_GAS_LIMIT = 1_200_000n;
 const TOP_UP_APPROVAL_GAS_RESERVE = 300_000n;
 const TOP_UP_SWAP_GAS_LIMIT = 1_500_000n;
+
+export function buildCrossPoolWithdrawCall({ pool, position, bounds, deadline, walletAddress,
+  fablesWalk, manualImmediate = false }) {
+  const args = [[pool.key.currency0, pool.key.currency1, pool.key.fee,
+    pool.key.tickSpacing, pool.key.hooks], position.tickLower, position.tickUpper,
+  BigInt(position.shares), walletAddress, bounds.amount0Min, bounds.amount1Min,
+  BigInt(deadline), fablesWalk];
+  return manualImmediate
+    ? { to: pool.key.hooks, data: hookInterface.encodeFunctionData('withdrawAndClaim', args),
+      value: 0n, gasLimit: 1_500_000 }
+    : { to: walletAddress, data: guardInterface.encodeFunctionData('guardedWithdrawAndClaim', args),
+      value: 0n, gasLimit: 1_500_000 };
+}
 
 export class RebalanceExecutor {
   constructor(readProvider, writeProvider, config, fables, ledger, getUsdPrice, state = null) {
@@ -65,9 +79,18 @@ export class RebalanceExecutor {
   }
 
   async execute(plan) {
-    await this.assertPlanStillOutOfRange(plan, 'executor-entry');
-
     const destinationPool = plan.destinationPool || plan.pool;
+    if (plan.manualImmediate === true) {
+      if (plan.manualSource !== 'dashboard'
+        || String(destinationPool.id).toLowerCase() === String(plan.pool.id).toLowerCase()) {
+        throw new Error('Manual immediate rotation requires a different saved destination pool');
+      }
+      if (this.config.dryRun || !this.config.enableLiveWrites) {
+        throw new Error('Manual immediate rotation requires live writes');
+      }
+      return this.executeCrossPool(plan, destinationPool);
+    }
+    await this.assertPlanStillOutOfRange(plan, 'executor-entry');
     if (String(destinationPool.id).toLowerCase() !== String(plan.pool.id).toLowerCase()) {
       return this.executeCrossPool(plan, destinationPool);
     }
@@ -1661,7 +1684,9 @@ export class RebalanceExecutor {
 
   async preflightCrossPoolSequence(plan, destinationPool) {
     const sourcePool = plan.pool;
-    const sourceState = await this.assertPlanStillOutOfRange(plan, 'cross-pool-sequence-preflight');
+    const sourceState = plan.manualImmediate === true
+      ? await this.assertManualRotationSource(plan, 'cross-pool-sequence-preflight')
+      : await this.assertPlanStillOutOfRange(plan, 'cross-pool-sequence-preflight');
     const destinationState = await this.fables.readPoolState(destinationPool);
     if (destinationState.paused !== false || BigInt(destinationState.liquidity || 0) <= 0n) {
       throw new Error('Destination pool is paused or empty');
@@ -1684,13 +1709,11 @@ export class RebalanceExecutor {
       liquidity: BigInt(plan.position.shares),
       slippageBps: this.config.withdrawSlippageBps
     });
-    const guardedData = guardInterface.encodeFunctionData('guardedWithdrawAndClaim', [[
-      sourcePool.key.currency0, sourcePool.key.currency1, sourcePool.key.fee,
-      sourcePool.key.tickSpacing, sourcePool.key.hooks
-    ], plan.position.tickLower, plan.position.tickUpper, BigInt(plan.position.shares),
-    this.config.walletAddress, bounds.amount0Min, bounds.amount1Min,
-    BigInt(deadline), this.config.fablesWalk]);
-    const withdrawCall = { to: this.config.walletAddress, data: guardedData, value: 0n, gasLimit: 1_500_000 };
+    const withdrawCall = buildCrossPoolWithdrawCall({
+      pool: sourcePool, position: plan.position, bounds, deadline,
+      walletAddress: this.config.walletAddress, fablesWalk: this.config.fablesWalk,
+      manualImmediate: plan.manualImmediate === true
+    });
     const simulationArgs = { walletAddress: this.config.walletAddress, chainId: this.config.chainId };
     const withdrawnSimulation = await simulateSequentialCalls(this.writeProvider, {
       ...simulationArgs, calls: [withdrawCall, ...trackedTokens.map(balanceCall)]
@@ -1727,7 +1750,11 @@ export class RebalanceExecutor {
           && pool.token0.address.toLowerCase() !== ZERO_ADDRESS
           && pool.token1.address.toLowerCase() !== ZERO_ADDRESS), 3)
       : { anchor: destinationPool.token0, routes: new Map() };
-    const maxImpactBps = this.config.crossPoolMaxSwapPriceImpactBps ?? 350;
+    const maxImpactBps = plan.manualImmediate === true
+      ? Number(plan.manualMaxCostBps) : this.config.crossPoolMaxSwapPriceImpactBps ?? 350;
+    if (!Number.isInteger(maxImpactBps) || maxImpactBps < 1 || maxImpactBps > 500) {
+      throw new Error('Cross-pool swap cost ceiling is invalid');
+    }
     const projected = new Map(funding.map((entry) => [entry.address, entry.maxSpendRaw]));
     const routeSwaps = [];
     for (const entry of conversionAssets) {
@@ -1862,7 +1889,7 @@ export class RebalanceExecutor {
     }
     return {
       status: 'full-sequence-simulated', sourcePoolId: sourcePool.id, destinationPoolId: destinationPool.id,
-      positionId: plan.position.id, guardedData, before, postWithdraw, funding,
+      positionId: plan.position.id, withdrawCall, before, postWithdraw, funding,
       routeSwaps, balanceSwap, depositPlan, finalTarget, deadline,
       simulatedGasUsed: fullSimulation.reduce((total, receipt) =>
         total + BigInt(receipt.gasUsed || 0), 0n).toString(),
@@ -1899,6 +1926,9 @@ export class RebalanceExecutor {
   }
 
   async executeCrossPool(plan, destinationPool) {
+    if (plan.manualImmediate === true && (this.config.dryRun || !this.config.enableLiveWrites)) {
+      throw new Error('Manual immediate rotation requires live writes');
+    }
     if (this.config.dryRun || !this.config.enableLiveWrites) {
       return this.previewCrossPoolExecution(plan, destinationPool);
     }
@@ -1969,11 +1999,15 @@ export class RebalanceExecutor {
           mintedLiquidity: preflight.mintedLiquidity
         }
       });
-      await this.assertPlanStillOutOfRange(plan, 'cross-pool-after-sequence-preflight');
+      if (plan.manualImmediate === true) {
+        await this.assertManualRotationSource(plan, 'cross-pool-after-sequence-preflight');
+      } else {
+        await this.assertPlanStillOutOfRange(plan, 'cross-pool-after-sequence-preflight');
+      }
       const withdrawReceipt = await this.sendVerifiedTx({
-        label: 'crossPoolGuardedWithdrawAndClaim',
-        to: this.config.walletAddress,
-        data: preflight.guardedData,
+        label: plan.manualImmediate === true ? 'manualImmediateWithdrawAndClaim' : 'crossPoolGuardedWithdrawAndClaim',
+        to: preflight.withdrawCall.to,
+        data: preflight.withdrawCall.data,
         value: 0n,
         onSent: (hash) => {
           phase = 'withdraw_sent';
@@ -2207,6 +2241,21 @@ export class RebalanceExecutor {
     throw new Error(
       `Absolute in-range hold: refusing LP withdrawal at tick ${latestState.tick} within [${plan.position.tickLower}, ${plan.position.tickUpper})`
     );
+  }
+
+  async assertManualRotationSource(plan, phase) {
+    if (plan.manualImmediate !== true || plan.manualSource !== 'dashboard') {
+      throw new Error('Manual rotation requires an explicit dashboard request');
+    }
+    const latestState = await this.fables.readPoolState(plan.pool);
+    if (latestState.paused !== false) throw new Error(`Source pool is paused during ${phase}`);
+    const shares = await this.readPositionShares(plan.pool, plan.position.id);
+    if (shares <= 0n || shares !== BigInt(plan.position.shares)) {
+      throw new Error(`Source LP shares changed during ${phase}`);
+    }
+    plan.currentTick = latestState.tick;
+    plan.pool.state = latestState;
+    return latestState;
   }
 
   async readRawPairBalances(pool) {

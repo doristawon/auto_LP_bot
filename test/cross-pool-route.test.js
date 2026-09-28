@@ -1,15 +1,57 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Interface } from 'ethers';
-import { RebalanceExecutor } from '../src/adapters/executor.js';
+import { RebalanceExecutor, buildCrossPoolWithdrawCall } from '../src/adapters/executor.js';
 import { assertCrossPoolWeightedQuoteCost } from '../src/execution/investment-target.js';
-import { V4_QUOTER_ABI } from '../src/abi.js';
+import { EIP7702_GUARD_ABI, HOOK_ABI, V4_QUOTER_ABI } from '../src/abi.js';
 
 const USDG = { address: '0x0000000000000000000000000000000000000010', symbol: 'USDG' };
 const EARN = { address: '0x0000000000000000000000000000000000000020', symbol: 'EARN' };
 const ORBIO = { address: '0x0000000000000000000000000000000000000030', symbol: 'ORBIO' };
 const source = { id: 'source', token0: USDG, token1: EARN };
 const destination = { id: 'destination', token0: USDG, token1: ORBIO };
+
+test('explicit manual rotation uses direct hook withdrawal while automatic OOR keeps the guard', () => {
+  const walletAddress = '0x0000000000000000000000000000000000000001';
+  const pool = { key: { currency0: USDG.address, currency1: EARN.address,
+    fee: 3000, tickSpacing: 60, hooks: '0x0000000000000000000000000000000000000080' } };
+  const position = { tickLower: -120, tickUpper: 120, shares: 1000n };
+  const args = { pool, position, bounds: { amount0Min: 1n, amount1Min: 2n },
+    deadline: 123, walletAddress, fablesWalk: 1000 };
+  const manual = buildCrossPoolWithdrawCall({ ...args, manualImmediate: true });
+  const automatic = buildCrossPoolWithdrawCall(args);
+  assert.equal(manual.to, pool.key.hooks);
+  assert.equal(new Interface(HOOK_ABI).parseTransaction({ data: manual.data }).name, 'withdrawAndClaim');
+  assert.equal(automatic.to, walletAddress);
+  assert.equal(new Interface(EIP7702_GUARD_ABI).parseTransaction({ data: automatic.data }).name,
+    'guardedWithdrawAndClaim');
+});
+
+test('manual immediate entry bypasses OOR only for an explicit different-pool dashboard plan', async () => {
+  const executor = Object.create(RebalanceExecutor.prototype);
+  executor.assertPlanStillOutOfRange = () => { throw new Error('OOR only'); };
+  executor.executeCrossPool = async (_plan, pool) => ({ status: 'manual-path', poolId: pool.id });
+  executor.config = { dryRun: false, enableLiveWrites: true };
+  assert.deepEqual(await executor.execute({ pool: source, destinationPool: destination,
+    manualImmediate: true, manualSource: 'dashboard' }),
+  { status: 'manual-path', poolId: destination.id });
+  await assert.rejects(() => executor.execute({ pool: source, destinationPool: destination,
+    manualImmediate: true, manualSource: 'automatic' }), /explicit|different saved destination/i);
+  await assert.rejects(() => executor.execute({ pool: source, destinationPool: destination }), /OOR only/);
+});
+
+test('manual in-range withdrawal refuses changed LP shares or a paused source pool', async () => {
+  const executor = Object.create(RebalanceExecutor.prototype);
+  const plan = { pool: { ...source }, position: { id: 'range', shares: 100n },
+    manualImmediate: true, manualSource: 'dashboard' };
+  executor.fables = { async readPoolState() { return { paused: false, tick: 0 }; } };
+  executor.readPositionShares = async () => 99n;
+  await assert.rejects(() => executor.assertManualRotationSource(plan, 'test'), /shares changed/);
+  executor.readPositionShares = async () => 100n;
+  assert.equal((await executor.assertManualRotationSource(plan, 'test')).tick, 0);
+  executor.fables.readPoolState = async () => ({ paused: true, tick: 0 });
+  await assert.rejects(() => executor.assertManualRotationSource(plan, 'test'), /paused/);
+});
 
 test('cross-pool route accepts a roughly three percent quote within its scoped ceiling', async () => {
   const executor = Object.create(RebalanceExecutor.prototype);

@@ -48,6 +48,7 @@ Dashboard 預設網址：`http://127.0.0.1:8787`。若本機埠被佔用，使�
 - **啟動自動平衡**：只有指定目標池、錢包掃描完成、RPC 健康且無復原流程時可啟動；實盤模式另需啟用鏈上寫入、簽署器及通過 runtime 驗證的原子化防護。選池不會自動啟動。
 - **暫停自動平衡**：阻止新的再平衡，不會停止監控；已開始的資產移動流程會安全完成或進入復原狀態。
 - **人工再平衡**：只對已區間外且符合既定政策的部位開放。
+- **立刻換倉**：池子頁先儲存「指定池」，再選來源 LP 執行唯讀完整預演；確認預演摘要後才會送出實盤交易。這是獨立的人工跨池操作，可處理仍在區間內的 LP。
 
 手動 rebalance 預設關閉：
 
@@ -61,7 +62,7 @@ DASHBOARD_MANUAL_CONTROL_ENABLED=false
 DASHBOARD_MANUAL_CONTROL_ENABLED=true
 ```
 
-Manual control **不能**繞過：
+一般人工再平衡**不能**繞過：
 
 1. Absolute In-Range Hold
 2. OOR hysteresis policy
@@ -70,6 +71,8 @@ Manual control **不能**繞過：
 5. hourly rate limit
 6. live signer / guard / write gates
 7. receipt-reconciled executor state machine
+
+「立刻換倉」由使用者明確點選，允許撤出區間內 LP，因此不套用第 1、2 項的 OOR 等待條件；仍要求錢包與部位重新掃描、份額核對、已儲存指定池、完整 `eth_simulateV1` 序列、Gas 與授權檢查、冷卻與每小時次數限制，以及單次預演憑證。整體換幣成本上限預設 3.5%；使用者可只為這一筆選擇最高 5%，預演憑證與最後確認都綁定該上限，不修改自動策略。它以錢包直接呼叫 Fables hook 提領；自動 OOR 流程繼續使用 EIP-7702 區間防護。若提領後換幣或存入未完成，交易 journal 進入復原狀態並暫停新的自動交易。
 
 Dashboard 僅綁定 `127.0.0.1` 時不需要 `DASHBOARD_TOKEN`，符合本機部署用途。若 `DASHBOARD_HOST` 改成非 loopback 位址，才必須設定權杖。
 

@@ -5,7 +5,7 @@ import { DashboardServer } from '../src/dashboard/server.js';
 import { dashboardPage } from '../src/dashboard/page.js';
 
 function makeHarness() {
-  const calls = { scans: [], manual: [], pause: [], investmentTarget: [], manualBaselines: [], quoteRefreshes: 0, evidenceRefreshes: 0 };
+  const calls = { scans: [], manual: [], rotation: [], pause: [], investmentTarget: [], manualBaselines: [], quoteRefreshes: 0, evidenceRefreshes: 0 };
   const config = {
     dashboardEnabled: true,
     dashboardHost: '127.0.0.1',
@@ -54,6 +54,12 @@ function makeHarness() {
     async manualRebalance(poolId, positionId, source) {
       calls.manual.push({ poolId, positionId, source });
       return { status: 'dry-run' };
+    },
+    async manualImmediateRotation(request) {
+      calls.rotation.push(request);
+      return request.previewOnly
+        ? { status: 'ready', previewId: 'preview-1', destinationPair: 'USDG/MOO' }
+        : { status: 'completed' };
     }
   };
   const ledger = {
@@ -203,6 +209,32 @@ test('armed dashboard still requires explicit REBALANCE confirmation', async () 
     assert.equal(good.status, 200);
     assert.equal(calls.manual.length, 1);
     assert.equal(calls.manual[0].source, 'dashboard');
+  });
+});
+
+test('immediate rotation requires manual arming, a preview and exact destination confirmation', async () => {
+  await withServer(async ({ config, calls }, base) => {
+    const body = { poolId: '0x' + '11'.repeat(32), positionId: '0x' + '22'.repeat(32),
+      destinationPoolId: '0x' + '33'.repeat(32), maxCostBps: 350 };
+    const post = (path, data) => fetch(base + path, {
+      method: 'POST', headers: { 'content-type': 'application/json', origin: base },
+      body: JSON.stringify(data)
+    });
+    assert.equal((await post('/api/control/rotate/preview', body)).status, 403);
+    config.dashboardManualControlEnabled = true;
+    const preview = await post('/api/control/rotate/preview', body);
+    assert.equal(preview.status, 200);
+    assert.equal((await preview.json()).preview.previewId, 'preview-1');
+    assert.equal((await post('/api/control/rotate/execute', {
+      ...body, previewId: 'preview-1', confirm: 'ROTATE_TO:wrong'
+    })).status, 400);
+    assert.equal(calls.rotation.length, 1);
+    const executed = await post('/api/control/rotate/execute', {
+      ...body, previewId: 'preview-1', confirm: 'ROTATE_TO:' + body.destinationPoolId + ':350'
+    });
+    assert.equal(executed.status, 200);
+    assert.equal(calls.rotation.length, 2);
+    assert.equal(calls.rotation[1].previewOnly, false);
   });
 });
 

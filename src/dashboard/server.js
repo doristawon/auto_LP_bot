@@ -239,6 +239,42 @@ export class DashboardServer {
         return sendJson(res, 409, { error: error.shortMessage || error.message });
       }
     }
+    if (req.method === 'POST' && url.pathname === '/api/control/rotate/preview') {
+      if (!this.config.dashboardManualControlEnabled) {
+        return sendJson(res, 403, { error: 'dashboard manual control is not armed' });
+      }
+      const body = await readJsonBody(req);
+      try {
+        const preview = await this.bot.manualImmediateRotation({
+          poolId: body.poolId, positionId: body.positionId,
+          destinationPoolId: body.destinationPoolId,
+          maxCostBps: body.maxCostBps, previewOnly: true
+        });
+        return sendJson(res, 200, { ok: true, preview });
+      } catch (error) {
+        return sendJson(res, 409, { error: sanitize(error.message || '立即換倉預演失敗') });
+      }
+    }
+    if (req.method === 'POST' && url.pathname === '/api/control/rotate/execute') {
+      if (!this.config.dashboardManualControlEnabled) {
+        return sendJson(res, 403, { error: 'dashboard manual control is not armed' });
+      }
+      const body = await readJsonBody(req);
+      if (String(body.confirm || '') !== `ROTATE_TO:${String(body.destinationPoolId || '').toLowerCase()}:${String(body.maxCostBps ?? '')}`) {
+        return sendJson(res, 400, { error: 'manual immediate rotation requires target confirmation' });
+      }
+      try {
+        const result = await this.bot.manualImmediateRotation({
+          poolId: body.poolId, positionId: body.positionId,
+          destinationPoolId: body.destinationPoolId,
+          maxCostBps: body.maxCostBps, previewId: body.previewId, previewOnly: false
+        });
+        return sendJson(res, result?.status === 'completed' ? 200 : 409,
+          { ok: result?.status === 'completed', result });
+      } catch (error) {
+        return sendJson(res, 409, { error: sanitize(error.message || '立即換倉未完成') });
+      }
+    }
     if (req.method === 'POST' && url.pathname === '/api/points/baseline') {
       const body = await readJsonBody(req);
       if (!Number.isFinite(Number(body.points)) || Number(body.points) < 0) return sendJson(res, 400, { error: 'invalid points' });

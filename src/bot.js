@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { Interface, formatUnits, getAddress, id, Wallet } from 'ethers';
 import { createProviders, verifyProviders } from './rpc/providers.js';
 import { FablesAdapter, lifecycleEventType, lifecycleLiquidity } from './adapters/fables.js';
@@ -84,6 +85,7 @@ function clearRebalanceFailure(state, pool, position) {
 export class AutoLpBot {
   constructor(config) {
     this.config = config;
+    this.manualRotationPreview = null;
     this.baseExecutionTarget = {
       mode: config.targetMode,
       poolIds: [...(config.targetPoolIds || [])],
@@ -817,6 +819,122 @@ export class AutoLpBot {
     }
   }
 
+  async manualImmediateRotation({ poolId, positionId, destinationPoolId, previewId = '',
+    previewOnly = false, maxCostBps = null }) {
+    poolId = String(poolId || '').toLowerCase();
+    positionId = String(positionId || '').toLowerCase();
+    destinationPoolId = String(destinationPoolId || '').toLowerCase();
+    if (![poolId, positionId, destinationPoolId].every((value) => /^0x[0-9a-f]{64}$/.test(value))) {
+      throw new Error('立即換倉需要有效的來源部位與目的池');
+    }
+    const costCapBps = Number(maxCostBps ?? this.config.crossPoolMaxSwapPriceImpactBps ?? 350);
+    if (!Number.isInteger(costCapBps) || costCapBps < 1 || costCapBps > 500) {
+      throw new Error('單次換倉成本上限須為 1 至 500 bps');
+    }
+    if (!this.config.dashboardManualControlEnabled) throw new Error('人工交易控制尚未啟用');
+    if (this.cycleActive) throw new Error('目前有鏈上掃描或交易流程，請稍後重試');
+    let approved = null;
+    if (!previewOnly) {
+      approved = this.manualRotationPreview;
+      this.manualRotationPreview = null;
+      if (!approved || approved.id !== previewId || approved.expiresAt < Date.now()
+        || approved.wallet !== this.config.walletAddress.toLowerCase()
+        || approved.poolId !== poolId || approved.positionId !== positionId
+        || approved.destinationPoolId !== destinationPoolId
+        || approved.maxCostBps !== costCapBps) {
+        throw new Error('立即換倉預演已過期或目標變更，請重新預演');
+      }
+      if (this.executionPaused) throw new Error('執行已暫停，無法立即換倉');
+    }
+    const snapshot = await this.runOnce({ executeRebalances: false, source: 'manual-rotation-preflight' });
+    if (this.cycleActive) throw new Error('鏈上掃描尚未釋放執行鎖');
+    this.cycleActive = true;
+    try {
+      if (approved && approved.expiresAt < Date.now()) {
+        throw new Error('立即換倉預演已過期，請重新預演');
+      }
+      const settings = this.getInvestmentTargetSettings();
+      if (settings.mode !== 'specific-pool' || settings.poolId !== destinationPoolId) {
+        throw new Error('請先儲存指定池，立即換倉只使用已保存的目的池');
+      }
+      if (poolId === destinationPoolId) throw new Error('目前 LP 已在指定池，無需跨池換倉');
+      const active = (snapshot?.portfolio?.positions || []).filter((item) => BigInt(item.shares || 0) > 0n);
+      if (!active.some((item) => String(item.poolId).toLowerCase() === poolId
+        && String(item.id).toLowerCase() === positionId)) {
+        throw new Error('來源 LP 已變動，請重新掃描後選擇部位');
+      }
+      const sourcePool = this.market.pools.find((item) => item.id.toLowerCase() === poolId);
+      const position = sourcePool?.positions?.find((item) => item.id.toLowerCase() === positionId);
+      const destinationPool = this.market.pools.find((item) => item.id.toLowerCase() === destinationPoolId);
+      if (!sourcePool || !position || !destinationPool) throw new Error('來源 LP 或目的池已不在最新清單');
+      if (destinationPool.state?.paused !== false || BigInt(destinationPool.state?.liquidity || 0) <= 0n) {
+        throw new Error('目的池已暫停或沒有可用流動性');
+      }
+      if (hasNativeCurrency(sourcePool) || hasNativeCurrency(destinationPool)) {
+        throw new Error('原生 ETH 池尚未支援立即跨池換倉');
+      }
+      if (this.executionPaused || this.config.dryRun || !this.config.enableLiveWrites) {
+        throw new Error('立即換倉需要未暫停的實盤執行狀態');
+      }
+      if (Date.now() < Number(this.state.getSetting('walletTopologyCooldownUntil', 0) || 0)) {
+        throw new Error('錢包 LP 部位變動冷卻中，請稍後再預演');
+      }
+      const failureBackoff = rebalanceFailureMap(this.state)[rebalanceFailureKey(sourcePool, position)];
+      if (failureBackoff && Date.now() < Number(failureBackoff.nextRetryAt || 0)) {
+        throw new Error('來源 LP 再平衡失敗冷卻中');
+      }
+      const minIntervalMs = Math.max(0, Number(this.config.minRebalanceIntervalSec || 0) * 1000);
+      if (minIntervalMs > 0 && this.state.recentRebalances(minIntervalMs).length) {
+        throw new Error('尚未達到兩次再平衡的最短間隔');
+      }
+      if (this.state.recentRebalances().length >= this.config.maxRebalancesPerHour) {
+        throw new Error('已達每小時再平衡次數上限');
+      }
+      if (this.config.targetMode === 'wallet-active'
+        && !(await this.revalidateTopologyBeforeExecution(snapshot.blockNumber, [{ pool: sourcePool, position }]))) {
+        throw new Error('錢包 LP 部位在預演期間變動');
+      }
+      const plan = {
+        pool: sourcePool, destinationPool, position, routingPools: this.market.pools,
+        destinationStats: this.market.fablesStats?.pools?.get(destinationPoolId) || null,
+        manualImmediate: true, manualSource: 'dashboard', manualMaxCostBps: costCapBps
+      };
+      if (previewOnly) {
+        await this.executor.assertLiveReady(plan);
+        this.executor.assertNoUnfinishedExecution();
+        const result = await this.executor.preflightCrossPoolSequence(plan, destinationPool);
+        const id = randomUUID();
+        this.manualRotationPreview = {
+          id, expiresAt: Date.now() + 2 * 60_000,
+          wallet: this.config.walletAddress.toLowerCase(), poolId, positionId,
+          destinationPoolId, maxCostBps: costCapBps
+        };
+        return {
+          status: 'ready', previewId: id, expiresAt: this.manualRotationPreview.expiresAt,
+          sourcePair: `${sourcePool.token0.symbol}/${sourcePool.token1.symbol}`,
+          destinationPair: `${destinationPool.token0.symbol}/${destinationPool.token1.symbol}`,
+          totalImpactBps: result.totalImpactBps,
+          simulatedGasUsed: result.simulatedGasUsed,
+          simulatedCallCount: result.simulatedCallCount,
+          pendingApprovalCount: result.pendingApprovalCount,
+          maxCostBps: costCapBps,
+          target: result.finalTarget
+        };
+      }
+      this.ledger.append('rebalance.manual_immediate_requested', {
+        poolId, positionId, destinationPoolId,
+        sourcePair: `${sourcePool.token0.symbol}/${sourcePool.token1.symbol}`,
+        destinationPair: `${destinationPool.token0.symbol}/${destinationPool.token1.symbol}`
+      });
+      return await this.maybeRebalance(sourcePool, position, {
+        source: 'dashboard', manualImmediate: true, destinationPool,
+        manualMaxCostBps: costCapBps, throwOnFailure: true
+      });
+    } finally {
+      this.cycleActive = false;
+    }
+  }
+
   async refreshMarket(force = false) {
     if (!force && Date.now() - this.market.refreshedAt < this.config.marketRefreshMs) return this.market;
     log('info', 'market.refresh_started', { force });
@@ -1497,9 +1615,10 @@ export class AutoLpBot {
   async maybeRebalance(pool, position, options = {}) {
     const source = options.source || 'automatic';
     const throwOnFailure = Boolean(options.throwOnFailure);
+    const manualImmediate = options.manualImmediate === true && source === 'dashboard';
     // ABSOLUTE RULE: never auto-withdraw an LP that is currently in its original range.
     // Re-read the chain immediately before any executor path is allowed to proceed.
-    if (position.outside !== true || position.shouldRebalance !== true) {
+    if (!manualImmediate && (position.outside !== true || position.shouldRebalance !== true)) {
       this.ledger.append('rebalance.blocked', {
         positionId: position.id,
         poolId: pool.id,
@@ -1507,8 +1626,18 @@ export class AutoLpBot {
       });
       return { status: 'blocked', reason: 'position-not-oor-eligible' };
     }
-    if (!(await this.assertStillOutOfRangeBeforeRebalance(pool, position))) {
+    if (!manualImmediate && !(await this.assertStillOutOfRangeBeforeRebalance(pool, position))) {
       return { status: 'blocked', reason: 'latest-chain-state-not-eligible' };
+    }
+    if (manualImmediate) {
+      const settings = this.getInvestmentTargetSettings();
+      if (settings.mode !== 'specific-pool' || settings.poolId !== options.destinationPool?.id?.toLowerCase()
+        || options.destinationPool.id.toLowerCase() === pool.id.toLowerCase()) {
+        throw new Error('立即換倉目的池必須與已保存的指定池一致');
+      }
+      await this.executor.assertManualRotationSource({
+        pool, position, manualImmediate: true, manualSource: 'dashboard'
+      }, 'manual-immediate-entry');
     }
 
     const topologyCooldownUntil = Number(this.state.getSetting('walletTopologyCooldownUntil', 0) || 0);
@@ -1561,14 +1690,17 @@ export class AutoLpBot {
     let destinationPool;
     try {
       const investmentMode = this.getInvestmentTargetSettings().mode;
-      try { await this.refreshAprForRebalance(); }
-      catch (error) {
-        log('warn', 'fables.stats_unavailable_for_rebalance', { error: error.message });
-        if (investmentMode === 'apr-highest') throw error;
+      if (!manualImmediate) {
+        try { await this.refreshAprForRebalance(); }
+        catch (error) {
+          log('warn', 'fables.stats_unavailable_for_rebalance', { error: error.message });
+          if (investmentMode === 'apr-highest') throw error;
+        }
       }
-      destinationPool = investmentMode === 'apr-highest' && this.config.enableLiveWrites && !this.config.dryRun
-        ? await this.resolveExecutableInvestmentTarget(pool, position)
-        : this.resolveInvestmentTarget(pool);
+      destinationPool = manualImmediate ? options.destinationPool
+        : investmentMode === 'apr-highest' && this.config.enableLiveWrites && !this.config.dryRun
+          ? await this.resolveExecutableInvestmentTarget(pool, position)
+          : this.resolveInvestmentTarget(pool);
       if (investmentMode === 'apr-highest' && destinationPool.id.toLowerCase() === pool.id.toLowerCase()) {
         this.ledger.append('rebalance.target_fallback', {
           sourcePoolId: pool.id, destinationPoolId: pool.id, positionId: position.id,
@@ -1597,6 +1729,9 @@ export class AutoLpBot {
         ? []
         : uniqueTargetTokens(this.market.pools, { excludeNative: true }),
       investmentTargetMode: this.getInvestmentTargetSettings().mode,
+      manualImmediate,
+      manualSource: manualImmediate ? source : null,
+      manualMaxCostBps: manualImmediate ? options.manualMaxCostBps : null,
       position,
       currentTick: pool.state.tick,
       target: position.target,
