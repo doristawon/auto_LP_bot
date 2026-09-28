@@ -8,7 +8,7 @@
 
 OOR 再投入可設定為最高有效 APR 或指定池。最高 APR 候選需有新鮮統計、未暫停，且 TVL 達 `APR_POOL_MIN_TVL_USD`。ERC20 跨池候選必須在提領前完成「guarded 撤池→路由換幣→比例換幣→Tight 存入」連續 RPC 模擬，並通過整次換幣成本、Gas、餘額與授權檢查；未通過時保留原池重建。原生 ETH 池目前不具備可驗證的存入與路由交易流程，自動跨池會跳過，池清單會標示此限制。手動按「更新池子換幣報價」後，清單顯示每池約 10 美元試算的方向、時間與成本；「約 3%」標記僅代表該筆樣本落在 2.5% 至 3.5%，不代表實際換倉成本固定。預演資金範圍只涵蓋來源與目的池交易對的錢包餘額及來源提領預估，不掃入無關代幣。現有 LP 在區間內時，可將同交易對的閒置餘額加倉。預設只使用現有代幣比例；若明確設定 `AUTO_TOPUP_SWAP_ENABLED=true`、單一 `AUTO_TOPUP_SWAP_POOL_ID` 與獨立的 `AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS`，才會在「授權→兌幣→存入」整串 RPC 模擬成功後兌幣加倉。兌幣前會再次確認價格衝擊、錢包餘額、原區間及完整模擬，並保留設定的零頭與 Gas。指定池可用關鍵字篩選 APR 排序下拉選單。預設區間檢查週期為 5 分鐘，深度 OOR 仍需連續 2 次確認；淺度 OOR 最長等待 30 分鐘。
 
-池子頁的「立刻換倉」只使用已儲存的指定池。人工控制明確啟用後，選擇來源 LP 並按下按鈕，系統會重新掃描錢包、核對 LP 份額與目的池，完成區間內撤池、換幣及 Tight 存入的整串鏈上模擬後直接執行，無需額外預演權杖或第二次確認。此筆換幣成本上限預設 5%，可在按鈕旁調低，不更動自動策略的上限。人工操作不受自動再平衡冷卻與每小時次數限制，但仍遵守完整模擬、成本、Gas 與交易復原檢查。此流程可能送出多筆交易；若撤池後的後續交易失敗，會暫停自動執行並要求人工復原。自動 OOR 再平衡仍使用原有 EIP-7702 鏈上區間防護，不會因這個按鈕而撤出區間內部位。
+池子頁選擇「指定池」與目的池後，按「立刻換倉到所選池」就會啟動，無須先儲存目標或取得預演權杖。有來源 LP 時先完整模擬，再撤出所選 LP、換幣並投入目的池 Tight 區間；沒有 LP 時，使用錢包的來源與目的池代幣直接換幣建倉。閒置錢包只會自動辨識一種已定價、價值至少 1 美元的非目的池代幣；若有多種，會停止以免換掉無關資產。此筆換幣成本上限預設 5%，可在按鈕旁調低，不更動自動策略的上限。人工操作不受自動再平衡冷卻與每小時次數限制，但仍遵守完整鏈上模擬、成本、Gas 與交易復原檢查。池子目標在換倉成功後保存；若重啟時因沒有 LP 而暫停自動監控，完成錢包餘額建倉後會恢復監控。此流程可能送出多筆交易；若資產移動後的後續交易失敗，會暫停自動執行並要求人工復原。自動 OOR 再平衡仍使用原有 EIP-7702 鏈上區間防護。
 
 同池 OOR 實盤現在也要求撤池前完成「guarded 撤池→必要換幣→tight 入池」連續 RPC 模擬及 Gas 預算檢查；任一步失敗就保留舊 LP。`npm run preflight:oor` 可唯讀檢查目前部位，參數 `-- --diagnostic-max-bps=350` 僅供診斷，不修改實盤上限。單一池的實盤上限可用 `OOR_REBALANCE_SWAP_POOL_ID` 與 `OOR_REBALANCE_MAX_SWAP_PRICE_IMPACT_BPS` 明確設定，其餘池沿用一般上限。Solady 固定無限額 Permit2 授權的代幣，僅在合約回傳特定固定授權錯誤時略過無法執行的 ERC20 重設，Router 仍使用定額、限時的 Permit2 授權。
 
@@ -502,7 +502,7 @@ npm run verify:guard
 - `POST /api/control/scan` — refreshes local state without sending trades
 - `POST /api/control/rebalance` — requires `DASHBOARD_MANUAL_CONTROL_ENABLED=true` and JSON `confirm: "REBALANCE"`
 - `POST /api/control/rotate/preview` — read-only complete simulation for the saved specified pool; returns a ten-minute one-use preview ID
-- `POST /api/control/rotate/execute` — the dashboard sends `direct: true` and `confirm: "ROTATE_TO:<destinationPoolId>:<maxCostBps>"` for a single-click manual rotation; the server re-scans and fully simulates before live writes. Legacy preview IDs remain accepted for API callers.
+- `POST /api/control/rotate/execute` — the dashboard sends its currently selected `destinationPoolId`, `direct: true` and `confirm: "ROTATE_TO:<destinationPoolId>:<maxCostBps>"` for a single-click manual rotation. The server re-scans and fully simulates before live writes; `poolId` and `positionId` may be empty only when the fresh wallet scan has no LP. Legacy preview IDs remain accepted for API callers.
 - `POST /api/points/baseline`
 - `POST /api/cashflow`
 

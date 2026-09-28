@@ -19,9 +19,13 @@ function harness() {
   const bot = Object.create(AutoLpBot.prototype);
   bot.config = { walletAddress: wallet, dashboardManualControlEnabled: true,
     dryRun: false, enableLiveWrites: true, targetMode: 'allowlist',
-    minRebalanceIntervalSec: 0, maxRebalancesPerHour: 10 };
-  bot.market = { pools: [source, destination], fablesStats: { pools: new Map() } };
-  bot.state = { getSetting() { return 0; }, recentRebalances() { return []; } };
+    minRebalanceIntervalSec: 0, maxRebalancesPerHour: 10,
+    usdgAddress: source.token0.address };
+  bot.market = { pools: [source, destination], fablesStats: { pools: new Map() },
+    prices: new Map([[source.token0.address.toLowerCase(), 1], [source.token1.address.toLowerCase(), 0.01]]) };
+  const settings = new Map();
+  bot.state = { getSetting(key, fallback = 0) { return settings.has(key) ? settings.get(key) : fallback; },
+    setSetting(key, value) { settings.set(key, value); }, recentRebalances() { return []; } };
   bot.ledger = { append() {} };
   bot.executionPaused = false;
   bot.cycleActive = false;
@@ -38,7 +42,8 @@ function harness() {
     async preflightCrossPoolSequence() { return {
       totalImpactBps: 120, simulatedGasUsed: '500000', simulatedCallCount: 3,
       pendingApprovalCount: 0, finalTarget: { tickLower: -100, tickUpper: 100 }
-    }; }
+    }; },
+    async executeCrossPool(plan) { assert.equal(plan.manualIdle, true); return { status: 'completed' }; }
   };
   bot.maybeRebalance = async (_pool, _position, options) => {
     assert.equal(options.manualImmediate, true);
@@ -108,7 +113,7 @@ test('explicit manual preview ignores automatic rebalance cooldown and quota', a
   assert.equal(h.executions, 0);
 });
 
-test('direct manual rotation executes after a fresh full sequence check without a preview token', async () => {
+test('direct manual rotation dispatches without a preview token', async () => {
   const h = harness();
   const result = await h.bot.manualImmediateRotation({
     poolId: sourceId, positionId, destinationPoolId: destinationId,
@@ -116,4 +121,70 @@ test('direct manual rotation executes after a fresh full sequence check without 
   });
   assert.equal(result.status, 'completed');
   assert.equal(h.executions, 1);
+});
+
+test('direct rotation accepts a newly selected pool without a separate save', async () => {
+  const h = harness();
+  h.bot.getInvestmentTargetSettings = () => ({ mode: 'apr-highest', poolId: '' });
+  const result = await h.bot.manualImmediateRotation({
+    poolId: sourceId, positionId, destinationPoolId: destinationId, directExecute: true
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(h.bot.state.getSetting('investmentTargetPoolId'), destinationId);
+  assert.equal(h.executions, 1);
+});
+
+test('direct rotation can deposit idle wallet balances when no LP exists', async () => {
+  const h = harness();
+  h.bot.runOnce = async () => ({ blockNumber: 100, portfolio: {
+    positions: [], inventory: { [h.bot.market.pools[0].token1.address]: 100 }
+  } });
+  const result = await h.bot.manualImmediateRotation({
+    destinationPoolId: destinationId, directExecute: true
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(h.bot.state.getSetting('investmentTargetPoolId'), destinationId);
+  assert.equal(h.executions, 0);
+});
+
+test('idle rotation restores monitoring after a successful startup-paused deposit', async () => {
+  const h = harness();
+  h.bot.executionPaused = true;
+  h.bot.resumeExecutionAfterStartup = true;
+  h.bot.runOnce = async () => ({ blockNumber: 100, portfolio: {
+    positions: [], inventory: { [h.bot.market.pools[0].token1.address]: 100 }
+  } });
+  const result = await h.bot.manualImmediateRotation({
+    destinationPoolId: destinationId, directExecute: true
+  });
+  assert.equal(result.status, 'completed');
+  assert.equal(h.bot.executionPaused, false);
+  assert.equal(h.bot.resumeExecutionAfterStartup, false);
+});
+
+test('idle rotation refuses to choose among multiple unrelated wallet tokens', async () => {
+  const h = harness();
+  const second = token(13, 'OTHER');
+  h.bot.market.prices.set(second.address.toLowerCase(), 1);
+  h.bot.runOnce = async () => ({ blockNumber: 100, portfolio: {
+    positions: [], inventory: {
+      [h.bot.market.pools[0].token1.address]: 100,
+      [second.address]: 2
+    }
+  } });
+  await assert.rejects(() => h.bot.manualImmediateRotation({
+    destinationPoolId: destinationId, directExecute: true
+  }), /多種待換代幣/);
+  assert.equal(h.executions, 0);
+});
+
+test('withdrawn source LP cannot silently become an idle-wallet swap', async () => {
+  const h = harness();
+  h.bot.runOnce = async () => ({ blockNumber: 100, portfolio: {
+    positions: [], inventory: { [h.bot.market.pools[0].token1.address]: 100 }
+  } });
+  await assert.rejects(() => h.bot.manualImmediateRotation({
+    poolId: sourceId, positionId, destinationPoolId: destinationId, directExecute: true
+  }), /來源 LP 已撤出或變動/);
+  assert.equal(h.executions, 0);
 });

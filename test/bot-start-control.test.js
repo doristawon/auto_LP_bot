@@ -96,3 +96,11 @@ test('explicit dashboard pause cancels pending startup restore', () => {
   bot.setExecutionPaused(true, 'dashboard');
   assert.equal(bot.resumeExecutionAfterStartup, false);
 });
+
+test('explicit dashboard start cancels pending startup restore', () => {
+  const { bot } = makeBot();
+  bot.resumeExecutionAfterStartup = true;
+  bot.setExecutionPaused(false, 'dashboard');
+  assert.equal(bot.resumeExecutionAfterStartup, false);
+  assert.equal(bot.executionPaused, false);
+});

@@ -1684,7 +1684,8 @@ export class RebalanceExecutor {
 
   async preflightCrossPoolSequence(plan, destinationPool) {
     const sourcePool = plan.pool;
-    const sourceState = plan.manualImmediate === true
+    const idleWallet = plan.manualIdle === true;
+    const sourceState = idleWallet ? null : plan.manualImmediate === true
       ? await this.assertManualRotationSource(plan, 'cross-pool-sequence-preflight')
       : await this.assertPlanStillOutOfRange(plan, 'cross-pool-sequence-preflight');
     const destinationState = await this.fables.readPoolState(destinationPool);
@@ -1702,29 +1703,29 @@ export class RebalanceExecutor {
       value: 0n, gasLimit: 100_000
     });
     const deadline = this.deadline();
-    const bounds = buildExactWithdrawBounds({
+    const bounds = idleWallet ? null : buildExactWithdrawBounds({
       sqrtPriceX96: sourceState.sqrtPriceX96,
       tickLower: plan.position.tickLower,
       tickUpper: plan.position.tickUpper,
       liquidity: BigInt(plan.position.shares),
       slippageBps: this.config.withdrawSlippageBps
     });
-    const withdrawCall = buildCrossPoolWithdrawCall({
+    const withdrawCall = idleWallet ? null : buildCrossPoolWithdrawCall({
       pool: sourcePool, position: plan.position, bounds, deadline,
       walletAddress: this.config.walletAddress, fablesWalk: this.config.fablesWalk,
       manualImmediate: plan.manualImmediate === true
     });
     const simulationArgs = { walletAddress: this.config.walletAddress, chainId: this.config.chainId };
-    const withdrawnSimulation = await simulateSequentialCalls(this.writeProvider, {
+    const withdrawnSimulation = idleWallet ? null : await simulateSequentialCalls(this.writeProvider, {
       ...simulationArgs, calls: [withdrawCall, ...trackedTokens.map(balanceCall)]
     });
-    const postWithdraw = new Map(trackedTokens.map((token, index) => [
+    const postWithdraw = idleWallet ? before : new Map(trackedTokens.map((token, index) => [
       token.address.toLowerCase(),
       BigInt(erc20Interface.decodeFunctionResult('balanceOf', withdrawnSimulation[index + 1].returnData)[0])
     ]));
     const sourceAddresses = [sourcePool.token0.address.toLowerCase(), sourcePool.token1.address.toLowerCase()];
     const withdrawn = sourceAddresses.map((address) => (postWithdraw.get(address) || 0n) - (before.get(address) || 0n));
-    if (withdrawn.some((value) => value < 0n) || withdrawn.every((value) => value === 0n)) {
+    if (!idleWallet && (withdrawn.some((value) => value < 0n) || withdrawn.every((value) => value === 0n))) {
       throw new Error('Cross-pool preflight did not return non-negative LP inventory');
     }
     const dustRawByAddress = Object.fromEntries(trackedTokens.map((token) => {
@@ -1844,7 +1845,7 @@ export class RebalanceExecutor {
       value: tx.value || 0n, gasLimit: Number(TOP_UP_APPROVAL_GAS_RESERVE) });
     const swapSimulation = await simulateSequentialCalls(this.writeProvider, {
       ...simulationArgs,
-      calls: [...swapApprovals.map(toSimulationCall), withdrawCall, ...swapCalls,
+      calls: [...swapApprovals.map(toSimulationCall), ...(withdrawCall ? [withdrawCall] : []), ...swapCalls,
         balanceCall(destinationPool.token0), balanceCall(destinationPool.token1)]
     });
     const simulatedRaw0 = BigInt(erc20Interface.decodeFunctionResult('balanceOf', swapSimulation.at(-2).returnData)[0]);
@@ -1879,7 +1880,7 @@ export class RebalanceExecutor {
     const fullSimulation = await simulateSequentialCalls(this.writeProvider, {
       ...simulationArgs,
       calls: [...swapApprovals.map(toSimulationCall), ...depositApprovals.map(toSimulationCall),
-        withdrawCall, ...swapCalls,
+        ...(withdrawCall ? [withdrawCall] : []), ...swapCalls,
         { to: destinationPool.key.hooks, data: depositData, value: 0n,
           gasLimit: Number(TOP_UP_DEPOSIT_GAS_LIMIT) }]
     });
@@ -1889,7 +1890,7 @@ export class RebalanceExecutor {
     }
     return {
       status: 'full-sequence-simulated', sourcePoolId: sourcePool.id, destinationPoolId: destinationPool.id,
-      positionId: plan.position.id, withdrawCall, before, postWithdraw, funding,
+      positionId: idleWallet ? null : plan.position.id, withdrawCall, before, postWithdraw, funding,
       routeSwaps, balanceSwap, depositPlan, finalTarget, deadline,
       simulatedGasUsed: fullSimulation.reduce((total, receipt) =>
         total + BigInt(receipt.gasUsed || 0), 0n).toString(),
@@ -1999,27 +2000,41 @@ export class RebalanceExecutor {
           mintedLiquidity: preflight.mintedLiquidity
         }
       });
-      if (plan.manualImmediate === true) {
+      if (plan.manualIdle === true) {
+        // No LP exists to withdraw; the full sequence simulation above starts
+        // with wallet balances and proves route swaps plus Tight deposit.
+      } else if (plan.manualImmediate === true) {
         await this.assertManualRotationSource(plan, 'cross-pool-after-sequence-preflight');
       } else {
         await this.assertPlanStillOutOfRange(plan, 'cross-pool-after-sequence-preflight');
       }
-      const withdrawReceipt = await this.sendVerifiedTx({
-        label: plan.manualImmediate === true ? 'manualImmediateWithdrawAndClaim' : 'crossPoolGuardedWithdrawAndClaim',
-        to: preflight.withdrawCall.to,
-        data: preflight.withdrawCall.data,
-        value: 0n,
-        onSent: (hash) => {
-          phase = 'withdraw_sent';
-          journal = this.patchJournal(journal, { phase, tx: { ...journal.tx, withdraw: hash } });
+      if (plan.manualIdle === true) {
+        const fresh = await this.readRawTokenBalances(uniquePairTokens(plan.pool, destinationPool));
+        for (const [address, balance] of preflight.before) {
+          if (fresh.get(address) !== balance) {
+            throw new Error('Wallet balances changed after idle-wallet preflight; replan before swapping');
+          }
         }
-      });
-      phase = 'withdraw_confirmed';
-      journal = this.patchJournal(journal, {
-        phase, tx: { ...journal.tx, withdraw: withdrawReceipt.hash || journal.tx.withdraw }
-      });
-      const oldShares = await this.readPositionShares(plan.pool, plan.position.id);
-      if (oldShares !== 0n) throw new Error(`Old LP shares remain after cross-pool withdrawal: ${oldShares}`);
+        phase = 'withdraw_not_required';
+        journal = this.patchJournal(journal, { phase });
+      } else {
+        const withdrawReceipt = await this.sendVerifiedTx({
+          label: plan.manualImmediate === true ? 'manualImmediateWithdrawAndClaim' : 'crossPoolGuardedWithdrawAndClaim',
+          to: preflight.withdrawCall.to,
+          data: preflight.withdrawCall.data,
+          value: 0n,
+          onSent: (hash) => {
+            phase = 'withdraw_sent';
+            journal = this.patchJournal(journal, { phase, tx: { ...journal.tx, withdraw: hash } });
+          }
+        });
+        phase = 'withdraw_confirmed';
+        journal = this.patchJournal(journal, {
+          phase, tx: { ...journal.tx, withdraw: withdrawReceipt.hash || journal.tx.withdraw }
+        });
+        const oldShares = await this.readPositionShares(plan.pool, plan.position.id);
+        if (oldShares !== 0n) throw new Error(`Old LP shares remain after cross-pool withdrawal: ${oldShares}`);
+      }
       const routeHashes = [];
       for (const swap of preflight.routeSwaps) {
         const beforeInput = await this.readRawTokenBalance(swap.tokenIn);
@@ -2075,11 +2090,11 @@ export class RebalanceExecutor {
       if (inventory.raw0 < 0n || inventory.raw1 < 0n) {
         throw new Error('Cross-pool destination inventory fell below retained dust');
       }
-      const destinationState = await this.fables.readPoolState(destinationPool);
+      let destinationState = await this.fables.readPoolState(destinationPool);
       if (destinationState.paused !== false) throw new Error('Destination pool paused before deposit');
-      const target = buildTargetRange(destinationState.tick, destinationPool.key.tickSpacing,
+      let target = buildTargetRange(destinationState.tick, destinationPool.key.tickSpacing,
         this.config.tightWidthBps, this.config.rangePreset);
-      const depositPlan = buildExactDepositPlan({
+      let depositPlan = buildExactDepositPlan({
         rawAmount0: inventory.raw0, rawAmount1: inventory.raw1,
         sqrtPriceX96: destinationState.sqrtPriceX96,
         tickLower: target.tickLower, tickUpper: target.tickUpper,
@@ -2091,8 +2106,26 @@ export class RebalanceExecutor {
         depositPlan.amount0Max);
       await this.ensureHookAllowance(destinationPool.token1, destinationPool.key.hooks,
         depositPlan.amount1Max);
+      destinationState = await this.fables.readPoolState(destinationPool);
+      if (destinationState.paused !== false) throw new Error('Destination pool paused after deposit approvals');
+      target = buildTargetRange(destinationState.tick, destinationPool.key.tickSpacing,
+        this.config.tightWidthBps, this.config.rangePreset);
+      depositPlan = buildExactDepositPlan({
+        rawAmount0: inventory.raw0, rawAmount1: inventory.raw1,
+        sqrtPriceX96: destinationState.sqrtPriceX96,
+        tickLower: target.tickLower, tickUpper: target.tickUpper,
+        slippageBps: this.config.depositSlippageBps,
+        liquidityReserveBps: this.config.depositLiquidityReserveBps
+      });
+      this.assertValidDeposit(depositPlan, 'Refreshed cross-pool deposit plan is invalid');
+      await this.ensureHookAllowance(destinationPool.token0, destinationPool.key.hooks,
+        depositPlan.amount0Max);
+      await this.ensureHookAllowance(destinationPool.token1, destinationPool.key.hooks,
+        depositPlan.amount1Max);
       const depositData = this.fables.encodeDeposit(destinationPool, target,
         depositPlan.liquidity, depositPlan.amount0Max, depositPlan.amount1Max, this.deadline());
+      await this.readProvider.call({ from: this.config.walletAddress,
+        to: destinationPool.key.hooks, data: depositData, value: 0n });
       journal = this.patchJournal(journal, { phase: 'deposit_preflighted', target,
         depositPlan: serializeDepositPlan(depositPlan) });
       const depositReceipt = await this.sendVerifiedTx({
@@ -2119,9 +2152,11 @@ export class RebalanceExecutor {
         newPosition: { id: depositEvent.rangeId, shares: shares.toString(), target } });
       this.clearJournal();
       this.ledger.append('rebalance.cross_pool_completed', {
+        manualIdle: plan.manualIdle === true,
         sourcePoolId: plan.pool.id, destinationPoolId: destinationPool.id,
         sourcePair: journal.sourcePair, destinationPair: journal.destinationPair,
-        oldPositionId: plan.position.id, newPositionId: depositEvent.rangeId,
+        oldPositionId: plan.manualIdle === true ? null : plan.position.id,
+        newPositionId: depositEvent.rangeId,
         withdrawHash: journal.tx.withdraw, routeSwapHashes: routeHashes,
         balanceSwapHash: journal.tx.swap || null, depositHash: journal.tx.deposit,
         target, aprPct: plan.destinationStats?.aprPct ?? null

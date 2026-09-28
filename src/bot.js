@@ -125,7 +125,9 @@ export class AutoLpBot {
     this.rpcHealth = [];
     this.resumeExecutionAfterStartup = this.state.getSetting('executionPaused', true) === false;
     this.executionPaused = true;
-    this.state.setSetting('executionPaused', true);
+    // Keep the persisted operator intent until the first healthy wallet scan.
+    // If this process dies during startup, the next one must still retry the
+    // previously running monitor instead of treating boot as an explicit pause.
     this.nextMonitorAt = null;
     this.snapshot = this.ledger.readSnapshot();
     this.running = false;
@@ -168,6 +170,7 @@ export class AutoLpBot {
   setExecutionPaused(value, source = 'system') {
     const next = Boolean(value);
     if (next && source === 'dashboard') this.resumeExecutionAfterStartup = false;
+    if (!next && source !== 'startup-restore') this.resumeExecutionAfterStartup = false;
     if (!next) {
       const activeExecution = this.state.getSetting('activeRebalanceExecution', null);
       const terminal = new Set(['completed', 'failed']);
@@ -296,6 +299,11 @@ export class AutoLpBot {
       rebalanceNeedsAttention,
       topologyCooldownUntil,
       liveReady,
+      manualIdleReady: !activeLp && this.config.dashboardManualControlEnabled
+        && this.resumeExecutionAfterStartup
+        && startBlockers.every((blocker) => [
+          'active-lp-required', 'target-required', 'target-unavailable'
+        ].includes(blocker)),
       startReadiness: { ready: startBlockers.length === 0, blockers: startBlockers },
       limits: {
         maxGasGwei: this.config.maxGasGwei,
@@ -672,14 +680,18 @@ export class AutoLpBot {
       }
       if (hasNativeCurrency(pool)) throw new Error('原生 ETH 池尚未支援自動跨池實盤');
     }
-    this.state.setSetting('investmentTargetMode', normalizedMode);
-    if (pool) this.state.setSetting('investmentTargetPoolId', normalizedPoolId);
+    return this.persistInvestmentTarget(normalizedMode, pool);
+  }
+
+  persistInvestmentTarget(mode, pool) {
+    this.state.setSetting('investmentTargetMode', mode);
+    if (pool) this.state.setSetting('investmentTargetPoolId', pool.id.toLowerCase());
     this.applyStoredExecutionTarget();
     const target = this.getInvestmentTargetSnapshot();
     this.ledger.append('investment.target_updated', {
-      mode: normalizedMode,
-      poolId: normalizedMode === 'specific-pool' ? normalizedPoolId : null,
-      pair: pool ? pool.token0.symbol + '/' + pool.token1.symbol : null
+      mode,
+      poolId: mode === 'specific-pool' ? pool?.id.toLowerCase() : null,
+      pair: pool ? `${pool.token0.symbol}/${pool.token1.symbol}` : null
     });
     return target;
   }
@@ -826,7 +838,9 @@ export class AutoLpBot {
     poolId = String(poolId || '').toLowerCase();
     positionId = String(positionId || '').toLowerCase();
     destinationPoolId = String(destinationPoolId || '').toLowerCase();
-    if (![poolId, positionId, destinationPoolId].every((value) => /^0x[0-9a-f]{64}$/.test(value))) {
+    if (!/^0x[0-9a-f]{64}$/.test(destinationPoolId)
+      || (poolId && !/^0x[0-9a-f]{64}$/.test(poolId))
+      || (positionId && !/^0x[0-9a-f]{64}$/.test(positionId))) {
       throw new Error('立即換倉需要有效的來源部位與目的池');
     }
     const costCapBps = Number(maxCostBps ?? this.config.crossPoolMaxSwapPriceImpactBps ?? 350);
@@ -856,38 +870,53 @@ export class AutoLpBot {
         throw new Error('立即換倉預演已過期，請重新預演');
       }
       const settings = this.getInvestmentTargetSettings();
-      if (settings.mode !== 'specific-pool' || settings.poolId !== destinationPoolId) {
+      if (!directExecute && (settings.mode !== 'specific-pool' || settings.poolId !== destinationPoolId)) {
         throw new Error('請先儲存指定池，立即換倉只使用已保存的目的池');
       }
-      if (poolId === destinationPoolId) throw new Error('目前 LP 已在指定池，無需跨池換倉');
       const active = (snapshot?.portfolio?.positions || []).filter((item) => BigInt(item.shares || 0) > 0n);
-      if (!active.some((item) => String(item.poolId).toLowerCase() === poolId
-        && String(item.id).toLowerCase() === positionId)) {
-        throw new Error('來源 LP 已變動，請重新掃描後選擇部位');
-      }
-      const sourcePool = this.market.pools.find((item) => item.id.toLowerCase() === poolId);
-      const position = sourcePool?.positions?.find((item) => item.id.toLowerCase() === positionId);
       const destinationPool = this.market.pools.find((item) => item.id.toLowerCase() === destinationPoolId);
-      if (!sourcePool || !position || !destinationPool) throw new Error('來源 LP 或目的池已不在最新清單');
+      if (!destinationPool) throw new Error('目的池已不在最新清單');
+      const idleWallet = active.length === 0;
+      if (idleWallet && !directExecute) throw new Error('沒有 LP 時請使用直接換倉操作');
+      if (idleWallet && (poolId || positionId)) {
+        throw new Error('來源 LP 已撤出或變動，請重新載入錢包餘額後再執行');
+      }
+      let sourcePool;
+      let position;
+      if (idleWallet) {
+        sourcePool = this.resolveIdleRotationSource(snapshot, destinationPool);
+        position = { id: '0x' + '0'.repeat(64), shares: 0n, tickLower: 0, tickUpper: 0 };
+      } else {
+        if (poolId === destinationPoolId) throw new Error('目前 LP 已在指定池，無需跨池換倉');
+        if (!active.some((item) => String(item.poolId).toLowerCase() === poolId
+          && String(item.id).toLowerCase() === positionId)) {
+          throw new Error('來源 LP 已變動，請重新掃描後選擇部位');
+        }
+        sourcePool = this.market.pools.find((item) => item.id.toLowerCase() === poolId);
+        position = sourcePool?.positions?.find((item) => item.id.toLowerCase() === positionId);
+        if (!sourcePool || !position) throw new Error('來源 LP 已不在最新清單');
+      }
       if (destinationPool.state?.paused !== false || BigInt(destinationPool.state?.liquidity || 0) <= 0n) {
         throw new Error('目的池已暫停或沒有可用流動性');
       }
       if (hasNativeCurrency(sourcePool) || hasNativeCurrency(destinationPool)) {
         throw new Error('原生 ETH 池尚未支援立即跨池換倉');
       }
-      if (this.executionPaused || this.config.dryRun || !this.config.enableLiveWrites) {
+      if ((this.executionPaused && !(idleWallet && directExecute && this.resumeExecutionAfterStartup))
+        || this.config.dryRun || !this.config.enableLiveWrites) {
         throw new Error('立即換倉需要未暫停的實盤執行狀態');
       }
-      // Explicit manual rotation uses fresh position and full-sequence preflight.
-      // Automatic retry timers and rebalance quotas do not apply to this action.
-      if (this.config.targetMode === 'wallet-active'
+      // Explicit manual rotation uses a fresh wallet scan and full-sequence
+      // preflight. Automatic retry timers and quotas do not apply.
+      if (!idleWallet && this.config.targetMode === 'wallet-active'
         && !(await this.revalidateTopologyBeforeExecution(snapshot.blockNumber, [{ pool: sourcePool, position }]))) {
         throw new Error('錢包 LP 部位在預演期間變動');
       }
       const plan = {
         pool: sourcePool, destinationPool, position, routingPools: this.market.pools,
         destinationStats: this.market.fablesStats?.pools?.get(destinationPoolId) || null,
-        manualImmediate: true, manualSource: 'dashboard', manualMaxCostBps: costCapBps
+        manualImmediate: true, manualIdle: idleWallet,
+        manualSource: 'dashboard', manualMaxCostBps: costCapBps
       };
       if (previewOnly) {
         await this.executor.assertLiveReady(plan);
@@ -914,20 +943,63 @@ export class AutoLpBot {
       if (directExecute) {
         await this.executor.assertLiveReady(plan);
         this.executor.assertNoUnfinishedExecution();
-        await this.executor.preflightCrossPoolSequence(plan, destinationPool);
       }
       this.ledger.append('rebalance.manual_immediate_requested', {
-        poolId, positionId, destinationPoolId,
+        poolId: idleWallet ? null : poolId, positionId: idleWallet ? null : positionId, destinationPoolId,
         sourcePair: `${sourcePool.token0.symbol}/${sourcePool.token1.symbol}`,
         destinationPair: `${destinationPool.token0.symbol}/${destinationPool.token1.symbol}`
       });
-      return await this.maybeRebalance(sourcePool, position, {
+      if (idleWallet) {
+        try {
+          const result = await this.executor.executeCrossPool(plan, destinationPool);
+          if (result.status === 'completed') {
+            this.persistInvestmentTarget('specific-pool', destinationPool);
+            this.state.setSetting('lastAction', `completed wallet → ${destinationPool.token0.symbol}/${destinationPool.token1.symbol}`);
+            if (this.executionPaused && this.resumeExecutionAfterStartup) {
+              this.setExecutionPaused(false, 'manual_idle_rotation');
+              this.resumeExecutionAfterStartup = false;
+            }
+          }
+          return result;
+        } catch (error) {
+          if (this.state.getSetting('activeRebalanceExecution', null)?.phase === 'recovery_required') {
+            this.setExecutionPaused(true, 'idle_rotation_recovery_required');
+          }
+          throw error;
+        }
+      }
+      const result = await this.maybeRebalance(sourcePool, position, {
         source: 'dashboard', manualImmediate: true, destinationPool,
         manualMaxCostBps: costCapBps, throwOnFailure: true
       });
+      if (result.status === 'completed') this.persistInvestmentTarget('specific-pool', destinationPool);
+      return result;
     } finally {
       this.cycleActive = false;
     }
+  }
+
+  resolveIdleRotationSource(snapshot, destinationPool) {
+    const destinationTokens = new Set([
+      destinationPool.token0.address.toLowerCase(), destinationPool.token1.address.toLowerCase()
+    ]);
+    const inventory = snapshot?.portfolio?.inventory || {};
+    const prices = this.market.prices;
+    const others = Object.entries(inventory).filter(([address, amount]) => {
+      const key = address.toLowerCase();
+      return key !== ZERO_ADDRESS && !destinationTokens.has(key)
+        && Number(amount) * Number(prices.get(key) || 0) >= 1;
+    });
+    if (others.length > 1) throw new Error('錢包有多種待換代幣；請先整理餘額，避免誤換無關資產');
+    if (!others.length) return destinationPool;
+    const tokenAddress = others[0][0].toLowerCase();
+    const sourcePool = this.market.pools.find((pool) =>
+      !hasNativeCurrency(pool)
+      && [pool.token0.address.toLowerCase(), pool.token1.address.toLowerCase()].includes(tokenAddress)
+      && [pool.token0.address.toLowerCase(), pool.token1.address.toLowerCase()]
+        .includes(this.config.usdgAddress.toLowerCase()));
+    if (!sourcePool) throw new Error('找不到錢包待換代幣與 USDG 的有效來源池');
+    return sourcePool;
   }
 
   async refreshMarket(force = false) {
@@ -1625,10 +1697,8 @@ export class AutoLpBot {
       return { status: 'blocked', reason: 'latest-chain-state-not-eligible' };
     }
     if (manualImmediate) {
-      const settings = this.getInvestmentTargetSettings();
-      if (settings.mode !== 'specific-pool' || settings.poolId !== options.destinationPool?.id?.toLowerCase()
-        || options.destinationPool.id.toLowerCase() === pool.id.toLowerCase()) {
-        throw new Error('立即換倉目的池必須與已保存的指定池一致');
+      if (!options.destinationPool || options.destinationPool.id.toLowerCase() === pool.id.toLowerCase()) {
+        throw new Error('立即換倉需要與來源不同的目的池');
       }
       await this.executor.assertManualRotationSource({
         pool, position, manualImmediate: true, manualSource: 'dashboard'
@@ -1723,7 +1793,7 @@ export class AutoLpBot {
       routingTokens: String(destinationPool.id).toLowerCase() === String(pool.id).toLowerCase()
         ? []
         : uniqueTargetTokens(this.market.pools, { excludeNative: true }),
-      investmentTargetMode: this.getInvestmentTargetSettings().mode,
+      investmentTargetMode: manualImmediate ? 'specific-pool' : this.getInvestmentTargetSettings().mode,
       manualImmediate,
       manualSource: manualImmediate ? source : null,
       manualMaxCostBps: manualImmediate ? options.manualMaxCostBps : null,

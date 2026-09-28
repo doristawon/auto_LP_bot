@@ -176,6 +176,8 @@ test('dashboard provides a keyword-filtered specified-pool selector', () => {
   assert.match(html, /id="investmentPoolSearch" type="search"/);
   assert.match(html, /id="investmentPool"><\/select>/);
   assert.match(html, /investmentPoolSearch'\)\.addEventListener\('input'/);
+  assert.match(html, /destinationPoolId=\$\('investmentPool'\)\.value\.toLowerCase\(\)/);
+  assert.match(html, /錢包餘額（目前沒有 LP）/);
 });
 
 test('dashboard manual rebalance is fail-closed until explicitly armed', async () => {
