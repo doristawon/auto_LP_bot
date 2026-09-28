@@ -14,6 +14,7 @@ import { buildExactDepositPlan } from '../math/v4-fixed.js';
 import { buildTargetRange, isLpOutOfRange } from '../math/ticks.js';
 import { simulateSequentialCalls } from '../execution/sequential-simulation.js';
 import { buildExactBalancedSwapPlan } from '../execution/exact-rebalance.js';
+import { buildPairFundingScope } from '../execution/pair-funding.js';
 
 loadDotEnv();
 const config = loadConfig();
@@ -89,17 +90,20 @@ const withdrawn = {
 if (withdrawn.raw0 < 0n || withdrawn.raw1 < 0n || withdrawn.raw0 + withdrawn.raw1 === 0n) {
   throw new Error('Simulated guarded withdrawal did not return non-negative pair inventory');
 }
+const fundingScope = buildPairFundingScope(pool, after, config.usdgAddress, config.autoTopupDustBps);
 const target = buildTargetRange(state.tick, pool.key.tickSpacing, config.tightWidthBps, config.rangePreset);
 const swapPlan = await buildExactBalancedSwapPlan({
   pool, quoter: executor.quoter,
-  rawAmount0: withdrawn.raw0,
-  rawAmount1: withdrawn.raw1,
+  rawAmount0: fundingScope.funding.raw0,
+  rawAmount1: fundingScope.funding.raw1,
   sqrtPriceX96: state.sqrtPriceX96,
   tickLower: target.tickLower,
   tickUpper: target.tickUpper,
   slippageBps: config.swapSlippageBps,
   // An optional diagnostic ceiling never changes the live executor's cap.
-  maxPriceImpactBps: appliedMaxBps
+  maxPriceImpactBps: appliedMaxBps,
+  preferRemainderTokenIndex: fundingScope.stableIndex,
+  preferredRemainderBps: fundingScope.stableIndex === null ? 0 : Math.min(config.autoTopupDustBps, 50)
 });
 if (swapPlan.direction === 'none') {
   throw new Error(`Simulated OOR inventory has no executable swap: ${swapPlan.blockedReason || 'already balanced'}`);
@@ -149,16 +153,16 @@ if (!simulatedPrice || simulatedPrice.sqrtPriceX96 <= 0n) {
   throw new Error('Simulated swap did not emit a valid pool price');
 }
 const projected = swapPlan.tokenIn === 0
-  ? { raw0: withdrawn.raw0 - swapPlan.rawAmountIn,
-      raw1: withdrawn.raw1 + BigInt(swapPlan.quote.minRawAmountOut) }
-  : { raw0: withdrawn.raw0 + BigInt(swapPlan.quote.minRawAmountOut),
-      raw1: withdrawn.raw1 - swapPlan.rawAmountIn };
+  ? { raw0: fundingScope.funding.raw0 - swapPlan.rawAmountIn,
+      raw1: fundingScope.funding.raw1 + BigInt(swapPlan.quote.minRawAmountOut) }
+  : { raw0: fundingScope.funding.raw0 + BigInt(swapPlan.quote.minRawAmountOut),
+      raw1: fundingScope.funding.raw1 - swapPlan.rawAmountIn };
 const simulatedPostSwap = {
   raw0: BigInt(erc20.decodeFunctionResult('balanceOf', simulatedSwap.at(-2).returnData)[0]),
   raw1: BigInt(erc20.decodeFunctionResult('balanceOf', simulatedSwap.at(-1).returnData)[0])
 };
-if (simulatedPostSwap.raw0 - balances.raw0 < projected.raw0
-  || simulatedPostSwap.raw1 - balances.raw1 < projected.raw1) {
+if (simulatedPostSwap.raw0 - fundingScope.dustRaw.raw0 < projected.raw0
+  || simulatedPostSwap.raw1 - fundingScope.dustRaw.raw1 < projected.raw1) {
   throw new Error('Simulated post-swap wallet balances are below conservative minOut inventory');
 }
 const depositTarget = buildTargetRange(

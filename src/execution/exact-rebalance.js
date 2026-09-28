@@ -16,7 +16,9 @@ export async function buildExactBalancedSwapPlan({
   tickUpper,
   slippageBps = 50,
   iterations = 22,
-  maxPriceImpactBps = 200
+  maxPriceImpactBps = 200,
+  preferRemainderTokenIndex = null,
+  preferredRemainderBps = 0
 }) {
   rawAmount0 = BigInt(rawAmount0);
   rawAmount1 = BigInt(rawAmount1);
@@ -27,6 +29,12 @@ export async function buildExactBalancedSwapPlan({
   }
   if (!Number.isInteger(tickLower) || !Number.isInteger(tickUpper) || tickLower >= tickUpper) {
     throw new Error('Target range ticks are invalid');
+  }
+  if (preferRemainderTokenIndex !== null && ![0, 1].includes(preferRemainderTokenIndex)) {
+    throw new Error('Preferred remainder token index must be 0, 1, or null');
+  }
+  if (!Number.isInteger(preferredRemainderBps) || preferredRemainderBps < 0 || preferredRemainderBps > 1000) {
+    throw new Error('Preferred remainder bps must be an integer from 0 through 1000');
   }
   const sqrtA = getSqrtPriceAtTick(tickLower);
   const sqrtB = getSqrtPriceAtTick(tickUpper);
@@ -39,7 +47,12 @@ export async function buildExactBalancedSwapPlan({
     return { direction: 'none', tokenIn: null, tokenOut: null, rawAmountIn: 0n, quote: null };
   }
 
-  const tokenIn = initial.l0 > initial.l1 ? 0 : 1;
+  const targetDifference = (cap) => {
+    if (preferRemainderTokenIndex === 0) return cap.l0 * 10_000n - cap.l1 * BigInt(10_000 + preferredRemainderBps);
+    if (preferRemainderTokenIndex === 1) return cap.l0 * BigInt(10_000 + preferredRemainderBps) - cap.l1 * 10_000n;
+    return cap.l0 - cap.l1;
+  };
+  const tokenIn = targetDifference(initial) > 0n ? 0 : 1;
   const tokenOut = tokenIn === 0 ? 1 : 0;
   const available = tokenIn === 0 ? rawAmount0 : rawAmount1;
   if (available <= 1n) return { direction: 'none', tokenIn: null, tokenOut: null, rawAmountIn: 0n, quote: null };
@@ -66,14 +79,15 @@ export async function buildExactBalancedSwapPlan({
     const post0 = tokenIn === 0 ? rawAmount0 - mid : rawAmount0 + out;
     const post1 = tokenIn === 1 ? rawAmount1 - mid : rawAmount1 + out;
     const cap = capacities(post0, post1, sqrtX, sqrtA, sqrtB);
-    const score = abs(cap.l0 - cap.l1);
+    const difference = targetDifference(cap);
+    const score = abs(difference);
     if (!best || score < best.score) best = { score, mid, quote, post0, post1, cap, impactBps };
 
     if (tokenIn === 0) {
-      if (cap.l0 > cap.l1) lo = mid + 1n;
+      if (difference > 0n) lo = mid + 1n;
       else hi = mid - 1n;
     } else {
-      if (cap.l1 > cap.l0) lo = mid + 1n;
+      if (difference < 0n) lo = mid + 1n;
       else hi = mid - 1n;
     }
   }

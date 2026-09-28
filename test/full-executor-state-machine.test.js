@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { id, zeroPadValue } from 'ethers';
 import { RebalanceExecutor } from '../src/adapters/executor.js';
 import { DEPOSITED_EVENT } from '../src/abi.js';
-import { getSqrtPriceAtTick } from '../src/math/v4-fixed.js';
+import { buildExactDepositPlan, getSqrtPriceAtTick } from '../src/math/v4-fixed.js';
 
 const wallet = '0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF';
 const hook = '0x08E52564Bad99E05a694b4809F397edcA417A080';
@@ -40,6 +40,7 @@ function createHarness({ failSwap = false, failPreflight = false } = {}) {
   let balanceIndex = 0;
   let postSwapBalance = null;
   let lastSwapQuote = null;
+  let depositedLiquidity = null;
   const state = {
     getSetting(key, fallback) { return settings.has(key) ? settings.get(key) : fallback; },
     setSetting(key, value) { settings.set(key, value); }
@@ -54,7 +55,10 @@ function createHarness({ failSwap = false, failPreflight = false } = {}) {
         tickUpper: 1220
       };
     },
-    encodeDeposit() { return '0xdeadbeef'; }
+    encodeDeposit(_pool, _range, liquidity) {
+      depositedLiquidity = liquidity;
+      return '0xdeadbeef';
+    }
   };
   const executor = new RebalanceExecutor(
     null,
@@ -68,6 +72,8 @@ function createHarness({ failSwap = false, failPreflight = false } = {}) {
       swapSlippageBps: 50,
       depositSlippageBps: 50,
       depositLiquidityReserveBps: 10,
+      autoTopupDustBps: 25,
+      usdgAddress: pool.token1.address,
       tightWidthBps: 120,
       txDeadlineSec: 1200,
       fablesWalk: 1000,
@@ -157,11 +163,15 @@ function createHarness({ failSwap = false, failPreflight = false } = {}) {
     if (!receipt.logs?.length) return null;
     return { rangeId: '0x' + '22'.repeat(32), liquidity: 5_000_000_000_000_000n };
   };
-  return { executor, events, settings, sentCount: () => sent };
+  return {
+    executor, events, settings, sentCount: () => sent,
+    depositedLiquidity: () => depositedLiquidity,
+    postSwapBalance: () => postSwapBalance
+  };
 }
 
 test('full executor advances only after receipts and completes with new LP shares', async () => {
-  const { executor, events, settings } = createHarness();
+  const { executor, events, settings, sentCount, depositedLiquidity, postSwapBalance } = createHarness();
   const result = await executor.execute({ pool: structuredClone(pool), position: { ...position }, currentTick: 1100 });
   assert.equal(result.status, 'completed');
   assert.ok(result.withdrawHash);
@@ -169,6 +179,27 @@ test('full executor advances only after receipts and completes with new LP share
   assert.ok(result.depositHash);
   assert.equal(settings.get('activeRebalanceExecution'), null);
   assert.ok(events.some((x) => x.type === 'rebalance.completed'));
+  const completed = events.find((x) => x.type === 'rebalance.completed').data;
+  assert.deepEqual(completed.initialWalletFundingRaw, {
+    raw0: '10000000000000000000', raw1: '10000000000000000000'
+  });
+  assert.deepEqual(completed.dustRetainedRaw, { raw0: '0', raw1: '25000000000000000' });
+  assert.deepEqual(completed.combinedFundingRaw, {
+    raw0: '110000000000000000000', raw1: '9975000000000000000'
+  });
+  assert.equal(sentCount(), 3); // withdraw, swap, one LP deposit
+  const oldWithdrawalOnlyInventory = {
+    raw0: postSwapBalance().raw0 - 10_000_000_000_000_000_000n,
+    raw1: postSwapBalance().raw1 - 10_000_000_000_000_000_000n
+  };
+  const oldDeposit = buildExactDepositPlan({
+    rawAmount0: oldWithdrawalOnlyInventory.raw0,
+    rawAmount1: oldWithdrawalOnlyInventory.raw1,
+    sqrtPriceX96: getSqrtPriceAtTick(1100),
+    tickLower: 980, tickUpper: 1220,
+    slippageBps: 50, liquidityReserveBps: 10
+  });
+  assert.ok(depositedLiquidity() > oldDeposit.liquidity);
 });
 
 test('post-withdraw swap failure records recovery_required and leaves execution locked', async () => {

@@ -75,6 +75,8 @@ Dashboard 僅綁定 `127.0.0.1` 時不需要 `DASHBOARD_TOKEN`，符合本機部
 
 ## 區間內閒置餘額加倉
 
+同池再平衡的首次重新存入會把撤池所得與錢包原有的同池代幣合併預演與存入，減少緊接著的第二次加倉。USDG 交易對只在 USDG 側預留錢包零頭，換幣配比也稍微偏向留下 USDG；價格變動、滑價、整數取整與價格衝擊上限仍可能讓少量 meme 幣留在錢包。
+
 `AUTO_TOPUP_ENABLED=true` 會把目前唯一、仍在區間內的 LP 交易對閒置代幣投入原區間，保留 `AUTO_TOPUP_DUST_BPS` 零頭與 `AUTO_TOPUP_MIN_GAS_ETH` Gas。預設不換幣；若要處理比例不符的餘額，須另外設定 `AUTO_TOPUP_SWAP_ENABLED=true`、**單一** `AUTO_TOPUP_SWAP_POOL_ID` 及該池的 `AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS`。一般再平衡仍受獨立的 `MAX_SWAP_PRICE_IMPACT_BPS` 限制。
 
 同池 OOR 再平衡會在撤出舊 LP 前，透過 `eth_simulateV1` 預演 guarded 撤池、必要的授權與換幣、重新存入 tight 區間，並檢查 Gas 預算；任何預演失敗都保留舊 LP。`npm run preflight:oor` 可唯讀檢查目前唯一的 OOR 部位。`-- --diagnostic-max-bps=350` 只調整該次診斷的報價上限，**不會**改變實盤設定。若要為單一池設定獨立實盤上限，需同時指定 `OOR_REBALANCE_SWAP_POOL_ID` 與 `OOR_REBALANCE_MAX_SWAP_PRICE_IMPACT_BPS`；其他池仍使用 `MAX_SWAP_PRICE_IMPACT_BPS`。首次觀測到 OOR 後滿 `OOR_CONFIRM_DELAY_MIN` 分鐘，下一次成功讀取鏈上 Tick 時若仍在原 LP 區間外，才具備自動撤池資格；任何一次讀到回到區間內都會清除計時。複查受監控週期與 RPC 可用性影響，可能晚於 15 分鐘。

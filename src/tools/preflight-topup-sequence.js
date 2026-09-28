@@ -9,6 +9,7 @@ import { createProviders } from '../rpc/providers.js';
 import { FablesAdapter } from '../adapters/fables.js';
 import { RebalanceExecutor } from '../adapters/executor.js';
 import { buildExactBalancedSwapPlan } from '../execution/exact-rebalance.js';
+import { buildPairFundingScope } from '../execution/pair-funding.js';
 import { buildExactDepositPlan } from '../math/v4-fixed.js';
 
 loadDotEnv();
@@ -41,15 +42,9 @@ const executor = new RebalanceExecutor(
 );
 const validation = await executor.validateTopUpPosition(pool, position, 'read-only-preflight');
 const walletBalances = await executor.readRawPairBalances(pool);
-const dustBps = BigInt(config.autoTopupDustBps);
-const dust = {
-  raw0: walletBalances.raw0 * dustBps / 10_000n,
-  raw1: walletBalances.raw1 * dustBps / 10_000n
-};
-const funding = {
-  raw0: walletBalances.raw0 - dust.raw0,
-  raw1: walletBalances.raw1 - dust.raw1
-};
+const { funding, dustRaw: dust, stableIndex } = buildPairFundingScope(
+  pool, walletBalances, config.usdgAddress, config.autoTopupDustBps
+);
 const swapPlan = await buildExactBalancedSwapPlan({
   pool,
   quoter: executor.quoter,
@@ -59,7 +54,9 @@ const swapPlan = await buildExactBalancedSwapPlan({
   tickLower: Number(position.tickLower),
   tickUpper: Number(position.tickUpper),
   slippageBps: config.swapSlippageBps,
-  maxPriceImpactBps: config.autoTopupMaxSwapPriceImpactBps
+  maxPriceImpactBps: config.autoTopupMaxSwapPriceImpactBps,
+  preferRemainderTokenIndex: stableIndex,
+  preferredRemainderBps: stableIndex === null ? 0 : Math.min(config.autoTopupDustBps, 50)
 });
 if (swapPlan.direction === 'none') {
   console.log(JSON.stringify({ ok: false, reason: swapPlan.blockedReason || 'already balanced', pair: `${pool.token0.symbol}/${pool.token1.symbol}` }));

@@ -85,3 +85,28 @@ test('exact balancer refuses swap quotes above configured spot price-impact limi
   assert.equal(plan.direction, 'none');
   assert.equal(plan.blockedReason, 'no-quote-within-price-impact-limit');
 });
+
+test('USDG remainder preference leaves more capacity on the chosen stablecoin side', async () => {
+  const base = {
+    pool, quoter: symmetricQuoter(),
+    rawAmount0: 1_000_000_000_000_000_000_000n,
+    rawAmount1: 100_000_000_000_000_000_000n,
+    sqrtPriceX96: getSqrtPriceAtTick(0),
+    tickLower: -200, tickUpper: 200,
+    slippageBps: 50, iterations: 32
+  };
+  const neutral = await buildExactBalancedSwapPlan(base);
+  const preferToken1 = await buildExactBalancedSwapPlan({
+    ...base, preferRemainderTokenIndex: 1, preferredRemainderBps: 25
+  });
+  assert.equal(preferToken1.direction, '0_to_1');
+  assert.ok(preferToken1.rawAmountIn > neutral.rawAmountIn);
+
+  const reverse = { ...base, rawAmount0: base.rawAmount1, rawAmount1: base.rawAmount0 };
+  const neutralReverse = await buildExactBalancedSwapPlan(reverse);
+  const preferToken1Reverse = await buildExactBalancedSwapPlan({
+    ...reverse, preferRemainderTokenIndex: 1, preferredRemainderBps: 25
+  });
+  assert.equal(preferToken1Reverse.direction, '1_to_0');
+  assert.ok(preferToken1Reverse.rawAmountIn < neutralReverse.rawAmountIn);
+});

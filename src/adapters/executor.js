@@ -23,6 +23,7 @@ import {
 import { UniversalRouterAdapter } from './universal-router.js';
 import { V4QuoterAdapter } from './quoter.js';
 import { buildExactBalancedSwapPlan, quotePriceImpactBps } from '../execution/exact-rebalance.js';
+import { buildPairFundingScope } from '../execution/pair-funding.js';
 import { simulateSequentialCalls } from '../execution/sequential-simulation.js';
 import {
   MAX_UINT128,
@@ -113,10 +114,12 @@ export class RebalanceExecutor {
 
       // Prepare every approval path before principal is withdrawn. If a meme token
       // rejects approve/Permit2, fail while the LP is still intact.
-      await this.ensureSwapAllowances(plan.pool.token0, approvalBounds.expected0 + BigInt(plan.position.owed0 || 0n));
-      await this.ensureSwapAllowances(plan.pool.token1, approvalBounds.expected1 + BigInt(plan.position.owed1 || 0n));
-      await this.ensureHookAllowance(plan.pool.token0, plan.pool.key.hooks, approvalBounds.expected0 + BigInt(plan.position.owed0 || 0n));
-      await this.ensureHookAllowance(plan.pool.token1, plan.pool.key.hooks, approvalBounds.expected1 + BigInt(plan.position.owed1 || 0n));
+      const approval0 = approvalBounds.expected0 + BigInt(plan.position.owed0 || 0n) + preBalances.raw0;
+      const approval1 = approvalBounds.expected1 + BigInt(plan.position.owed1 || 0n) + preBalances.raw1;
+      await this.ensureSwapAllowances(plan.pool.token0, approval0);
+      await this.ensureSwapAllowances(plan.pool.token1, approval1);
+      await this.ensureHookAllowance(plan.pool.token0, plan.pool.key.hooks, approval0);
+      await this.ensureHookAllowance(plan.pool.token1, plan.pool.key.hooks, approval1);
       journal = this.patchJournal(journal, { phase: 'approvals_ready' });
 
       // Approvals can consume blocks; re-check OOR only after all non-capital-moving
@@ -215,9 +218,15 @@ export class RebalanceExecutor {
       if (withdrawn.raw0 === 0n && withdrawn.raw1 === 0n) {
         throw new Error('Withdraw confirmed but no token principal/fees reached the wallet');
       }
+      const fundingScope = buildPairFundingScope(
+        plan.pool, postWithdrawBalances, this.config.usdgAddress, this.config.autoTopupDustBps ?? 25
+      );
       journal = this.patchJournal(journal, {
         postWithdrawBalancesRaw: stringifyRawBalances(postWithdrawBalances),
-        withdrawnRaw: { raw0: withdrawn.raw0.toString(), raw1: withdrawn.raw1.toString() }
+        withdrawnRaw: stringifyRawBalances(withdrawn),
+        initialWalletFundingRaw: stringifyRawBalances(preBalances),
+        dustRetainedRaw: stringifyRawBalances(fundingScope.dustRaw),
+        combinedFundingRaw: stringifyRawBalances(fundingScope.funding)
       });
 
       const postWithdrawState = await this.fables.readPoolState(plan.pool);
@@ -230,13 +239,15 @@ export class RebalanceExecutor {
       const swapPlan = await buildExactBalancedSwapPlan({
         pool: plan.pool,
         quoter: this.quoter,
-        rawAmount0: withdrawn.raw0,
-        rawAmount1: withdrawn.raw1,
+        rawAmount0: fundingScope.funding.raw0,
+        rawAmount1: fundingScope.funding.raw1,
         sqrtPriceX96: postWithdrawState.sqrtPriceX96,
         tickLower: targetAfterWithdraw.tickLower,
         tickUpper: targetAfterWithdraw.tickUpper,
         slippageBps: this.config.swapSlippageBps,
-        maxPriceImpactBps: rebalanceMaxImpactBps
+        maxPriceImpactBps: rebalanceMaxImpactBps,
+        preferRemainderTokenIndex: fundingScope.stableIndex,
+        preferredRemainderBps: fundingScope.stableIndex === null ? 0 : Math.min(this.config.autoTopupDustBps ?? 25, 50)
       });
       journal = this.patchJournal(journal, {
         targetAfterWithdraw,
@@ -288,9 +299,9 @@ export class RebalanceExecutor {
         journal = this.patchJournal(journal, { phase });
       }
 
-      const strategyInventory = operationDelta(preBalances, postSwapBalances);
+      const strategyInventory = operationDelta(fundingScope.dustRaw, postSwapBalances);
       if (strategyInventory.raw0 < 0n || strategyInventory.raw1 < 0n) {
-        throw new Error('Post-swap strategy inventory crossed below the pre-rebalance wallet baseline');
+        throw new Error('Post-swap strategy inventory crossed below the retained wallet dust');
       }
       if (strategyInventory.raw0 === 0n && strategyInventory.raw1 === 0n) {
         throw new Error('No strategy inventory remains for redeposit');
@@ -415,6 +426,9 @@ export class RebalanceExecutor {
         withdrawHash: journal.tx.withdraw,
         swapHash: journal.tx.swap || null,
         depositHash: journal.tx.deposit,
+        initialWalletFundingRaw: journal.initialWalletFundingRaw,
+        combinedFundingRaw: journal.combinedFundingRaw,
+        dustRetainedRaw: journal.dustRetainedRaw,
         target: finalTarget
       });
       return {
@@ -482,14 +496,9 @@ export class RebalanceExecutor {
     let validation = await this.validateTopUpPosition(pool, position, 'top-up-entry');
     this.assertTokenPrices(pool);
     const initialBalances = await this.readRawPairBalances(pool);
-    const dustRaw = {
-      raw0: initialBalances.raw0 * BigInt(dustBps) / 10_000n,
-      raw1: initialBalances.raw1 * BigInt(dustBps) / 10_000n
-    };
-    const funding = {
-      raw0: initialBalances.raw0 - dustRaw.raw0,
-      raw1: initialBalances.raw1 - dustRaw.raw1
-    };
+    const { dustRaw, funding, stableIndex } = buildPairFundingScope(
+      pool, initialBalances, this.config.usdgAddress, dustBps
+    );
     if (funding.raw0 < 0n || funding.raw1 < 0n) throw new Error('Top-up dust exceeds wallet pair balances');
     if (funding.raw0 === 0n && funding.raw1 === 0n) {
       return { status: 'skipped', reason: 'no pair-token balance remains after dust reserve', poolId: pool.id, positionId: position.id };
@@ -508,7 +517,9 @@ export class RebalanceExecutor {
           tickLower: Number(position.tickLower),
           tickUpper: Number(position.tickUpper),
           slippageBps: this.config.swapSlippageBps,
-          maxPriceImpactBps: topUpMaxPriceImpactBps
+          maxPriceImpactBps: topUpMaxPriceImpactBps,
+          preferRemainderTokenIndex: stableIndex,
+          preferredRemainderBps: stableIndex === null ? 0 : Math.min(Number(dustBps), 50)
         });
       } catch (error) { swapQuoteError = error.message; }
     }
@@ -1162,6 +1173,9 @@ export class RebalanceExecutor {
       || withdrawn.raw0 + withdrawn.raw1 === 0n) {
       throw new Error('Sequential preflight did not return non-negative withdrawn inventory');
     }
+    const fundingScope = buildPairFundingScope(
+      pool, postWithdraw, this.config.usdgAddress, this.config.autoTopupDustBps ?? 25
+    );
 
     const target = buildTargetRange(
       poolState.tick, pool.key.tickSpacing,
@@ -1169,19 +1183,21 @@ export class RebalanceExecutor {
     );
     const swapPlan = await buildExactBalancedSwapPlan({
       pool, quoter: this.quoter,
-      rawAmount0: withdrawn.raw0,
-      rawAmount1: withdrawn.raw1,
+      rawAmount0: fundingScope.funding.raw0,
+      rawAmount1: fundingScope.funding.raw1,
       sqrtPriceX96: poolState.sqrtPriceX96,
       tickLower: target.tickLower,
       tickUpper: target.tickUpper,
       slippageBps: this.config.swapSlippageBps,
-      maxPriceImpactBps
+      maxPriceImpactBps,
+      preferRemainderTokenIndex: fundingScope.stableIndex,
+      preferredRemainderBps: fundingScope.stableIndex === null ? 0 : Math.min(this.config.autoTopupDustBps ?? 25, 50)
     });
     if (swapPlan.blockedReason) {
       throw new Error(`Sequential preflight cannot swap within price-impact limit: ${swapPlan.blockedReason}`);
     }
 
-    let projected = withdrawn;
+    let projected = fundingScope.funding;
     let finalTarget = target;
     let finalSqrtPriceX96 = poolState.sqrtPriceX96;
     let swapRequest = null;
@@ -1222,15 +1238,15 @@ export class RebalanceExecutor {
         throw new Error('Sequential preflight swap did not emit the expected pool price');
       }
       projected = swapPlan.tokenIn === 0
-        ? { raw0: withdrawn.raw0 - swapPlan.rawAmountIn,
-            raw1: withdrawn.raw1 + BigInt(swapPlan.quote.minRawAmountOut) }
-        : { raw0: withdrawn.raw0 + BigInt(swapPlan.quote.minRawAmountOut),
-            raw1: withdrawn.raw1 - swapPlan.rawAmountIn };
+        ? { raw0: fundingScope.funding.raw0 - swapPlan.rawAmountIn,
+            raw1: fundingScope.funding.raw1 + BigInt(swapPlan.quote.minRawAmountOut) }
+        : { raw0: fundingScope.funding.raw0 + BigInt(swapPlan.quote.minRawAmountOut),
+            raw1: fundingScope.funding.raw1 - swapPlan.rawAmountIn };
       const postSwap = {
         raw0: BigInt(erc20Interface.decodeFunctionResult('balanceOf', preview.at(-2).returnData)[0]),
         raw1: BigInt(erc20Interface.decodeFunctionResult('balanceOf', preview.at(-1).returnData)[0])
       };
-      const actualInventory = operationDelta(preBalances, postSwap);
+      const actualInventory = operationDelta(fundingScope.dustRaw, postSwap);
       if (actualInventory.raw0 < projected.raw0 || actualInventory.raw1 < projected.raw1) {
         throw new Error('Sequential preflight swap returned less than conservative minOut inventory');
       }
