@@ -1,3 +1,4 @@
+// Public release verification trigger.
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -293,7 +294,7 @@ const secretPatterns = [
   /\bgh[pousr]_[A-Za-z0-9]{30,}\b/,
   /\bgithub_pat_[A-Za-z0-9_]{40,}\b/,
   /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/,
-  /(?:^|\n)\s*(?:PRIVATE_KEY|GUARD_DEPLOYER_PRIVATE_KEY|DASHBOARD_TOKEN|BLOCKSCOUT_API_KEY)\s*=\s*(?!\s*(?:$|#|\.\.\.|<|\$\{))[^\s#]+/m,
+  /(?:^|\n)[ \t]*(?:PRIVATE_KEY|GUARD_DEPLOYER_PRIVATE_KEY|DASHBOARD_TOKEN|BLOCKSCOUT_API_KEY)[ \t]*=[ \t]*(?![ \t]*(?:$|#|\.\.\.|<|\$\{))[^\s#]+/m,
   /https?:\/\/[^\s/:@]+:[^\s/@]+@[^\s/]+/i,
   /[A-Za-z]:\\Users\\[^\\\r\n]+/i,
   /\/home\/[^/\s]+\/[^\r\n]*/
