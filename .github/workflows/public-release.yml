@@ -2,7 +2,7 @@ name: Build Public Release
 
 on:
   push:
-    branches: [public-release-prep]
+    branches: [main, public-release-prep]
     paths:
       - "scripts/build-public-release.js"
       - ".github/workflows/public-release.yml"
