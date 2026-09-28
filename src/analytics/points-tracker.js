@@ -15,7 +15,7 @@ import {
 
 const USER_FEE_TYPES = new Set(['fee.accrual', 'points.user_fee_adjustment']);
 const GLOBAL_FEE_TYPE = 'points.global_swap_fee';
-const EVIDENCE_REFRESH_MS = 60_000;
+const EVIDENCE_REFRESH_MS = 5 * 60_000;
 
 export class PointsTracker {
   constructor(config, ledger, state) {

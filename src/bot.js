@@ -5,7 +5,7 @@ import { createProviders, verifyProviders } from './rpc/providers.js';
 import { FablesAdapter, lifecycleEventType, lifecycleLiquidity } from './adapters/fables.js';
 import { RebalanceExecutor } from './adapters/executor.js';
 import { V4QuoterAdapter } from './adapters/quoter.js';
-import { fetchFablesPoolStats } from './adapters/fables-stats.js';
+import { fetchFablesPoolStats, fetchFablesPoolTvl } from './adapters/fables-stats.js';
 import { buildUsdPriceMap } from './analytics/prices.js';
 import { spotToken1PerToken0 } from './analytics/liquidity.js';
 import { PortfolioAnalytics } from './analytics/portfolio.js';
@@ -490,6 +490,8 @@ export class AutoLpBot {
 
   getInvestmentTargetSnapshot() {
     const settings = this.getInvestmentTargetSettings();
+    const freshStats = Date.now() - Number(this.market.fablesStats?.aprObservedAt || 0) <= 5 * 60_000
+      ? this.market.fablesStats : null;
     const ranked = settings.mode === 'apr-highest'
       ? rankAprPools({
         pools: this.market.pools,
@@ -517,15 +519,17 @@ export class AutoLpBot {
     const selected = settings.mode === 'specific-pool'
       ? this.market.pools.find((pool) => pool.id.toLowerCase() === settings.poolId)
       : aprSelected;
-    const stats = selected && this.market.fablesStats?.pools?.get(selected.id.toLowerCase());
+    const stats = selected && freshStats?.pools?.get(selected.id.toLowerCase());
+    const tvlStats = selected && Date.now() - Number(this.market.fablesStats?.observedAt || 0) <= 5 * 60_000
+      ? this.market.fablesStats?.pools?.get(selected.id.toLowerCase()) : null;
     return {
       mode: settings.mode,
       poolId: selected?.id || (settings.mode === 'specific-pool' ? settings.poolId : null),
       specificPoolId: settings.poolId || null,
       pair: selected ? selected.token0.symbol + '/' + selected.token1.symbol : null,
       aprPct: stats?.aprPct ?? null,
-      tvlUsd: stats?.tvlUsd ?? null,
-      statsObservedAt: this.market.fablesStats?.observedAt ?? null,
+      tvlUsd: tvlStats?.tvlUsd ?? null,
+      statsObservedAt: this.market.fablesStats?.aprObservedAt ?? null,
       minTvlUsd: this.config.aprPoolMinTvlUsd
     };
   }
@@ -757,9 +761,11 @@ export class AutoLpBot {
     const pools = fullStateRefresh
       ? await this.fables.hydratePoolStates(await this.fables.discoverAllPools())
       : this.market.pools;
-    let fablesStats = null;
-    try { fablesStats = await fetchFablesPoolStats(); }
-    catch (error) { log('warn', 'fables.stats_unavailable', { error: error.message }); }
+    // TVL weights USD price routes; the separate 24h fee/APR endpoint is only
+    // queried when an OOR position passes the execution gates.
+    let fablesStats = this.market.fablesStats;
+    try { fablesStats = await fetchFablesPoolTvl(); }
+    catch (error) { log('warn', 'fables.tvl_unavailable', { error: error.message }); }
     const prices = buildUsdPriceMap(pools, this.config.usdgAddress, { fablesStats });
     this.market = {
       refreshedAt: Date.now(),
@@ -790,6 +796,31 @@ export class AutoLpBot {
       targetPools: this.config.targetMode === 'wallet-active' ? null : this.fables.targetPools(pools).length
     });
     return this.market;
+  }
+
+  async refreshAprForRebalance() {
+    const fablesStats = await fetchFablesPoolStats();
+    this.market.fablesStats = fablesStats;
+    this.market.prices = buildUsdPriceMap(this.market.pools, this.config.usdgAddress, { fablesStats });
+    if (this.snapshot) {
+      const watched = new Set((this.state.getSetting('watchedPoolIds', []) || [])
+        .map((id) => String(id).toLowerCase()));
+      this.snapshot = {
+        ...this.snapshot,
+        markets: this.market.pools.map((pool) => snapshotMarket(
+          pool, fablesStats.pools?.get(pool.id.toLowerCase()) || null,
+          watched.has(pool.id.toLowerCase()), fablesStats
+        )),
+        prices: Object.fromEntries(this.market.prices),
+        bot: { ...this.snapshot.bot, investmentTarget: this.getInvestmentTargetSnapshot() }
+      };
+      this.ledger.writeSnapshot(this.snapshot);
+    }
+    log('info', 'market.apr_refreshed_for_rebalance', {
+      pools: fablesStats.pools?.size || 0,
+      observedAt: fablesStats.observedAt
+    });
+    return fablesStats;
   }
 
   async runOnce(options = {}) {
@@ -1343,6 +1374,11 @@ export class AutoLpBot {
     }
     let destinationPool;
     try {
+      try { await this.refreshAprForRebalance(); }
+      catch (error) {
+        log('warn', 'fables.stats_unavailable_for_rebalance', { error: error.message });
+        if (this.getInvestmentTargetSettings().mode === 'apr-highest') throw error;
+      }
       destinationPool = this.resolveInvestmentTarget(pool);
     } catch (error) {
       const backoff = recordRebalanceFailure(this.state, this.ledger, pool, position, error.message);
@@ -1360,7 +1396,7 @@ export class AutoLpBot {
       pool,
       destinationPool,
       destinationStats: this.market.fablesStats?.pools?.get(destinationPool.id.toLowerCase()) || null,
-      destinationStatsObservedAt: this.market.fablesStats?.observedAt ?? 0,
+      destinationStatsObservedAt: this.market.fablesStats?.aprObservedAt ?? 0,
       routingPools: this.market.pools,
       routingTokens: String(destinationPool.id).toLowerCase() === String(pool.id).toLowerCase()
         ? []
@@ -2045,6 +2081,9 @@ function snapshotPool(pool) {
   };
 }
 function snapshotMarket(pool, stats, watched, fablesStats) {
+  const fresh = Date.now() - Number(fablesStats?.observedAt || 0) <= 5 * 60_000;
+  const freshApr = Date.now() - Number(fablesStats?.aprObservedAt || 0) <= 5 * 60_000;
+  const currentStats = fresh ? stats : null;
   return {
     id: pool.id,
     pair: pool.token0.symbol + '/' + pool.token1.symbol,
@@ -2053,11 +2092,11 @@ function snapshotMarket(pool, stats, watched, fablesStats) {
     tick: pool.state?.tick ?? null,
     paused: pool.state?.paused ?? null,
     watched,
-    tvlUsd: stats?.tvlUsd ?? null,
-    volume24hUsd: stats?.volume24hUsd ?? null,
-    fees24hUsd: stats?.fees24hUsd ?? null,
-    aprPct: stats?.aprPct ?? null,
-    statsObservedAt: fablesStats?.observedAt ?? null,
+    tvlUsd: currentStats?.tvlUsd ?? null,
+    volume24hUsd: currentStats?.volume24hUsd ?? null,
+    fees24hUsd: currentStats?.fees24hUsd ?? null,
+    aprPct: freshApr ? (currentStats?.aprPct ?? null) : null,
+    statsObservedAt: fablesStats?.aprObservedAt ?? null,
     statsSource: fablesStats?.source ?? null
   };
 }

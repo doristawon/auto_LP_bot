@@ -268,7 +268,8 @@ test('manual points baseline endpoint writes only the fallback baseline', async 
 test('dashboard labels source freshness limits and rebalance attention fields', () => {
   const html = dashboardPage();
   assert.match(html, /本機取得時間/);
-  assert.match(html, /上游更新時間未提供/);
+  assert.match(html, /Fables 回應未提供統計資料的更新時間/);
+  assert.match(html, /下次符合 OOR 再平衡條件時更新/);
   assert.match(html, /rebalanceBackoffNotice/);
   assert.match(html, /journal 長時間未更新/);
   assert.match(html, /手動備援分數只供顯示/);

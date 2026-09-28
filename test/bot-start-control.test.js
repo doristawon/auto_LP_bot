@@ -37,6 +37,7 @@ function makeBot() {
   bot.walletImportState = { status: 'ready', address: WALLET };
   bot.walletProfiles = new Map();
   bot.rpcHealth = [{ ok: true, chainId: 4663 }];
+  bot.providers = { rawProviders: [{}] };
   bot.executionPaused = true;
   bot.cycleActive = true;
   bot.getSelectedExecutionTargetPoolId = () => POOL_ID;

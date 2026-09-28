@@ -2,6 +2,17 @@ import { FABLES_STATS_URL } from '../constants.js';
 
 const REQUEST_TIMEOUT_MS = 8_000;
 
+export async function fetchFablesPoolTvl() {
+  const result = await fetchStats('PoolTvl');
+  if (!result.ok) throw new Error('Fables public pool TVL is temporarily unavailable');
+  const pools = new Map(Object.entries(result.data.pools).map(([id, value]) => [
+    id.toLowerCase(), { tvlUsd: finiteOrNull(value?.tvlUsd), volume24hUsd: null,
+      fees24hUsd: null, aprPct: null }
+  ]));
+  return { source: 'https://www.fables.fi', observedAt: Date.now(), aprObservedAt: null,
+    pools, tvlAvailable: true, volumeAvailable: false };
+}
+
 export async function fetchFablesPoolStats() {
   const [tvlResult, volumeResult] = await Promise.all([
     fetchStats('PoolTvl'),
@@ -35,6 +46,7 @@ export async function fetchFablesPoolStats() {
   return {
     source: 'https://www.fables.fi',
     observedAt,
+    aprObservedAt: volumeResult.ok && tvlResult.ok ? observedAt : null,
     pools,
     tvlAvailable: tvlResult.ok,
     volumeAvailable: volumeResult.ok

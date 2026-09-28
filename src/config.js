@@ -3,7 +3,7 @@ import { CHAIN_ID, DEFAULT_RPC_URL, FABLES_REGISTRY, USDG } from './constants.js
 import { envBool, envInt, envList, envNum } from './env.js';
 
 export const RUNTIME_INTERVAL_LIMITS = Object.freeze({
-  marketRefreshMs: { min: 15_000, max: 60 * 60 * 1000, label: 'APR 更新間隔', minLabel: '15 秒', maxLabel: '60 分鐘' },
+  marketRefreshMs: { min: 15_000, max: 60 * 60 * 1000, label: '池資料更新間隔', minLabel: '15 秒', maxLabel: '60 分鐘' },
   rangeCheckIntervalMs: { min: 30_000, max: 24 * 60 * 60 * 1000, label: '區間檢查間隔', minLabel: '30 秒', maxLabel: '24 小時' },
   pointsSimulationIntervalMs: { min: 5_000, max: 60 * 60 * 1000, label: '分數模擬間隔', minLabel: '5 秒', maxLabel: '60 分鐘' }
 });
@@ -34,13 +34,13 @@ export function loadConfig() {
   const targetPoolIds = envList('TARGET_POOL_IDS', []).map((x) => x.toLowerCase());
   const rangePreset = (process.env.RANGE_PRESET?.trim() || 'custom-bps').toLowerCase();
   const runtimeIntervals = normalizeRuntimeIntervals({
-    marketRefreshMs: envInt('MARKET_REFRESH_MS', 60_000),
+    marketRefreshMs: envInt('MARKET_REFRESH_MS', 5 * 60_000),
     rangeCheckIntervalMs: envInt('RANGE_CHECK_INTERVAL_MS', 5 * 60 * 1000),
     pointsSimulationIntervalMs: envInt('POINTS_SIMULATION_INTERVAL_MS', 15_000)
   });
   const { marketRefreshMs, rangeCheckIntervalMs, pointsSimulationIntervalMs } = runtimeIntervals;
   const marketStateRefreshMs = envInt('MARKET_STATE_REFRESH_MS', Math.max(marketRefreshMs, 5 * 60_000));
-  const pollIntervalMs = envInt('POLL_INTERVAL_MS', 60_000);
+  const pollIntervalMs = envInt('POLL_INTERVAL_MS', 5 * 60_000);
   const aprPoolMinTvlUsd = envNum('APR_POOL_MIN_TVL_USD', 30_000);
   const swapSlippageBps = envInt('SWAP_SLIPPAGE_BPS', 50);
   const maxSwapPriceImpactBps = envInt('MAX_SWAP_PRICE_IMPACT_BPS', 200);

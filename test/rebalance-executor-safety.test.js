@@ -38,6 +38,7 @@ test('dry-run rebalance never commits cooldown/history or resets OOR state', asy
     market: { pools: [pool], fablesStats: { pools: new Map() } },
     config: { maxRebalancesPerHour: 3, minRebalanceIntervalSec: 300 },
     getInvestmentTargetSettings() { return { mode: 'apr-highest', poolId: '' }; },
+    async refreshAprForRebalance() {},
     resolveInvestmentTarget(sourcePool) { return sourcePool; },
     async assertStillOutOfRangeBeforeRebalance() { return true; },
     executor: { async execute() { return { status: 'dry-run' }; } }
@@ -176,6 +177,7 @@ test('bot auto-pauses when executor enters recovery_required after capital moved
     market: { pools: [pool], fablesStats: { pools: new Map() } },
     config: { maxRebalancesPerHour: 3, minRebalanceIntervalSec: 300 },
     getInvestmentTargetSettings() { return { mode: 'apr-highest', poolId: '' }; },
+    async refreshAprForRebalance() {},
     resolveInvestmentTarget(sourcePool) { return sourcePool; },
     async assertStillOutOfRangeBeforeRebalance() { return true; },
     executor: { async execute() { throw new Error('post-withdraw failure'); } },
@@ -207,6 +209,7 @@ test('a failed preflight backs off instead of retrying on the next monitor cycle
     market: { pools: [pool], fablesStats: { pools: new Map() } },
     config: { maxRebalancesPerHour: 3, minRebalanceIntervalSec: 300 },
     getInvestmentTargetSettings() { return { mode: 'apr-highest', poolId: '' }; },
+    async refreshAprForRebalance() {},
     resolveInvestmentTarget(sourcePool) { return sourcePool; },
     async assertStillOutOfRangeBeforeRebalance() { return true; },
     executor: { async execute() { executions++; throw new Error('preflight unavailable'); } }
