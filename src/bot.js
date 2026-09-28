@@ -6,6 +6,7 @@ import { FablesAdapter, lifecycleEventType, lifecycleLiquidity } from './adapter
 import { RebalanceExecutor } from './adapters/executor.js';
 import { V4QuoterAdapter } from './adapters/quoter.js';
 import { fetchFablesPoolStats, fetchFablesPoolTvl } from './adapters/fables-stats.js';
+import { fetchWalletCashflowCandidates, fetchEthUsdCloseAt, fetchNativeBalanceAt } from './adapters/wallet-cashflows.js';
 import { buildUsdPriceMap } from './analytics/prices.js';
 import { spotToken1PerToken0 } from './analytics/liquidity.js';
 import { PortfolioAnalytics } from './analytics/portfolio.js';
@@ -28,6 +29,7 @@ import { log, registerSensitiveValues, sanitize } from './logger.js';
 
 const hookInterface = new Interface(HOOK_ABI);
 const transferTopic = id('Transfer(address,address,uint256)').toLowerCase();
+const PROLOGUE_FEE_DISTRIBUTOR = '0xc9ecc11728a4955b31f77c077b97fec521d78760';
 const REBALANCE_FAILURE_BASE_MS = 60_000;
 const REBALANCE_FAILURE_MAX_MS = 30 * 60_000;
 const RPC_RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
@@ -888,12 +890,23 @@ export class AutoLpBot {
       }
 
       const uniqueTokens = uniqueTargetTokens(accountingPools);
+      if (!uniqueTokens.some((token) => token.address.toLowerCase() === ZERO_ADDRESS)) {
+        uniqueTokens.push({ address: ZERO_ADDRESS, symbol: 'ETH', decimals: 18 });
+      }
       const walletBalances = await this.fables.readWalletBalances(uniqueTokens);
+      try { await this.scanExternalCashflows(latestBlock); }
+      catch (error) {
+        this.state.setSetting('cashflowCoverage', {
+          complete: false, error: sanitize(error.message), at: Date.now()
+        });
+        log('warn', 'cashflow.scan_failed', { error: error.message });
+      }
       const portfolio = this.analytics.build({
         targetPools,
         walletBalances,
         prices: this.market.prices,
-        trackedTokens: uniqueTokens
+        trackedTokens: uniqueTokens,
+        blockNumber: latestBlock
       });
       await this.attachRebalanceQuotes(targetPools, portfolio);
       const points = this.points.snapshot();
@@ -960,6 +973,89 @@ export class AutoLpBot {
     } finally {
       this.cycleActive = false;
     }
+  }
+
+  async scanExternalCashflows(latestBlock) {
+    const baseline = this.ledger.readBaseline();
+    if (!baseline) return;
+    const wallet = this.config.walletAddress.toLowerCase();
+    const baselineMs = Number(baseline.createdAt);
+    if (!Number.isFinite(baselineMs) || baselineMs <= 0) throw new Error('Portfolio baseline timestamp unavailable');
+    if (!Object.hasOwn(baseline.inventory || {}, ZERO_ADDRESS)) {
+      const native = await fetchNativeBalanceAt({
+        wallet, atMs: baselineMs, apiKey: this.config.blockscoutApiKey
+      });
+      const ethBasisPriceUsd = native.amount > 0 ? await fetchEthUsdCloseAt(baselineMs) : 0;
+      const recovered = {
+        ...baseline,
+        inventory: { ...baseline.inventory, [ZERO_ADDRESS]: native.amount },
+        initialValueUsd: Number(baseline.initialValueUsd) + native.amount * ethBasisPriceUsd,
+        nativeBasisPriceUsd: ethBasisPriceUsd,
+        nativeBasisSource: 'Blockscout balance history; Coinbase transfer-minute ETH/USD close',
+        nativeBasisBlockNumber: native.blockNumber
+      };
+      this.ledger.writeBaseline(recovered);
+      this.ledger.append('portfolio.native_baseline_recovered', {
+        amountEth: native.amount, ethBasisPriceUsd, basisUsd: native.amount * ethBasisPriceUsd,
+        blockNumber: native.blockNumber, baselineCreatedAt: baselineMs
+      });
+    }
+    const previousScan = Number(this.state.getSetting('externalCashflowScannedAt', 0));
+    const sinceMs = Math.max(baselineMs, previousScan > 0 ? previousScan - 60 * 60_000 : baselineMs);
+    const candidates = await fetchWalletCashflowCandidates({
+      wallet, usdgAddress: this.config.usdgAddress, sinceMs,
+      apiKey: this.config.blockscoutApiKey
+    });
+    const ethPriceCache = new Map();
+    for (const { type, direction, timestamp, item } of candidates) {
+      if (item.status && item.status !== 'ok') continue;
+      const from = String(item.from?.hash || '').toLowerCase();
+      const to = String(item.to?.hash || '').toLowerCase();
+      if (direction === 'in' && to !== wallet) continue;
+      if (direction === 'out' && from !== wallet) continue;
+      const counterparty = direction === 'in' ? from : to;
+      const counterpartyInfo = direction === 'in' ? item.from : item.to;
+      const hash = String(item.transaction_hash || item.hash || '').toLowerCase();
+      if (!/^0x[0-9a-f]{64}$/.test(hash)) continue;
+      if (type === 'usdg') {
+        if (String(item.token?.address_hash || '').toLowerCase() !== this.config.usdgAddress.toLowerCase()) continue;
+        const decimals = Number(item.total?.decimals);
+        if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) continue;
+        const amount = Number(formatUnits(BigInt(item.total.value), decimals));
+        if (!(amount > 0)) continue;
+        const eventKey = `cashflow:usdg:${hash}:${Number(item.log_index)}`;
+        if (direction === 'in' && counterparty === PROLOGUE_FEE_DISTRIBUTOR
+          && item.method === '0x3d13f874') {
+          this.ledger.appendUnique(eventKey, 'reward.claimed', {
+            token: this.config.usdgAddress.toLowerCase(), symbol: 'USDG', amount, usd: amount,
+            hash, blockNumber: Number(item.block_number), classification: 'contract-claim-transfer'
+          }, timestamp);
+        } else if (counterpartyInfo?.is_contract === false) {
+          const signed = direction === 'in' ? amount : -amount;
+          this.ledger.appendUnique(eventKey, 'cashflow.external_transfer', {
+            token: this.config.usdgAddress.toLowerCase(), symbol: 'USDG', amount: signed, usd: signed,
+            direction, hash, blockNumber: Number(item.block_number),
+            logIndex: Number(item.log_index), counterparty, classification: 'external-eoa-transfer'
+          }, timestamp);
+        }
+      } else if (type === 'eth' && counterpartyInfo?.is_contract === false) {
+        const amount = Number(formatUnits(BigInt(item.value || 0), 18));
+        if (!(amount > 0)) continue;
+        const priceMinute = Math.floor(timestamp / 60_000);
+        if (!ethPriceCache.has(priceMinute)) ethPriceCache.set(priceMinute, await fetchEthUsdCloseAt(timestamp));
+        const ethPriceUsd = ethPriceCache.get(priceMinute);
+        const signed = direction === 'in' ? amount : -amount;
+        this.ledger.appendUnique(`cashflow:eth:${hash}`, 'cashflow.external_transfer', {
+          token: ZERO_ADDRESS, symbol: 'ETH', amount: signed, usd: signed * ethPriceUsd,
+          direction, hash, blockNumber: Number(item.block_number), counterparty,
+          classification: 'external-eoa-transfer', priceBasis: 'transfer-minute ETH/USD close'
+        }, timestamp);
+      }
+    }
+    this.state.setSetting('externalCashflowScannedAt', Date.now());
+    this.state.setSetting('cashflowCoverage', {
+      complete: true, source: 'blockscout', throughBlock: latestBlock, at: Date.now()
+    });
   }
 
   async resolveTargetPools(latestBlock) {
@@ -1128,8 +1224,12 @@ export class AutoLpBot {
     const last = Number(this.state.getSetting('lastPortfolioSnapshotAt', 0) || 0);
     if (last && now - last < this.config.portfolioSnapshotIntervalMs) return;
     this.ledger.append('portfolio.snapshot', {
+      accountingVersion: 2,
       blockNumber: snapshot.blockNumber,
       currentValueUsd: snapshot.portfolio.currentValueUsd,
+      netInvestedUsd: snapshot.portfolio.netInvestedUsd,
+      externalCashflowUsd: snapshot.portfolio.externalCashflowUsd,
+      accountingComplete: snapshot.portfolio.accountingComplete,
       hodlValueUsd: snapshot.portfolio.hodlValueUsd,
       netPnlUsd: snapshot.portfolio.netPnlUsd,
       excessVsHodlUsd: snapshot.portfolio.excessVsHodlUsd,

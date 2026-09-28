@@ -2,6 +2,7 @@ import { formatUnits } from 'ethers';
 import { rangeAmounts, spotToken1PerToken0 } from './liquidity.js';
 import { usdValue } from './prices.js';
 import { buildRebalanceInventoryPlan } from './rebalance-plan.js';
+import { ZERO_ADDRESS } from '../constants.js';
 
 export class PortfolioAnalytics {
   constructor(config, ledger, state) {
@@ -10,7 +11,7 @@ export class PortfolioAnalytics {
     this.state = state;
   }
 
-  build({ targetPools, walletBalances, prices, trackedTokens = [] }) {
+  build({ targetPools, walletBalances, prices, trackedTokens = [], blockNumber = null }) {
     const positionMetrics = [];
     const inventory = new Map();
     const targetTokens = new Map();
@@ -201,6 +202,7 @@ export class PortfolioAnalytics {
     if (!baseline) {
       baseline = {
         createdAt: Date.now(),
+        blockNumber,
         inventory: inventoryObject,
         initialValueUsd: inventoryUsd(inventoryObject, prices)
       };
@@ -209,20 +211,40 @@ export class PortfolioAnalytics {
     }
 
     const currentValueUsd = inventoryUsd(inventoryObject, prices);
-    const hodlValueUsd = inventoryUsd(baseline.inventory || {}, prices);
+    const events = this.ledger.all();
     const gasUsd = uniqueGasUsd(this.ledger.all());
     const trackedFeeUsd = this.ledger.sum('feeUsd', 'fee.accrual');
-    const cashflowEvents = this.ledger.all().filter((e) => e.type === 'cashflow.adjustment');
-    const eventCashflow = cashflowEvents.reduce((sum, e) => sum + Number(e.usd || 0), 0);
-    const netCashflowUsd = this.config.manualNetCashflowUsd + eventCashflow;
-    const nativeIsTracked = targetTokens.has('0x0000000000000000000000000000000000000000');
+    const manualCashflowUsd = events.filter((e) => e.type === 'cashflow.adjustment')
+      .reduce((sum, e) => sum + Number(e.usd || 0), Number(this.config.manualNetCashflowUsd || 0));
+    const externalTransfers = events.filter((e) => e.type === 'cashflow.external_transfer');
+    const externalCashflowUsd = externalTransfers.reduce((sum, e) => sum + Number(e.usd || 0), 0);
+    const rewardUsd = events.filter((e) => e.type === 'reward.claimed')
+      .reduce((sum, e) => sum + Number(e.usd || 0), 0);
+    const netCashflowUsd = manualCashflowUsd + externalCashflowUsd;
+    const holdInventory = { ...(baseline.inventory || {}) };
+    for (const event of externalTransfers) {
+      const address = String(event.token || '').toLowerCase();
+      const amount = Number(event.amount);
+      if (address && Number.isFinite(amount)) holdInventory[address] = Number(holdInventory[address] || 0) + amount;
+    }
+    if (manualCashflowUsd) holdInventory[this.config.usdgAddress.toLowerCase()]
+      = Number(holdInventory[this.config.usdgAddress.toLowerCase()] || 0) + manualCashflowUsd;
+    const hodlValueUsd = inventoryUsd(holdInventory, prices);
+    const nativeIsTracked = targetTokens.has(ZERO_ADDRESS);
+    const nativeBaselineMissing = nativeIsTracked && !Object.hasOwn(baseline.inventory || {}, ZERO_ADDRESS);
+    const cashflowCoverage = this.state.getSetting('cashflowCoverage', null);
+    const accountingComplete = !nativeBaselineMissing && cashflowCoverage?.complete === true;
     const grossPnlUsd = Number.isFinite(currentValueUsd) && Number.isFinite(baseline.initialValueUsd)
       ? currentValueUsd - baseline.initialValueUsd - netCashflowUsd
       : null;
-    const netPnlUsd = Number.isFinite(grossPnlUsd) ? grossPnlUsd - (nativeIsTracked ? 0 : gasUsd) : null;
-    const excessVsHodlUsd = finitePair(currentValueUsd, hodlValueUsd)
-      ? currentValueUsd - hodlValueUsd - netCashflowUsd - (nativeIsTracked ? 0 : gasUsd)
-      : null;
+    const netPnlUsd = accountingComplete && Number.isFinite(grossPnlUsd)
+      ? grossPnlUsd - (nativeIsTracked ? 0 : gasUsd) : null;
+    const excessVsHodlUsd = accountingComplete && finitePair(currentValueUsd, hodlValueUsd)
+      ? currentValueUsd - hodlValueUsd - (nativeIsTracked ? 0 : gasUsd) : null;
+    const holdPnlUsd = accountingComplete && Number.isFinite(hodlValueUsd)
+      ? hodlValueUsd - Number(baseline.initialValueUsd) - netCashflowUsd : null;
+    const lpAndTradingPnlUsd = Number.isFinite(netPnlUsd) && Number.isFinite(holdPnlUsd)
+      ? netPnlUsd - holdPnlUsd - trackedFeeUsd - rewardUsd : null;
     const currentIlUsd = positionMetrics.reduce((sum, p) => sum + (Number.isFinite(p.ilUsd) ? p.ilUsd : 0), 0);
 
     return {
@@ -234,10 +256,20 @@ export class PortfolioAnalytics {
       grossPnlUsd,
       netPnlUsd,
       excessVsHodlUsd,
+      holdPnlUsd,
+      lpAndTradingPnlUsd,
       currentIlUsd,
       gasUsd,
       trackedFeeUsd,
+      rewardUsd,
+      externalCashflowUsd,
+      manualCashflowUsd,
       netCashflowUsd,
+      netInvestedUsd: Number(baseline.initialValueUsd) + netCashflowUsd,
+      accountingComplete,
+      accountingIssue: nativeBaselineMissing ? 'native-baseline-missing'
+        : cashflowCoverage?.complete !== true ? 'external-transfer-scan-incomplete' : null,
+      cashflowCoverage,
       positions: positionMetrics
     };
   }

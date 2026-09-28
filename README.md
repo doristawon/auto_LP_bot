@@ -330,10 +330,10 @@ Gross PnL
 - Net External Cashflow
 
 Net PnL
-= Gross PnL - Gas Cost
+= Gross PnL（追蹤原生 ETH 時 Gas 已反映在 ETH 餘額）
 ```
 
-如果 native ETH 本身就是 tracked target token，gas 已反映在 ETH balance 下降，因此不再重複扣一次。
+追蹤資產包含 LP、本錢包相關代幣及原生 ETH。USDG／ETH 的外部 EOA 轉入與轉出由 Blockscout 對帳，ETH 轉帳成本採交易分鐘的 ETH/USD 價格；Prologue 領取另列為獎勵。淨損益拆為持幣價格損益、已追蹤 LP 手續費、已領獎勵與剩餘 LP／兌換／Gas 損益，後者也包含估值誤差。當外部轉帳掃描或舊 ETH 基準無法補齊時，中控台暫不顯示淨損益；合約來源或其他資產轉入需手動帳務調整。
 
 ### Impermanent Loss（無常損失）
 

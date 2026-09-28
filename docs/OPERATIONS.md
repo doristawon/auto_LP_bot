@@ -102,12 +102,14 @@ Points 全池歷史資料在背景分段回補；回補未追上鏈頭前，中�
 
 ## 外部存提
 
-若在 BOT 外手動轉入/轉出 tracked asset，Dashboard 新增 cashflow adjustment：
+中控台每次鏈上監控掃描時，透過 Blockscout 對帳基準建立後的 USDG／ETH 外部 EOA 轉入與轉出；USDG 按 1 美元、ETH 按轉帳分鐘的 Coinbase ETH/USD 收盤價計入本金。已辨識的 Prologue 獎勵領取列為收益。舊基準若缺 ETH，會用基準時間以前最後一筆鏈上 ETH 餘額與當時 ETH/USD 價格補齊；資料缺漏時淨損益顯示待補齊，不顯示可能誤導的數字。
+
+若從合約錢包、交易所合約或非 USDG／ETH 資產轉入資金，需在 Dashboard 新增 cashflow adjustment，並註明來源：
 
 - 存入：正數
 - 提領：負數
 
-否則 PnL 會把外部資金流誤認成投資收益/損失。
+不要為已自動對帳的 USDG／ETH EOA 轉帳重複新增調整，否則本金會重複計入。淨損益為目前追蹤資產價值減起始成本與外部淨轉入；目前部位的無常損失是診斷值，不再額外加減一次。
 
 ## Points 校準
 

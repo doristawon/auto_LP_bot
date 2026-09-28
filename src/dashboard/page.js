@@ -49,17 +49,22 @@ button,input,select{font:inherit;color:var(--text);background:#20231d;border:1px
 <section class="tab-panel active" id="panel-overview" data-panel="overview" role="tabpanel" aria-labelledby="tab-overview" aria-hidden="false">
   <div class="grid">
     <div class="card"><div class="label">追蹤資產價值</div><div class="value" id="valueUsd">--</div><div class="small muted" id="hodl">持有基準 --</div><div class="small muted" id="valueSources">估值來源尚未載入</div></div>
+    <div class="card"><div class="label">淨損益（扣除轉入本金）</div><div class="value" id="netPnl">--</div><div class="small muted" id="accountingStatus">等待鏈上轉帳對帳</div></div>
     <div class="card"><div class="label">目前 LP 部位</div><div class="value" id="rangeCount">--</div><div class="small muted" id="oorCount">--</div></div>
     <div class="card"><div class="label">執行狀態</div><div class="value" id="execution">--</div><div class="small muted" id="lastAction">尚無執行紀錄</div></div>
-    <div class="card"><div class="label">LP 手續費</div><div class="value" id="fees">--</div><div class="small muted" id="gas">鏈上手續費 --</div></div>
   </div>
   <details class="detail-toggle"><summary>查看損益與安全細節</summary>
   <div class="grid">
-    <div class="card"><div class="label">淨損益</div><div class="value" id="netPnl">--</div><div class="small muted" id="excess">相對持有基準 --</div></div>
-    <div class="card"><div class="label">無常損失</div><div class="value" id="il">--</div><div class="small muted">相對部位起始基準</div></div>
+    <div class="card"><div class="label">淨投入本金</div><div class="value" id="netInvested">--</div><div class="small muted" id="externalCashflow">外部淨轉入 --</div></div>
+    <div class="card"><div class="label">LP 手續費</div><div class="value" id="fees">--</div><div class="small muted" id="gas">鏈上手續費 --</div></div>
+    <div class="card"><div class="label">已領獎勵</div><div class="value" id="rewards">--</div><div class="small muted">已確認的合約領取紀錄</div></div>
+    <div class="card"><div class="label">持幣價格損益</div><div class="value" id="holdPnl">--</div><div class="small muted">依本金與外部轉入代幣持有估值</div></div>
+    <div class="card"><div class="label">LP／兌換／Gas 剩餘損益</div><div class="value" id="lpTradingPnl">--</div><div class="small muted" id="excess">相對持有基準 --</div></div>
+    <div class="card"><div class="label">目前部位無常損失</div><div class="value" id="il">--</div><div class="small muted">僅目前部位，不另加總至淨損益</div></div>
     <div class="card"><div class="label">原子化安全防護</div><div class="value" id="guard">--</div><div class="small muted mono" id="guardAddr">--</div></div>
     <div class="card"><div class="label">復原狀態</div><div class="value" id="recovery">--</div><div class="small muted" id="recoveryDetail">--</div></div>
   </div>
+  <p class="small muted">淨損益＝目前追蹤資產價值－起始資產成本－基準後外部淨轉入。持幣損益、LP 手續費、已領獎勵與剩餘損益合計為淨損益；剩餘項含歷次 LP 區間、兌換價差、Gas 與估值誤差。</p>
   <div class="row-equal">
     <section class="card"><h2>部署與安全閘門</h2><div class="status-list">
       <div class="status-item"><span class="muted">簽署錢包</span><strong id="signer">--</strong></div>
@@ -159,7 +164,7 @@ const validTabs=['overview','wallet','pools','positions','points','ledger'];
 const tabNames={overview:'總覽',wallet:'錢包與 RPC',pools:'池子監控與 APR',positions:'LP 部位與區間檢查',points:'分數即時模擬',ledger:'帳務與事件紀錄'};
 const eventNames={
   'portfolio.snapshot':'資產組合快照','portfolio.baseline_created':'建立資產基準','points.actual_baseline':'更新實際分數基準',
-  'execution.control':'執行暫停狀態','cashflow.adjustment':'手動帳務調整','fee.accrual':'個人手續費累計','fee.owed_decrease':'未領手續費減少',
+  'execution.control':'執行暫停狀態','cashflow.adjustment':'手動帳務調整','cashflow.external_transfer':'外部資金轉入／轉出','reward.claimed':'已領獎勵','fee.accrual':'個人手續費累計','fee.owed_decrease':'未領手續費減少',
   'pool.fee':'池子手續費紀錄','pool.fee_unattributed':'未歸屬池子的手續費','lp.deposit':'LP 存入','lp.withdraw':'LP 提領',
   'wallet.lp_topology_changed':'錢包 LP 部位變更','rebalance.manual_requested':'要求人工再平衡','rebalance.dry_run':'再平衡預演',
   'rebalance.blocked':'再平衡遭安全條件阻擋','rebalance.failed':'再平衡失敗','rebalance.uncommitted':'再平衡尚未完成',
@@ -340,7 +345,11 @@ function eventPhase(value){
   return names[text]||text;
 }
 function eventDetail(e){
-  if(e.type==='portfolio.snapshot')return'淨損益 '+usd(e.netPnlUsd)+' · 無常損失 '+usd(e.ilUsd)+' · 模擬積分 '+num(e.estimatedPoints);
+  if(e.type==='cashflow.external_transfer')return(e.direction==='in'?'轉入 ':'轉出 ')+safeEventText(e.symbol||'',12)+' '+num(Math.abs(Number(e.amount||0)))+' · 計入本金 '+usd(e.usd);
+  if(e.type==='reward.claimed')return'已領 '+safeEventText(e.symbol||'',12)+' '+num(e.amount)+' · 列為收益，不計入本金';
+  if(e.type==='portfolio.snapshot')return e.accountingVersion===2
+    ?'淨損益 '+usd(e.netPnlUsd)+' · 淨投入 '+usd(e.netInvestedUsd)+' · 目前部位無常損失 '+usd(e.ilUsd)
+    :'舊版快照：未自動扣除外部轉入，原損益數字已隱藏';
   if(e.type==='wallet.lp_topology_changed')return'新增池 '+(e.added||[]).length+' 個／移除 '+(e.removed||[]).length+' 個 · 區間新增 '+(e.addedRanges||[]).length+' 個／移除 '+(e.removedRanges||[]).length+' 個';
   if(e.type==='rebalance.manual_requested')return'人工操作 · '+(e.pair||'')+(e.dryRun?' · 預演':' · 即時交易');
   if(e.type==='rebalance.dry_run')return'預演計畫 · '+safeEventText(e.pair||'',48)+eventRange(e.target)+' · 未送出交易';
@@ -393,7 +402,7 @@ function render(){
   $('updated').textContent=state.generatedAt?dt(state.generatedAt):'等待首次掃描';
   $('mode').textContent=(ctl.dryRun?'預演模式':'實盤模式')+' · '+(ctl.executionPaused?'已暫停':'監控中');$('mode').className='pill '+(ctl.recoveryRequired?'bad':ctl.executionPaused?'warn':'good');
   $('armed').textContent=ctl.manualControlEnabled?'人工操作已啟用':'人工操作安全關閉';$('armed').className='pill '+(ctl.manualControlEnabled?'warn':'good');
-  $('valueUsd').textContent=usd(portfolio.currentValueUsd);$('hodl').textContent='持有基準 '+usd(portfolio.hodlValueUsd);$('valueSources').textContent=renderPriceSourceSummary(portfolio.priceSources);$('netPnl').textContent=usd(portfolio.netPnlUsd);$('netPnl').className='value '+(Number(portfolio.netPnlUsd)>0?'good':Number(portfolio.netPnlUsd)<0?'bad':'');$('excess').textContent='相對持有基準 '+usd(portfolio.excessVsHodlUsd);$('il').textContent=usd(portfolio.currentIlUsd);$('fees').textContent=usd(portfolio.trackedFeeUsd);$('gas').textContent='鏈上手續費 '+usd(portfolio.gasUsd);
+  $('valueUsd').textContent=usd(portfolio.currentValueUsd);$('hodl').textContent='持有基準 '+usd(portfolio.hodlValueUsd);$('valueSources').textContent=renderPriceSourceSummary(portfolio.priceSources);$('netPnl').textContent=usd(portfolio.netPnlUsd);$('netPnl').className='value '+(portfolio.netPnlUsd==null?'warn':Number(portfolio.netPnlUsd)>0?'good':Number(portfolio.netPnlUsd)<0?'bad':'');$('accountingStatus').textContent=portfolio.accountingComplete?'已扣除外部淨轉入 '+usd(portfolio.externalCashflowUsd):'帳務待補齊：'+(portfolio.accountingIssue==='native-baseline-missing'?'起始 ETH 基準缺漏':'轉入／轉出掃描尚未完成');$('netInvested').textContent=usd(portfolio.netInvestedUsd);$('externalCashflow').textContent='外部淨轉入 '+usd(portfolio.externalCashflowUsd);$('rewards').textContent=usd(portfolio.rewardUsd);$('holdPnl').textContent=usd(portfolio.holdPnlUsd);$('lpTradingPnl').textContent=usd(portfolio.lpAndTradingPnlUsd);$('excess').textContent='相對持有基準 '+usd(portfolio.excessVsHodlUsd);$('il').textContent=usd(portfolio.currentIlUsd);$('fees').textContent=usd(portfolio.trackedFeeUsd);$('gas').textContent='鏈上手續費 '+usd(portfolio.gasUsd);
   const positions=portfolio.positions||[];$('rangeCount').textContent=positions.length;$('oorCount').textContent=positions.filter(x=>x.outside).length+' 個區間外';$('execution').textContent=ctl.executionPaused?'已暫停':(ctl.dryRun?'預演監控中':(ctl.recoveryRequired||!(ctl.guard&&ctl.guard.runtimeReady)?'實盤受限':'實盤監控中'));$('lastAction').textContent=bot.lastAction||'尚無操作紀錄';
   const phases={completed:'已完成',failed:'失敗',recovery_required:'需要復原',withdraw_submitted:'提領交易已送出',swap_submitted:'兌換交易已送出',deposit_submitted:'存入交易已送出'};$('guard').textContent=ctl.guard&&ctl.guard.runtimeReady?'已就緒':(ctl.guard&&ctl.guard.verifiedFlag?'驗證失敗':'未啟用');$('guard').className='value '+(ctl.guard&&ctl.guard.runtimeReady?'good':(ctl.guard&&ctl.guard.verifiedFlag?'bad':'warn'));$('guardAddr').textContent=ctl.guard&&ctl.guard.address?short(ctl.guard.address):'尚未設定';$('recovery').textContent=ctl.recoveryRequired?'需要復原':(ctl.executionBusy?'執行中':'正常');$('recovery').className='value '+(ctl.recoveryRequired?'bad':(ctl.executionBusy?'warn':'good'));$('recoveryDetail').textContent=ctl.activeRebalanceExecution?((phases[ctl.activeRebalanceExecution.phase]||'交易處理中')+' · '+(ctl.activeRebalanceExecution.pair||'')):'沒有待處理交易';renderRebalanceBackoffs(ctl);
   $('signer').innerHTML=yesNo(ctl.signerConfigured);$('liveWrites').innerHTML=yesNo(ctl.liveWrites);$('autoRedeploy').innerHTML=yesNo(ctl.autoRedeploy);$('manualControl').innerHTML=ctl.manualControlEnabled?'<span class="warn">已啟用</span>':'<span class="good">安全關閉</span>';$('guardFlag').innerHTML=yesNo(ctl.guard&&ctl.guard.verifiedFlag);$('guardRuntime').innerHTML=(ctl.guard&&ctl.guard.runtimeReady)?'<span class="good">已就緒</span>':'<span class="bad">'+esc((ctl.guard&&ctl.guard.error)?translateError(ctl.guard.error):'尚未部署並驗證安全防護')+'</span>';
