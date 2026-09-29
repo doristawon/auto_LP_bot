@@ -57,12 +57,18 @@ export async function buildExactBalancedSwapPlan({
   const available = tokenIn === 0 ? rawAmount0 : rawAmount1;
   if (available <= 1n) return { direction: 'none', tokenIn: null, tokenOut: null, rawAmountIn: 0n, quote: null };
 
+  const probeAmount = available / 2n > MAX_UINT128 ? MAX_UINT128 : available / 2n;
+  const selected = quoter.selectSamePairSwapPool
+    ? await quoter.selectSamePairSwapPool(pool, tokenIn, probeAmount, slippageBps)
+    : { pool };
+  const swapPool = selected.pool;
+
   let lo = 1n;
   let hi = available < MAX_UINT128 ? available : MAX_UINT128;
   let best = null;
   for (let i = 0; i < iterations && lo <= hi; i++) {
     const mid = (lo + hi) >> 1n;
-    const quote = await quoter.quoteExactInputSingleRaw(pool, tokenIn, mid, slippageBps);
+    const quote = await quoter.quoteExactInputSingleRaw(swapPool, tokenIn, mid, slippageBps);
     if (BigInt(quote.rawAmountIn) !== mid) {
       throw new Error('Balancer quote input does not match the requested exact-input amount');
     }
@@ -108,6 +114,7 @@ export async function buildExactBalancedSwapPlan({
     tokenOut,
     rawAmountIn: best.mid,
     quote: best.quote,
+    swapPool,
     priceImpactBps: Number(best.impactBps),
     projectedRaw0: best.post0,
     projectedRaw1: best.post1

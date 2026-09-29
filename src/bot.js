@@ -279,6 +279,7 @@ export class AutoLpBot {
       autoRedeploy: this.config.enableAutoRedeploy,
       autoTopupEnabled: this.config.autoTopupEnabled,
       autoTopupSwapEnabled: this.config.autoTopupSwapEnabled,
+      externalSwapRoutesEnabled: this.config.externalSwapRoutesEnabled,
       executionPaused: this.executionPaused,
       cycleActive: this.cycleActive,
       nextMonitorAt: this.nextMonitorAt,

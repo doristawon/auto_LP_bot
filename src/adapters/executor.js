@@ -74,7 +74,7 @@ export class RebalanceExecutor {
     this.getUsdPrice = getUsdPrice;
     this.state = state;
     this.signer = config.privateKey ? new Wallet(config.privateKey, writeProvider) : null;
-    this.quoter = new V4QuoterAdapter(readProvider);
+    this.quoter = new V4QuoterAdapter(readProvider, undefined, config.externalSwapRoutesEnabled);
     this.router = new UniversalRouterAdapter(readProvider, config);
   }
 
@@ -288,12 +288,12 @@ export class RebalanceExecutor {
 
         const swapDeadline = this.deadline();
         const request = this.router.buildV4ExactInputSingle({
-          pool: plan.pool,
+          pool: executableSwapPlan.swapPool || plan.pool,
           quote: executableSwapPlan.quote,
           deadline: swapDeadline
         });
         await this.router.simulateV4ExactInputSingle({
-          pool: plan.pool,
+          pool: executableSwapPlan.swapPool || plan.pool,
           quote: executableSwapPlan.quote,
           deadline: swapDeadline,
           from: this.config.walletAddress
@@ -449,6 +449,7 @@ export class RebalanceExecutor {
         newPositionId: depositEvent.rangeId,
         withdrawHash: journal.tx.withdraw,
         swapHash: journal.tx.swap || null,
+        swapPoolId: journal.swapPlan?.swapPoolId || null,
         depositHash: journal.tx.deposit,
         initialWalletFundingRaw: journal.initialWalletFundingRaw,
         combinedFundingRaw: journal.combinedFundingRaw,
@@ -987,6 +988,7 @@ export class RebalanceExecutor {
         poolId: pool.id,
         positionId: position.id,
         swapHash: journal.tx.swap,
+        swapPoolId: executableSwapPlan?.swapPool?.id || null,
         depositHash: journal.tx.deposit,
         sharesBefore: validation.shares.toString(),
         sharesAfter: sharesAfter.toString(),
@@ -1080,7 +1082,7 @@ export class RebalanceExecutor {
       throw new Error('A priced swap is required for the post-swap pool preview');
     }
     const swapRequest = this.router.buildV4ExactInputSingle({
-      pool, quote: swapPlan.quote, deadline: this.deadline()
+      pool: swapPlan.swapPool || pool, quote: swapPlan.quote, deadline: this.deadline()
     });
     const calls = [
       ...approvalRequests.map(({ tx }) => ({
@@ -1108,7 +1110,7 @@ export class RebalanceExecutor {
     for (const entry of swapResult.logs || []) {
       try {
         const parsed = swapEventInterface.parseLog(entry);
-        if (String(parsed.args.id).toLowerCase() === pool.id.toLowerCase()) {
+        if (String(parsed.args.id).toLowerCase() === (swapPlan.swapPool || pool).id.toLowerCase()) {
           postSwapState = {
             tick: Number(parsed.args.tick),
             sqrtPriceX96: BigInt(parsed.args.sqrtPriceX96)
@@ -1117,7 +1119,11 @@ export class RebalanceExecutor {
       } catch {}
     }
     if (!postSwapState || postSwapState.sqrtPriceX96 <= 0n) {
-      throw new Error('Simulated V4 swap did not emit the destination pool price');
+      throw new Error('Simulated V4 swap did not emit the selected swap pool price');
+    }
+    if ((swapPlan.swapPool || pool).id.toLowerCase() !== pool.id.toLowerCase()) {
+      const lpState = await this.fables.readPoolState(pool);
+      postSwapState = { tick: lpState.tick, sqrtPriceX96: lpState.sqrtPriceX96 };
     }
     const raw0 = BigInt(erc20Interface.decodeFunctionResult('balanceOf', results.at(-2).returnData)[0]);
     const raw1 = BigInt(erc20Interface.decodeFunctionResult('balanceOf', results.at(-1).returnData)[0]);
@@ -1130,7 +1136,7 @@ export class RebalanceExecutor {
     }
     const deadline = this.deadline();
     const swapRequest = this.router.buildV4ExactInputSingle({
-      pool, quote: swapPlan.quote, deadline
+      pool: swapPlan.swapPool || pool, quote: swapPlan.quote, deadline
     });
     const depositData = this.fables.encodeDeposit(
       pool,
@@ -1227,7 +1233,7 @@ export class RebalanceExecutor {
     let swapRequest = null;
     if (swapPlan.direction !== 'none') {
       swapRequest = this.router.buildV4ExactInputSingle({
-        pool, quote: swapPlan.quote, deadline
+        pool: swapPlan.swapPool || pool, quote: swapPlan.quote, deadline
       });
       const swapApprovals = await this.buildTopUpApprovalRequests(pool, swapPlan, {
         amount0Max: 0n, amount1Max: 0n
@@ -1250,7 +1256,7 @@ export class RebalanceExecutor {
       for (const entry of swapReceipt.logs || []) {
         try {
           const event = swapEventInterface.parseLog(entry);
-          if (String(event.args.id).toLowerCase() === pool.id.toLowerCase()) {
+          if (String(event.args.id).toLowerCase() === (swapPlan.swapPool || pool).id.toLowerCase()) {
             swapPrice = {
               tick: Number(event.args.tick),
               sqrtPriceX96: BigInt(event.args.sqrtPriceX96)
@@ -1259,7 +1265,10 @@ export class RebalanceExecutor {
         } catch {}
       }
       if (!swapPrice || swapPrice.sqrtPriceX96 <= 0n) {
-        throw new Error('Sequential preflight swap did not emit the expected pool price');
+        throw new Error('Sequential preflight swap did not emit the selected pool price');
+      }
+      if ((swapPlan.swapPool || pool).id.toLowerCase() !== pool.id.toLowerCase()) {
+        swapPrice = { tick: poolState.tick, sqrtPriceX96: poolState.sqrtPriceX96 };
       }
       projected = swapPlan.tokenIn === 0
         ? { raw0: fundingScope.funding.raw0 - swapPlan.rawAmountIn,
@@ -1455,8 +1464,8 @@ export class RebalanceExecutor {
             ? quote
             : await this.quoteDirectRoute(route, entry.token, simAmount);
           try {
-            const request = this.router.buildV4ExactInputSingle({ pool: route[0], quote: simQuote, deadline: this.deadline() });
-            await this.router.simulateV4ExactInputSingle({ pool: route[0], quote: simQuote, deadline: request.deadline, from: this.config.walletAddress });
+            const request = this.router.buildV4ExactInputSingle({ pool: simQuote.swapPool || route[0], quote: simQuote, deadline: this.deadline() });
+            await this.router.simulateV4ExactInputSingle({ pool: simQuote.swapPool || route[0], quote: simQuote, deadline: request.deadline, from: this.config.walletAddress });
             simulation = { status: 'simulated', amountInRaw: simAmount.toString() };
           } catch (error) {
             simulation = { status: 'failed', amountInRaw: simAmount.toString(), error: error.message };
@@ -1471,7 +1480,7 @@ export class RebalanceExecutor {
           tokenOut: quote.tokenOut,
           rawAmountOut: quote.rawAmountOut,
           minRawAmountOut: quote.minRawAmountOut,
-          poolIds: route.map((pool) => pool.id),
+          poolIds: [quote.swapPool?.id || route[0].id],
           routerSimulation: simulation
         });
         const anchorAddress = anchorPlan.anchor.address.toLowerCase();
@@ -1502,13 +1511,13 @@ export class RebalanceExecutor {
       });
       let balanceSimulation = { status: 'not-required' };
       if (balancePlan.direction !== 'none') {
-        const request = this.router.buildV4ExactInputSingle({ pool: destinationPool, quote: balancePlan.quote, deadline: this.deadline() });
+        const request = this.router.buildV4ExactInputSingle({ pool: balancePlan.swapPool || destinationPool, quote: balancePlan.quote, deadline: this.deadline() });
         const inputAddress = balancePlan.tokenIn === 0 ? destinationPool.token0.address.toLowerCase() : destinationPool.token1.address.toLowerCase();
         const walletRaw = beforeBalances.get(inputAddress) || 0n;
         const scopedRaw = balancePlan.tokenIn === 0 ? destinationBalances.raw0 : destinationBalances.raw1;
         if (walletRaw >= scopedRaw && scopedRaw > 0n) {
           try {
-            await this.router.simulateV4ExactInputSingle({ pool: destinationPool, quote: balancePlan.quote, deadline: request.deadline, from: this.config.walletAddress });
+            await this.router.simulateV4ExactInputSingle({ pool: balancePlan.swapPool || destinationPool, quote: balancePlan.quote, deadline: request.deadline, from: this.config.walletAddress });
             balanceSimulation = { status: 'simulated', amountInRaw: balancePlan.rawAmountIn.toString() };
           } catch (error) {
             balanceSimulation = { status: 'failed', amountInRaw: balancePlan.rawAmountIn.toString(), error: error.message };
@@ -1598,12 +1607,15 @@ export class RebalanceExecutor {
     if (state.paused !== false || BigInt(state.liquidity || 0) <= 0n) {
       throw new Error('Direct route pool is paused or has no active liquidity');
     }
-    const quote = await this.quoter.quoteExactInputSingleRaw(routePool, address === token0 ? 0 : 1, amountIn, this.config.swapSlippageBps);
+    const selected = await this.quoter.selectSamePairSwapPool(
+      routePool, address === token0 ? 0 : 1, amountIn, this.config.swapSlippageBps
+    );
+    const quote = selected.quote;
     if (BigInt(quote.rawAmountIn) !== BigInt(amountIn) || BigInt(quote.minRawAmountOut) <= 0n) {
       throw new Error('Direct route quote is invalid or has zero minimum output');
     }
     const impactBps = this.assertQuotePriceImpact(routePool, quote, BigInt(amountIn), state);
-    return { ...quote, priceImpactBps: Number(impactBps) };
+    return { ...quote, swapPool: selected.pool, priceImpactBps: Number(impactBps) };
   }
 
   assertQuotePriceImpact(pool, quote, rawAmountIn, state, maxOverrideBps = null) {
@@ -1661,12 +1673,17 @@ export class RebalanceExecutor {
         return receipts[1].returnData;
       }
     } : null;
-    const quoter = quoteProvider ? new V4QuoterAdapter(quoteProvider, this.quoter.address) : this.quoter;
-    const quote = route.length === 1
-      ? await quoter.quoteExactInputSingleRaw(route[0],
+    const quoter = quoteProvider
+      ? new V4QuoterAdapter(quoteProvider, this.quoter.address, this.config.externalSwapRoutesEnabled)
+      : this.quoter;
+    const selected = route.length === 1
+      ? await quoter.selectSamePairSwapPool(route[0],
         tokenIn.address.toLowerCase() === route[0].token0.address.toLowerCase() ? 0 : 1,
         amountIn, this.config.swapSlippageBps)
-      : await quoter.quoteExactInputPathRaw(route, tokenIn, amountIn, this.config.swapSlippageBps);
+      : null;
+    const effectiveRoute = selected ? [selected.pool] : route;
+    const quote = selected?.quote
+      || await quoter.quoteExactInputPathRaw(route, tokenIn, amountIn, this.config.swapSlippageBps);
     if (BigInt(quote.rawAmountIn) !== amountIn || BigInt(quote.minRawAmountOut) <= 0n
       || quote.tokenOut.toLowerCase() !== cursor) {
       throw new Error('Cross-pool route quote amount or output does not match the selected path');
@@ -1676,10 +1693,10 @@ export class RebalanceExecutor {
     if (impactBps > BigInt(maxImpactBps)) {
       throw new Error(`Cross-pool route cost ${impactBps} bps exceeds ${maxImpactBps} bps`);
     }
-    const request = route.length === 1
-      ? this.router.buildV4ExactInputSingle({ pool: route[0], quote, deadline: this.deadline() })
+    const request = effectiveRoute.length === 1
+      ? this.router.buildV4ExactInputSingle({ pool: effectiveRoute[0], quote, deadline: this.deadline() })
       : this.router.buildV4ExactInputPath({ route, tokenIn, quote, deadline: this.deadline() });
-    return { route, tokenIn, quote, request, impactBps: Number(impactBps), rawAmountIn: amountIn };
+    return { route: effectiveRoute, tokenIn, quote, request, impactBps: Number(impactBps), rawAmountIn: amountIn };
   }
 
   async preflightCrossPoolSequence(plan, destinationPool) {
@@ -1813,7 +1830,7 @@ export class RebalanceExecutor {
       portfolioUsd, maxImpactBps, this.config.swapSlippageBps);
     const balanceSwap = balancePlan.direction === 'none' ? null : {
       plan: balancePlan,
-      request: this.router.buildV4ExactInputSingle({ pool: destinationPool, quote: balancePlan.quote, deadline })
+      request: this.router.buildV4ExactInputSingle({ pool: balancePlan.swapPool || destinationPool, quote: balancePlan.quote, deadline })
     };
     const projectedAfterSwaps = { ...destinationInventory };
     if (balanceSwap) {
@@ -1917,7 +1934,7 @@ export class RebalanceExecutor {
       throw new Error(`Swap pool is paused or illiquid at ${phase}`);
     }
     const quote = await this.quoter.quoteExactInputSingleRaw(
-      pool,
+      swapPlan.swapPool || pool,
       swapPlan.tokenIn,
       swapPlan.rawAmountIn,
       this.config.swapSlippageBps
@@ -2158,7 +2175,9 @@ export class RebalanceExecutor {
         oldPositionId: plan.manualIdle === true ? null : plan.position.id,
         newPositionId: depositEvent.rangeId,
         withdrawHash: journal.tx.withdraw, routeSwapHashes: routeHashes,
+        routeSwapPoolIds: preflight.routeSwaps.map((swap) => swap.route.map((routePool) => routePool.id)),
         balanceSwapHash: journal.tx.swap || null, depositHash: journal.tx.deposit,
+        balanceSwapPoolId: preflight.balanceSwap?.plan?.swapPool?.id || null,
         target, aprPct: plan.destinationStats?.aprPct ?? null
       });
       return { status: 'completed', withdrawHash: journal.tx.withdraw,
@@ -2751,6 +2770,7 @@ function serializeSwapPlan(plan) {
     tokenIn: plan.tokenIn,
     tokenOut: plan.tokenOut,
     rawAmountIn: plan.rawAmountIn?.toString?.() || '0',
+    swapPoolId: plan.swapPool?.id || null,
     quote: plan.quote || null
   };
 }

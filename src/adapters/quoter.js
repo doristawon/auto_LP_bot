@@ -3,14 +3,16 @@ import { V4_QUOTER_ABI } from '../abi.js';
 import { UNISWAP_V4_QUOTER } from '../constants.js';
 import { buildV4PathKeys } from '../execution/investment-target.js';
 import { poolKeyArgs } from './fables.js';
+import { externalSwapPool } from '../execution/swap-routes.js';
 
 const iface = new Interface(V4_QUOTER_ABI);
 const MAX_UINT128 = (1n << 128n) - 1n;
 
 export class V4QuoterAdapter {
-  constructor(provider, address = UNISWAP_V4_QUOTER) {
+  constructor(provider, address = UNISWAP_V4_QUOTER, externalRoutesEnabled = false) {
     this.provider = provider;
     this.address = address;
+    this.externalRoutesEnabled = externalRoutesEnabled;
   }
 
   async quoteExactInputSingle(pool, tokenInIndex, amountIn, slippageBps = 50) {
@@ -19,6 +21,24 @@ export class V4QuoterAdapter {
     if (tokenIn.decimals == null) throw new Error('Token decimals unavailable for quote');
     const rawAmountIn = parseUnits(decimalString(amountIn, tokenIn.decimals), tokenIn.decimals);
     return this.quoteExactInputSingleRaw(pool, tokenInIndex, rawAmountIn, slippageBps);
+  }
+
+  async selectSamePairSwapPool(pool, tokenInIndex, rawAmountIn, slippageBps = 50) {
+    const alternate = this.externalRoutesEnabled ? externalSwapPool(pool) : null;
+    if (!alternate) return { pool, quote: await this.quoteExactInputSingleRaw(pool, tokenInIndex, rawAmountIn, slippageBps) };
+    const [primary, external] = await Promise.allSettled([
+      this.quoteExactInputSingleRaw(pool, tokenInIndex, rawAmountIn, slippageBps),
+      this.quoteExactInputSingleRaw(alternate, tokenInIndex, rawAmountIn, slippageBps)
+    ]);
+    if (primary.status !== 'fulfilled' && external.status !== 'fulfilled') throw primary.reason;
+    if (primary.status !== 'fulfilled') return { pool: alternate, quote: external.value };
+    if (external.status !== 'fulfilled') return { pool, quote: primary.value };
+    // A material output advantage avoids route churn for tiny market moves and
+    // pays for any extra approval or execution gas before selecting the route.
+    return BigInt(external.value.rawAmountOut) * 10_000n
+      >= BigInt(primary.value.rawAmountOut) * 10_020n
+      ? { pool: alternate, quote: external.value }
+      : { pool, quote: primary.value };
   }
 
   async quoteExactInputSingleRaw(pool, tokenInIndex, rawAmountIn, slippageBps = 50) {

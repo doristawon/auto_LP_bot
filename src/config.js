@@ -143,6 +143,7 @@ export function loadConfig() {
     dryRun,
     enableLiveWrites,
     enableAutoRedeploy,
+    externalSwapRoutesEnabled: envBool('EXTERNAL_SWAP_ROUTES_ENABLED', false),
     autoTopupEnabled: envBool('AUTO_TOPUP_ENABLED', false),
     autoTopupSwapEnabled,
     autoTopupSwapPoolId,
