@@ -74,7 +74,8 @@ export class RebalanceExecutor {
     this.getUsdPrice = getUsdPrice;
     this.state = state;
     this.signer = config.privateKey ? new Wallet(config.privateKey, writeProvider) : null;
-    this.quoter = new V4QuoterAdapter(readProvider, undefined, config.externalSwapRoutesEnabled);
+    this.quoter = new V4QuoterAdapter(readProvider, undefined, config.externalSwapRoutesEnabled,
+      { getUsdPrice, maxGasGwei: config.maxGasGwei });
     this.router = new UniversalRouterAdapter(readProvider, config);
   }
 
@@ -1118,7 +1119,8 @@ export class RebalanceExecutor {
         }
       } catch {}
     }
-    if (!postSwapState || postSwapState.sqrtPriceX96 <= 0n) {
+    if ((swapPlan.swapPool || pool).protocol !== 'v3'
+      && (!postSwapState || postSwapState.sqrtPriceX96 <= 0n)) {
       throw new Error('Simulated V4 swap did not emit the selected swap pool price');
     }
     if ((swapPlan.swapPool || pool).id.toLowerCase() !== pool.id.toLowerCase()) {
@@ -1264,7 +1266,8 @@ export class RebalanceExecutor {
           }
         } catch {}
       }
-      if (!swapPrice || swapPrice.sqrtPriceX96 <= 0n) {
+      if ((swapPlan.swapPool || pool).protocol !== 'v3'
+        && (!swapPrice || swapPrice.sqrtPriceX96 <= 0n)) {
         throw new Error('Sequential preflight swap did not emit the selected pool price');
       }
       if ((swapPlan.swapPool || pool).id.toLowerCase() !== pool.id.toLowerCase()) {
@@ -1608,7 +1611,9 @@ export class RebalanceExecutor {
       throw new Error('Direct route pool is paused or has no active liquidity');
     }
     const selected = await this.quoter.selectSamePairSwapPool(
-      routePool, address === token0 ? 0 : 1, amountIn, this.config.swapSlippageBps
+      routePool, address === token0 ? 0 : 1, amountIn, this.config.swapSlippageBps,
+      { spotSqrtPriceX96: state.sqrtPriceX96,
+        maxPriceImpactBps: this.config.maxSwapPriceImpactBps }
     );
     const quote = selected.quote;
     if (BigInt(quote.rawAmountIn) !== BigInt(amountIn) || BigInt(quote.minRawAmountOut) <= 0n) {
@@ -1643,11 +1648,13 @@ export class RebalanceExecutor {
     let cursor = tokenIn.address.toLowerCase();
     let spotOutput = amountIn;
     const q192 = 1n << 192n;
+    let firstState = null;
     for (const pool of route) {
       if (pool.token0.address.toLowerCase() === ZERO_ADDRESS || pool.token1.address.toLowerCase() === ZERO_ADDRESS) {
         throw new Error('Native-token cross-pool route is not enabled');
       }
       const state = await this.fables.readPoolState(pool);
+      if (!firstState) firstState = state;
       if (state.paused !== false || BigInt(state.liquidity || 0) <= 0n) {
         throw new Error('Cross-pool route contains a paused or empty pool');
       }
@@ -1674,12 +1681,17 @@ export class RebalanceExecutor {
       }
     } : null;
     const quoter = quoteProvider
-      ? new V4QuoterAdapter(quoteProvider, this.quoter.address, this.config.externalSwapRoutesEnabled)
+      ? new V4QuoterAdapter(quoteProvider, this.quoter.address,
+        this.config.externalSwapRoutesEnabled,
+        { getUsdPrice: this.getUsdPrice, maxGasGwei: this.config.maxGasGwei },
+        this.quoter.v3ValidatedPools)
       : this.quoter;
     const selected = route.length === 1
       ? await quoter.selectSamePairSwapPool(route[0],
         tokenIn.address.toLowerCase() === route[0].token0.address.toLowerCase() ? 0 : 1,
-        amountIn, this.config.swapSlippageBps)
+        amountIn, this.config.swapSlippageBps,
+        { spotSqrtPriceX96: firstState.sqrtPriceX96,
+          maxPriceImpactBps: maxImpactBps })
       : null;
     const effectiveRoute = selected ? [selected.pool] : route;
     const quote = selected?.quote
@@ -1696,7 +1708,8 @@ export class RebalanceExecutor {
     const request = effectiveRoute.length === 1
       ? this.router.buildV4ExactInputSingle({ pool: effectiveRoute[0], quote, deadline: this.deadline() })
       : this.router.buildV4ExactInputPath({ route, tokenIn, quote, deadline: this.deadline() });
-    return { route: effectiveRoute, tokenIn, quote, request, impactBps: Number(impactBps), rawAmountIn: amountIn };
+    return { route: effectiveRoute, baseRoute: route, tokenIn, quote, request,
+      impactBps: Number(impactBps), maxImpactBps, rawAmountIn: amountIn };
   }
 
   async preflightCrossPoolSequence(plan, destinationPool) {
@@ -1933,14 +1946,16 @@ export class RebalanceExecutor {
     if (state.paused !== false || BigInt(state.liquidity || 0) <= 0n) {
       throw new Error(`Swap pool is paused or illiquid at ${phase}`);
     }
-    const quote = await this.quoter.quoteExactInputSingleRaw(
-      swapPlan.swapPool || pool,
-      swapPlan.tokenIn,
-      swapPlan.rawAmountIn,
-      this.config.swapSlippageBps
+    const selected = await this.quoter.selectSamePairSwapPool(
+      pool, swapPlan.tokenIn, swapPlan.rawAmountIn, this.config.swapSlippageBps,
+      { spotSqrtPriceX96: state.sqrtPriceX96,
+        maxPriceImpactBps: maxOverrideBps ?? this.config.maxSwapPriceImpactBps }
     );
+    const quote = selected.quote;
     const impactBps = this.assertQuotePriceImpact(pool, quote, swapPlan.rawAmountIn, state, maxOverrideBps);
-    return { ...swapPlan, quote: { ...quote, priceImpactBps: Number(impactBps) }, priceImpactBps: Number(impactBps), poolState: state };
+    return { ...swapPlan, swapPool: selected.pool,
+      quote: { ...quote, priceImpactBps: Number(impactBps) },
+      priceImpactBps: Number(impactBps), poolState: state };
   }
 
   async executeCrossPool(plan, destinationPool) {
@@ -1980,6 +1995,7 @@ export class RebalanceExecutor {
       for (const swap of preflight.routeSwaps) {
         await this.ensureSwapAllowances(swap.tokenIn, swap.rawAmountIn);
       }
+      let executedBalanceSwapPoolId = null;
       if (preflight.balanceSwap) {
         const token = preflight.balanceSwap.plan.tokenIn === 0
           ? destinationPool.token0 : destinationPool.token1;
@@ -2053,17 +2069,27 @@ export class RebalanceExecutor {
         if (oldShares !== 0n) throw new Error(`Old LP shares remain after cross-pool withdrawal: ${oldShares}`);
       }
       const routeHashes = [];
+      const executedRouteIds = [];
       for (const swap of preflight.routeSwaps) {
+        // Withdrawal changes source-pool liquidity. Re-quote and simulate the
+        // exact route again immediately before each live conversion.
+        const freshSwap = await this.quoteCrossPoolRoute(
+          swap.baseRoute, swap.tokenIn, swap.rawAmountIn, swap.maxImpactBps
+        );
+        await this.readProvider.call({ from: this.config.walletAddress,
+          to: freshSwap.request.router, data: freshSwap.request.data,
+          value: freshSwap.request.value });
         const beforeInput = await this.readRawTokenBalance(swap.tokenIn);
         const outputToken = [destinationPool.token0, destinationPool.token1]
-          .find((token) => token.address.toLowerCase() === swap.quote.tokenOut.toLowerCase());
+          .find((token) => token.address.toLowerCase() === freshSwap.quote.tokenOut.toLowerCase());
         if (!outputToken || beforeInput < swap.rawAmountIn) {
           throw new Error('Cross-pool conversion input or output token changed after withdrawal');
         }
         const beforeOutput = await this.readRawTokenBalance(outputToken);
         const receipt = await this.sendVerifiedTx({
           label: `crossPoolRoute:${swap.tokenIn.symbol}->${outputToken.symbol}`,
-          to: swap.request.router, data: swap.request.data, value: swap.request.value,
+          to: freshSwap.request.router, data: freshSwap.request.data,
+          value: freshSwap.request.value,
           onSent: (hash) => {
             phase = 'route_swap_sent';
             journal = this.patchJournal(journal, { phase,
@@ -2073,9 +2099,10 @@ export class RebalanceExecutor {
         const afterInput = await this.readRawTokenBalance(swap.tokenIn);
         const afterOutput = await this.readRawTokenBalance(outputToken);
         if (beforeInput - afterInput !== swap.rawAmountIn
-          || afterOutput - beforeOutput < BigInt(swap.quote.minRawAmountOut)) {
+          || afterOutput - beforeOutput < BigInt(freshSwap.quote.minRawAmountOut)) {
           throw new Error('Cross-pool route receipt balances differ from exact-input minOut');
         }
+        executedRouteIds.push(freshSwap.route.map((routePool) => routePool.id));
         routeHashes.push(receipt.hash || journal.tx.routeSwaps.at(-1));
         phase = 'route_swap_confirmed';
         journal = this.patchJournal(journal, { phase,
@@ -2084,16 +2111,28 @@ export class RebalanceExecutor {
       if (preflight.balanceSwap) {
         const beforeBalances = await this.readRawPairBalances(destinationPool);
         const swap = preflight.balanceSwap;
+        const refreshedPlan = await this.refreshSingleSwapQuote(destinationPool,
+          swap.plan, 'cross-pool-before-balance-swap',
+          plan.manualImmediate === true ? Number(plan.manualMaxCostBps)
+            : this.config.crossPoolMaxSwapPriceImpactBps);
+        const refreshedRequest = this.router.buildV4ExactInputSingle({
+          pool: refreshedPlan.swapPool || destinationPool,
+          quote: refreshedPlan.quote, deadline: this.deadline()
+        });
+        executedBalanceSwapPoolId = (refreshedPlan.swapPool || destinationPool).id;
+        await this.readProvider.call({ from: this.config.walletAddress,
+          to: refreshedRequest.router, data: refreshedRequest.data,
+          value: refreshedRequest.value });
         const receipt = await this.sendVerifiedTx({
-          label: 'crossPoolBalanceSwap', to: swap.request.router,
-          data: swap.request.data, value: swap.request.value,
+          label: 'crossPoolBalanceSwap', to: refreshedRequest.router,
+          data: refreshedRequest.data, value: refreshedRequest.value,
           onSent: (hash) => {
             phase = 'swap_sent';
             journal = this.patchJournal(journal, { phase, tx: { ...journal.tx, swap: hash } });
           }
         });
         const afterBalances = await this.readRawPairBalances(destinationPool);
-        this.assertSwapReceiptBalances(destinationPool, swap.plan, beforeBalances, afterBalances);
+        this.assertSwapReceiptBalances(destinationPool, refreshedPlan, beforeBalances, afterBalances);
         phase = 'swap_confirmed';
         journal = this.patchJournal(journal, { phase,
           tx: { ...journal.tx, swap: receipt.hash || journal.tx.swap } });
@@ -2175,9 +2214,9 @@ export class RebalanceExecutor {
         oldPositionId: plan.manualIdle === true ? null : plan.position.id,
         newPositionId: depositEvent.rangeId,
         withdrawHash: journal.tx.withdraw, routeSwapHashes: routeHashes,
-        routeSwapPoolIds: preflight.routeSwaps.map((swap) => swap.route.map((routePool) => routePool.id)),
+        routeSwapPoolIds: executedRouteIds,
         balanceSwapHash: journal.tx.swap || null, depositHash: journal.tx.deposit,
-        balanceSwapPoolId: preflight.balanceSwap?.plan?.swapPool?.id || null,
+        balanceSwapPoolId: executedBalanceSwapPoolId,
         target, aprPct: plan.destinationStats?.aprPct ?? null
       });
       return { status: 'completed', withdrawHash: journal.tx.withdraw,

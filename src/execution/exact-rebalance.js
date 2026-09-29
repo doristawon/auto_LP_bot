@@ -59,7 +59,8 @@ export async function buildExactBalancedSwapPlan({
 
   const probeAmount = available / 2n > MAX_UINT128 ? MAX_UINT128 : available / 2n;
   const selected = quoter.selectSamePairSwapPool
-    ? await quoter.selectSamePairSwapPool(pool, tokenIn, probeAmount, slippageBps)
+    ? await quoter.selectSamePairSwapPool(pool, tokenIn, probeAmount, slippageBps,
+      { spotSqrtPriceX96: sqrtX, maxPriceImpactBps })
     : { pool };
   const swapPool = selected.pool;
 
