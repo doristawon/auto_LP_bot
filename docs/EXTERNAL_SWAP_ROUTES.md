@@ -1,5 +1,8 @@
 # Uniswap v4 換幣路由（MOO / ORBIO）
 
+MOO 的 V3／V4 完整池地址、ETH 與 WETH 差異及 1–2k USDG 比價：
+見 [MOO 換幣池核對](MOO_SWAP_POOL_RESEARCH.md)。
+
 `EXTERNAL_SWAP_ROUTES_ENABLED=true` 時，機器人只對以下 Fables LP 的 USDG
 交易對比較外部 Uniswap v4 池。LP 取出、存入及區間政策仍使用原 Fables 池。
 
