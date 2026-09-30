@@ -90,6 +90,31 @@ async function withServer(fn) {
   }
 }
 
+test('single-pool switch queues behind observation and releases the flag after persistence', async () => {
+  await withServer(async ({ bot, calls }, base) => {
+    bot.cycleActive = true;
+    setTimeout(() => { bot.cycleActive = false; }, 40);
+    const response = await fetch(base + '/api/investment/allocation', { method: 'PUT',
+      headers: { origin: base, 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: false, allocations: [] }) });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).enabled, false);
+    assert.deepEqual(calls.allocation, [{ enabled: false, allocations: [] }]);
+    assert.equal(bot.allocationUpdatePending, false);
+  });
+});
+
+test('mode switch reports pending capital writes instead of silently changing the mode', async () => {
+  await withServer(async ({ bot, calls }, base) => {
+    bot.cycleActive = true; bot.executor = { hasPendingWrite: true };
+    const response = await fetch(base + '/api/investment/allocation', { method: 'PUT',
+      headers: { origin: base, 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: false, allocations: [] }) });
+    assert.equal(response.status, 409); assert.match((await response.json()).error, /錢包交易尚未完成/);
+    assert.equal(calls.allocation.length, 0); assert.equal(bot.allocationUpdatePending, false);
+  });
+});
+
 test('dashboard scan is observation-only and never requests execution', async () => {
   await withServer(async ({ calls }, base) => {
     const response = await fetch(base + '/api/control/scan', { method: 'POST', headers: { origin: base } });

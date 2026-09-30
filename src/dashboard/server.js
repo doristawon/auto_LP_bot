@@ -300,10 +300,27 @@ export class DashboardServer {
         if (typeof bot.setInvestmentAllocation !== 'function') {
           return sendJson(res, 503, { error: '兩池配置目前不可用，請稍後重試。' });
         }
-        const result = await bot.setInvestmentAllocation({ allocations: body.allocations, enabled: body.enabled });
-        return sendJson(res, 200, result);
-      } catch {
-        return sendJson(res, 400, { error: '兩池配置未儲存；請確認池子、比例與資金狀態。' });
+        if (bot.allocationUpdatePending) return sendJson(res, 409, { error: '模式切換正在處理，請稍候。' });
+        bot.allocationUpdatePending = true;
+        try {
+          const deadline = Date.now() + 45_000;
+          while ((bot.cycleActive || bot.initializing || bot.rpcManagementActive) && Date.now() < deadline) {
+            const journal = bot.state?.getSetting('activeRebalanceExecution', null);
+            if (bot.executor?.hasPendingWrite || (journal?.phase && !['completed', 'failed'].includes(journal.phase))) {
+              return sendJson(res, 409, { error: '錢包交易尚未完成，完成或復原後才能切換模式。' });
+            }
+            if (body.enabled === false && bot.executionPaused === true && !bot.initializing && !bot.rpcManagementActive) break;
+            await new Promise(resolve => setTimeout(resolve, 250));
+          }
+          const result = await bot.setInvestmentAllocation({ allocations: body.allocations, enabled: body.enabled });
+          return sendJson(res, 200, result);
+        } finally { bot.allocationUpdatePending = false; }
+      } catch (error) {
+        const message = String(error.message || '');
+        const safe = /current wallet operation|掃描|設定更新/.test(message) ? '目前掃描或設定更新中，請稍後再切換。'
+          : /queued wallet transactions|rebalance journal|execution|unfinished/.test(message) ? '錢包交易尚未完成，完成或復原後才能切換模式。'
+          : /^[資每啟目錢模]/.test(message) ? sanitize(message) : '兩池配置未儲存；請確認池子與比例。';
+        return sendJson(res, 409, { error: safe });
       }
     }
     if (req.method === 'POST' && url.pathname === '/api/control/rebalance') {

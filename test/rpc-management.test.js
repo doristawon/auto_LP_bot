@@ -170,7 +170,7 @@ test('retry initialize probes every configured URL after an earlier healthy-prov
         // Simulate a previous startup having reduced runtime providers to the
         // healthy public endpoint while config still retains both URLs.
         bot.providers = createProviders({ ...bot.config, rpcUrls: [publicUrl] });
-        bot.createExecutor = () => ({});
+        bot.createExecutor = () => ({ async reconcileStartupJournal() {} });
         bot.refreshMarket = async () => {};
         await bot.initialize();
         assert.equal(bot.rpcHealth.length, 2);

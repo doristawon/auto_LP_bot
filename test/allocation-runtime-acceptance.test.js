@@ -67,6 +67,32 @@ const balances = {
   [MOO]: { raw: units(500, 18), amount: 500 }
 };
 
+test('disabling allocation ignores stale paused pools and preserves saved ratios without revalidation', () => {
+  const { bot, pools, settings } = makeBot();
+  pools.forEach(pool => { pool.state = { paused: true, liquidity: 0n }; });
+  bot.applyStoredExecutionTarget = () => { bot.config.targetMode = 'allowlist'; };
+  const result = bot.setInvestmentAllocation({ enabled: false, allocations: [] });
+  assert.equal(result.enabled, false);
+  assert.equal(settings.get('investmentAllocation').allocations.length, 2);
+  assert.equal(bot.config.targetMode, 'allowlist');
+});
+
+test('queued mode change suppresses allocation writes', async () => {
+  const { bot, pools } = makeBot();
+  bot.allocationUpdatePending = true;
+  bot.getAllocationFundingScope = () => { throw new Error('must not plan capital writes'); };
+  assert.equal(await bot.runAllocationExecutionCycle(pools, []), null);
+});
+
+test('paused strategy can disable during a read-only cycle without enabling capital execution', () => {
+  const { bot } = makeBot();
+  bot.cycleActive = true; bot.executionPaused = true;
+  bot.applyStoredExecutionTarget = () => {};
+  assert.equal(bot.setInvestmentAllocation({ enabled: false }).enabled, false);
+  assert.equal(bot.executionPaused, true);
+  assert.throws(() => bot.setInvestmentAllocation({ enabled: true }), /目前掃描/);
+});
+
 test('Bot fresh allocation valuation uses pool-local spot orientation and includes LP fees', async () => {
   const { bot, pools } = makeBot();
   const result = await bot.refreshAllocationFundingSnapshot({ pools, walletBalances: balances, asOfBlock: 987 });
@@ -97,7 +123,7 @@ test('cached allocation GET returns scope copies without RPC and mutation fails 
   assert.deepEqual(calls, before, 'cached GET/scope must not make RPC calls');
   for (const busy of ['cycleActive', 'initializing', 'rpcManagementActive']) {
     bot[busy] = true;
-    assert.throws(() => bot.setInvestmentAllocation({ enabled: true }), /current wallet operation/);
+    assert.throws(() => bot.setInvestmentAllocation({ enabled: true }), /current wallet operation|目前掃描/);
     bot[busy] = false;
   }
   assert.equal(calls.saved, 0);
@@ -205,6 +231,7 @@ test('fresh allocation scan preserves LP range decoration for the top-up schedul
     position.outside = false;
     position.shouldRebalance = false;
   };
+  bot.getInvestmentAllocationSnapshot = () => ({ status: 'ready' });
   bot.getAllocationFundingScope = (poolId) => ({ availableUsdG: poolId === POOL_A ? 20 : 0, poolId,
     allocationUpdatedAt: 1234, tokenCaps: { [USDG]: '1000000', [CASHCAT]: '1000000' } });
   let topUpCalled = 0;
@@ -212,7 +239,7 @@ test('fresh allocation scan preserves LP range decoration for the top-up schedul
   const result = await bot.runAllocationExecutionCycle(pools, []);
   assert.equal(result?.status, 'completed');
   assert.equal(topUpCalled, 1, 'fresh range scan should retain inside/in-range eligibility');
-  assert.equal(decorateCalls, 2, 'the scheduled scan and post-top-up refresh both decorate the discovered position');
+  assert.equal(decorateCalls, 1, 'only post-top-up refresh rescans; the cycle uses its fresh input');
 });
 
 test('allocation bootstraps the empty second pool before topping up the first healthy pool', async () => {
@@ -225,6 +252,7 @@ test('allocation bootstraps the empty second pool before topping up the first he
   pools[0].positions = [{ id: 'healthy', shares: 1n, outside: false }];
   pools[1].positions = [];
   bot.refreshAllocationFundingSnapshot = async () => {};
+  bot.getInvestmentAllocationSnapshot = () => ({ status: 'ready' });
   bot.getAllocationFundingScope = (poolId) => ({ poolId, availableUsdG: 20 });
   const jobs = [];
   bot.executor = {

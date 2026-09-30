@@ -137,7 +137,8 @@ export function buildExactDepositPlan({
   tickLower,
   tickUpper,
   slippageBps = 50,
-  liquidityReserveBps = 10
+  liquidityReserveBps = 10,
+  tickToleranceTicks = 0
 }) {
   rawAmount0 = BigInt(rawAmount0);
   rawAmount1 = BigInt(rawAmount1);
@@ -145,13 +146,35 @@ export function buildExactDepositPlan({
   const sqrtA = getSqrtPriceAtTick(tickLower);
   const sqrtB = getSqrtPriceAtTick(tickUpper);
   let liquidity = getLiquidityForAmounts(sqrtX, sqrtA, sqrtB, rawAmount0, rawAmount1);
+  // Bound both token requirements across a price band, including range edges.
+  // The legacy k=0 calculation remains bit-for-bit unchanged.
+  if (!Number.isInteger(tickToleranceTicks) || tickToleranceTicks < -1 || tickToleranceTicks > 2000) {
+    throw new Error('Deposit tick tolerance must be -1 (adaptive) or 0..2000');
+  }
+  let worstLow = sqrtX, worstHigh = sqrtX;
+  if (tickToleranceTicks !== 0) {
+    let low = MIN_TICK, high = MAX_TICK;
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      if (getSqrtPriceAtTick(middle) <= sqrtX) low = middle; else high = middle - 1;
+    }
+    const distance = Math.max(0, Math.min(low - tickLower, tickUpper - low));
+    const tolerance = tickToleranceTicks === -1 ? Math.max(3, Math.ceil(distance / 10)) : tickToleranceTicks;
+    worstLow = getSqrtPriceAtTick(Math.max(MIN_TICK, low - tolerance));
+    worstHigh = getSqrtPriceAtTick(Math.min(MAX_TICK, low + tolerance + 1));
+    liquidity = minBigInt(liquidity, minBigInt(
+      getLiquidityForAmounts(worstLow, sqrtA, sqrtB, rawAmount0, rawAmount1),
+      getLiquidityForAmounts(worstHigh, sqrtA, sqrtB, rawAmount0, rawAmount1)));
+  }
   liquidity = bpsDown(liquidity, liquidityReserveBps);
   if (liquidity <= 0n) throw new Error('Exact deposit liquidity is zero');
   liquidity = assertUint128(liquidity, 'deposit liquidity');
 
   const required = getAmountsForLiquidity(sqrtX, sqrtA, sqrtB, liquidity, true);
-  const amount0Max = minBigInt(rawAmount0, bpsUp(required.amount0, slippageBps));
-  const amount1Max = minBigInt(rawAmount1, bpsUp(required.amount1, slippageBps));
+  const lowRequired = getAmountsForLiquidity(worstLow, sqrtA, sqrtB, liquidity, true);
+  const highRequired = getAmountsForLiquidity(worstHigh, sqrtA, sqrtB, liquidity, true);
+  const amount0Max = minBigInt(rawAmount0, bpsUp(lowRequired.amount0, slippageBps));
+  const amount1Max = minBigInt(rawAmount1, bpsUp(highRequired.amount1, slippageBps));
   return {
     provisional: false,
     basis: 'post-swap raw balances / BigInt Q64.96 fixed-point',

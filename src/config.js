@@ -62,6 +62,10 @@ export function loadConfig() {
   const autoTopupDustBps = envInt('AUTO_TOPUP_DUST_BPS', 25);
   const autoTopupMinIntervalSec = envInt('AUTO_TOPUP_MIN_INTERVAL_SEC', 1800);
   const topUpMinGasReserveWei = parseEther(process.env.AUTO_TOPUP_MIN_GAS_ETH?.trim() || '0.0002');
+  const depositTickTolerance = envInt('DEPOSIT_TICK_TOLERANCE', -1);
+  if (!Number.isInteger(depositTickTolerance) || depositTickTolerance < -1 || depositTickTolerance > 2000) {
+    throw new Error('DEPOSIT_TICK_TOLERANCE must be -1 or 0..2000');
+  }
 
   if (!rpcUrls.length) throw new Error('RPC_URLS must contain at least one endpoint');
   if (!Number.isSafeInteger(rpcRequestTimeoutMs) || rpcRequestTimeoutMs < 1_000 || rpcRequestTimeoutMs > 300_000) {
@@ -184,6 +188,7 @@ export function loadConfig() {
     depositSlippageBps,
     withdrawSlippageBps,
     depositLiquidityReserveBps: envInt('DEPOSIT_LIQUIDITY_RESERVE_BPS', 10),
+    depositTickTolerance,
     fablesWalk: envInt('FABLES_WALK', 1000),
     permit2ExpirationSec: envInt('PERMIT2_EXPIRATION_SEC', 30 * 24 * 60 * 60),
     eip7702GuardAddress,

@@ -31,7 +31,7 @@ const position = {
   rebalanceReason: 'oor_delay_confirmed'
 };
 
-function createHarness({ failSwap = false, failPreflight = false } = {}) {
+function createHarness({ failSwap = false, failPreflight = false, failWithdraw = false } = {}) {
   const events = [];
   const settings = new Map();
   const balances = [
@@ -73,6 +73,7 @@ function createHarness({ failSwap = false, failPreflight = false } = {}) {
       swapSlippageBps: 50,
       depositSlippageBps: 50,
       depositLiquidityReserveBps: 10,
+      depositTickTolerance: 0,
       autoTopupDustBps: 25,
       usdgAddress: pool.token1.address,
       tightWidthBps: 120,
@@ -101,6 +102,7 @@ function createHarness({ failSwap = false, failPreflight = false } = {}) {
   executor.readPositionShares = async (_pool, rangeId) => rangeId === position.id ? 0n : 5_000_000_000_000_000n;
   executor.ensureSwapAllowances = async () => {};
   executor.ensureHookAllowance = async () => {};
+  executor.assertExactHookAllowance = async () => {};
   executor.getPinnedFeeOverrides = async () => ({ gasPrice: 1n });
   executor.assertTopUpGasBudget = async () => {};
   executor.preflightSamePoolSequence = async () => {
@@ -137,6 +139,11 @@ function createHarness({ failSwap = false, failPreflight = false } = {}) {
     sent++;
     const hash = '0x' + sent.toString(16).padStart(64, '0');
     if (onSent) onSent(hash);
+    if (failWithdraw && label === 'guardedWithdrawAndClaim') {
+      const error = new Error('confirmed withdraw revert');
+      error.code = 'TRANSACTION_REVERTED'; error.receipt = { hash, status: 0, blockNumber: 100 };
+      throw error;
+    }
     if (failSwap && label === 'v4SwapExactInputSingle') throw new Error('mock swap failure');
     if (label === 'v4SwapExactInputSingle') {
       const before = balances.at(-1);
@@ -170,6 +177,21 @@ function createHarness({ failSwap = false, failPreflight = false } = {}) {
     postSwapBalance: () => postSwapBalance
   };
 }
+
+test('confirmed first-capital revert reaches reconciliation instead of freezing an unchanged wallet', async () => {
+  const { executor, settings, sentCount } = createHarness({ failWithdraw: true });
+  let checked = false;
+  executor.reconcileConfirmedNoOp = async ({ phase, baseline, error, journal }) => {
+    checked = true;
+    assert.equal(phase, 'withdraw_sent'); assert.equal(error.receipt.status, 0);
+    assert.equal(baseline.raw0, '10000000000000000000');
+    executor.patchJournal(journal, { phase: 'failed' });
+    return true;
+  };
+  const result = await executor.execute({ pool: structuredClone(pool), position: { ...position }, currentTick: 1100 });
+  assert.equal(result.status, 'deferred'); assert.equal(checked, true);
+  assert.equal(sentCount(), 1); assert.equal(settings.get('activeRebalanceExecution').phase, 'failed');
+});
 
 test('full executor advances only after receipts and completes with new LP shares', async () => {
   const { executor, events, settings, sentCount, depositedLiquidity, postSwapBalance } = createHarness();

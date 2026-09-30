@@ -284,6 +284,12 @@ test('actual same-pool allocation bootstrap scopes both assets with no conversio
   assert.deepEqual(preview.routeSwaps, []);
   assert.ok(preview.balanceSwap === null || typeof preview.balanceSwap === 'object');
   assert.ok(preview.funding.every((entry) => BigInt(entry.maxSpendRaw) <= BigInt(scope.tokenCaps[entry.address].rawCap)));
+  settings.set('allocationDepositFailures', { [POOL]: { count: 1, at: Date.now() } });
+  const recovered = await executor.preflightCrossPoolSequence(plan, bootstrapPool);
+  assert.equal(recovered.recoverExistingPair, true);
+  assert.equal(recovered.balanceSwap, null, 'confirmed failed-deposit recovery must reuse existing pair inventory');
+  assert.equal(recovered.preparedCapitalCalls.length, 1);
+  assert.equal(recovered.preparedCapitalCalls[0].to, bootstrapPool.key.hooks);
 });
 
 test('allocation bootstrap refits refreshed swap output within unchanged exact approval and funding caps', async () => {
@@ -428,6 +434,21 @@ test('allocation deposits retain one percent liquidity headroom without changing
   settings.set('investmentAllocation',{version:1,enabled:false,allocations:[]});
   executor.config.depositLiquidityReserveBps=10;
   assert.equal(executor.getDepositLiquidityReserveBps(),10);
+});
+
+test('deposit recovery preference requires a prior confirmed-failure marker and both pair tokens', () => {
+  const {executor,settings}=makeExecutor();
+  assert.equal(executor.shouldRecoverAllocationWithExistingPair(pool,{raw0:1n,raw1:1n}),false);
+  settings.set('allocationDepositFailures',{[POOL]:{count:1,at:Date.now()}});
+  executor.config.usdgAddress = USDG;
+  const valued = { ...pool, token0: { ...pool.token0, decimals: 18 }, token1: { ...pool.token1, decimals: 18 },
+    state: { sqrtPriceX96: getSqrtPriceAtTick(0) } };
+  assert.equal(executor.shouldRecoverAllocationWithExistingPair(valued,{raw0:20n*10n**18n,raw1:20n*10n**18n}),true);
+  assert.equal(executor.shouldRecoverAllocationWithExistingPair(valued,{raw0:20n*10n**18n,raw1:1n}),false);
+  settings.set('allocationDepositFailures',{[POOL]:{count:1,at:Date.now()-3_600_001}});
+  assert.equal(executor.shouldRecoverAllocationWithExistingPair(valued,{raw0:20n*10n**18n,raw1:20n*10n**18n}),false);
+  assert.equal(executor.shouldRecoverAllocationWithExistingPair(pool,{raw0:1n,raw1:0n}),false);
+  assert.equal(executor.shouldRecoverAllocationWithExistingPair({id:OTHER},{raw0:1n,raw1:1n}),false);
 });
 
 test('actual wallet write queue is serial and reports active and queued writes', async () => {

@@ -99,7 +99,8 @@ export async function fetchBlockscoutPage(path, query, { apiKey = '' } = {}) {
     const { stdout } = await execFileAsync('powershell.exe', [
       '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script
     ], {
-      env: { ...process.env, LP_BOT_EXPLORER_URL: url.toString() },
+      env: { ...Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+        /^(?:path|systemroot|windir|temp|tmp|pathext)$/i.test(key))), LP_BOT_EXPLORER_URL: url.toString() },
       timeout: 30_000,
       maxBuffer: 8 * 1024 * 1024,
       windowsHide: true

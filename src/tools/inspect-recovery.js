@@ -3,6 +3,7 @@ import { loadConfig } from '../config.js';
 import { StateStore } from '../state.js';
 import { createProviders, verifyProviders } from '../rpc/providers.js';
 import { resolveWalletStorage } from './wallet-storage.js';
+import { journalTransactions } from '../execution/journal-transactions.js';
 
 loadDotEnv();
 const config = loadConfig();
@@ -13,11 +14,10 @@ if (!journal) {
   console.log(JSON.stringify({ ok: true, status: 'no-pending-execution' }, null, 2));
   process.exit(0);
 }
-const { readProvider, rawProviders } = createProviders(config);
+const { readProvider, writeProvider, rawProviders } = createProviders(config);
 await verifyProviders(rawProviders, config.chainId);
 const receipts = {};
-for (const [phase, hash] of Object.entries(journal.tx || {})) {
-  if (!hash) continue;
+for (const { phase, hash } of journalTransactions(journal)) {
   const receipt = await readProvider.getTransactionReceipt(hash);
   receipts[phase] = receipt ? {
     hash,
@@ -35,3 +35,4 @@ console.log(JSON.stringify({
     ? 'Automatic new writes are locked. Review token balances and receipts before clearing or resuming this execution.'
     : 'An unfinished execution journal exists; do not start a new rebalance.'
 }, null, 2));
+for (const provider of new Set([readProvider, writeProvider, ...rawProviders])) provider.destroy();

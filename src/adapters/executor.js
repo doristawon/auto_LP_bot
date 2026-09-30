@@ -535,7 +535,8 @@ export class RebalanceExecutor {
         tickLower: finalTarget.tickLower,
         tickUpper: finalTarget.tickUpper,
         slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.getDepositLiquidityReserveBps()
+        liquidityReserveBps: this.getDepositLiquidityReserveBps(),
+        tickToleranceTicks: this.config.depositTickTolerance ?? -1
       });
       if (exactDeposit.liquidity <= 0n || exactDeposit.liquidity > MAX_UINT128) {
         throw new Error('Exact deposit liquidity is invalid');
@@ -543,6 +544,7 @@ export class RebalanceExecutor {
       await this.ensureHookAllowance(plan.pool.token0, plan.pool.key.hooks, exactDeposit.amount0Max);
       await this.ensureHookAllowance(plan.pool.token1, plan.pool.key.hooks, exactDeposit.amount1Max);
 
+      const approvedDepositCaps = { amount0Max: exactDeposit.amount0Max, amount1Max: exactDeposit.amount1Max };
       // Any allowance transaction, mempool delay, or swap can move the market.
       // Re-read slot0 immediately before deposit and rebuild range/liquidity/caps.
       postSwapState = await this.fables.readPoolState(plan.pool);
@@ -553,18 +555,22 @@ export class RebalanceExecutor {
         this.config.rangePreset
       );
       exactDeposit = buildExactDepositPlan({
-        rawAmount0: strategyInventory.raw0,
-        rawAmount1: strategyInventory.raw1,
+        rawAmount0: minBigIntLocal(strategyInventory.raw0, approvedDepositCaps.amount0Max),
+        rawAmount1: minBigIntLocal(strategyInventory.raw1, approvedDepositCaps.amount1Max),
         sqrtPriceX96: postSwapState.sqrtPriceX96,
         tickLower: finalTarget.tickLower,
         tickUpper: finalTarget.tickUpper,
         slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.getDepositLiquidityReserveBps()
+        liquidityReserveBps: this.getDepositLiquidityReserveBps(),
+        tickToleranceTicks: this.config.depositTickTolerance ?? -1
       });
       if (exactDeposit.liquidity <= 0n || exactDeposit.liquidity > MAX_UINT128) {
         throw new Error('Recomputed exact deposit liquidity is invalid');
       }
 
+      exactDeposit = { ...exactDeposit, ...approvedDepositCaps };
+      await this.assertExactHookAllowance(plan.pool.token0, plan.pool.key.hooks, exactDeposit.amount0Max);
+      await this.assertExactHookAllowance(plan.pool.token1, plan.pool.key.hooks, exactDeposit.amount1Max);
       const depositDeadline = this.deadline();
       const depositData = this.fables.encodeDeposit(
         plan.pool,
@@ -675,6 +681,14 @@ export class RebalanceExecutor {
         target: finalTarget
       };
     } catch (error) {
+      try {
+        if (await this.reconcileConfirmedNoOp({ pool: plan.pool, journal, error, phase,
+          baseline: journal.preBalancesRaw, position: plan.position })) {
+          return { status: 'deferred', reason: 'confirmed revert; balances and shares unchanged' };
+        }
+      } catch (reconcileError) {
+        this.ledger.append('rebalance.reconciliation_blocked', { error: reconcileError.message });
+      }
       const afterCapitalMoved = error.code === 'BROADCAST_OUTCOME_UNCERTAIN' || [
         'withdraw_sent',
         'withdraw_confirmed',
@@ -813,7 +827,8 @@ export class RebalanceExecutor {
         tickLower: Number(position.tickLower),
         tickUpper: Number(position.tickUpper),
         slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.getDepositLiquidityReserveBps()
+        liquidityReserveBps: this.getDepositLiquidityReserveBps(),
+        tickToleranceTicks: this.config.depositTickTolerance ?? -1
       });
       this.assertValidDeposit(optionalSwapDepositPlan, 'Projected top-up deposit liquidity is invalid');
     } catch (error) {
@@ -829,7 +844,8 @@ export class RebalanceExecutor {
         tickLower: Number(position.tickLower),
         tickUpper: Number(position.tickUpper),
         slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.getDepositLiquidityReserveBps()
+        liquidityReserveBps: this.getDepositLiquidityReserveBps(),
+        tickToleranceTicks: this.config.depositTickTolerance ?? -1
       });
     } catch (error) {
       depositOnlyError = error.message;
@@ -1255,6 +1271,15 @@ export class RebalanceExecutor {
       this.ledger.append('rebalance.top_up_completed', result);
       return result;
     } catch (error) {
+      try {
+        if (await this.reconcileConfirmedNoOp({ pool, journal, error, phase,
+          baseline: journal.postSwapBalancesRaw || stringifyRawBalances(initialBalances),
+          position: { ...position, shares: journal.position.sharesBefore } })) {
+          return { status: 'deferred', reason: 'confirmed revert; balances and shares unchanged' };
+        }
+      } catch (reconcileError) {
+        this.ledger.append('rebalance.reconciliation_blocked', { error: reconcileError.message });
+      }
       const capitalMayHaveMoved = error.code === 'BROADCAST_OUTCOME_UNCERTAIN' || [
         'swap_sent', 'swap_confirmed', 'deposit_sent', 'deposit_confirmed'
       ].includes(phase);
@@ -1566,7 +1591,8 @@ export class RebalanceExecutor {
       tickLower: finalTarget.tickLower,
       tickUpper: finalTarget.tickUpper,
       slippageBps: this.config.depositSlippageBps,
-      liquidityReserveBps: this.getDepositLiquidityReserveBps()
+      liquidityReserveBps: this.getDepositLiquidityReserveBps(),
+        tickToleranceTicks: this.config.depositTickTolerance ?? -1
     });
     this.assertValidDeposit(depositPlan, 'Sequential preflight deposit plan is invalid');
     const fullApprovals = await this.buildTopUpApprovalRequests(pool, swapPlan, depositPlan);
@@ -1806,7 +1832,8 @@ export class RebalanceExecutor {
         tickLower: targetRange.tickLower,
         tickUpper: targetRange.tickUpper,
         slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.getDepositLiquidityReserveBps()
+        liquidityReserveBps: this.getDepositLiquidityReserveBps(),
+        tickToleranceTicks: this.config.depositTickTolerance ?? -1
       });
       this.assertValidDeposit(depositPlan, 'Cross-pool dry-run deposit liquidity is invalid');
       const output = {
@@ -2084,7 +2111,11 @@ export class RebalanceExecutor {
     };
     const initialTarget = buildTargetRange(destinationState.tick, destinationPool.key.tickSpacing,
       this.config.tightWidthBps, this.config.rangePreset);
-    const balancePlan = await buildExactBalancedSwapPlan({
+    const recoverExistingPair = allocationBootstrap
+      && this.shouldRecoverAllocationWithExistingPair({ ...destinationPool, state: destinationState }, destinationInventory);
+    const balancePlan = recoverExistingPair
+      ? { direction: 'none', tokenIn: null, tokenOut: null, rawAmountIn: 0n, quote: null }
+      : await buildExactBalancedSwapPlan({
       pool: destinationPool, quoter: this.quoter,
       rawAmount0: destinationInventory.raw0, rawAmount1: destinationInventory.raw1,
       sqrtPriceX96: destinationState.sqrtPriceX96,
@@ -2182,7 +2213,8 @@ export class RebalanceExecutor {
       sqrtPriceX96: finalPrice.sqrtPriceX96,
       tickLower: finalTarget.tickLower, tickUpper: finalTarget.tickUpper,
       slippageBps: this.config.depositSlippageBps,
-      liquidityReserveBps: this.getDepositLiquidityReserveBps()
+      liquidityReserveBps: this.getDepositLiquidityReserveBps(),
+        tickToleranceTicks: this.config.depositTickTolerance ?? -1
     });
     this.assertValidDeposit(depositPlan, 'Cross-pool sequence deposit plan is invalid');
     if (allocationBootstrap) depositPlan = { ...depositPlan,
@@ -2211,7 +2243,7 @@ export class RebalanceExecutor {
       positionId: idleWallet ? null : plan.position.id, withdrawCall, before, postWithdraw, funding,
       scopedBefore: allocationBootstrap ? scopedBefore : null,
       withdrawnRaw: { raw0: withdrawn[0].toString(), raw1: withdrawn[1].toString() },
-      routeSwaps, balanceSwap, depositPlan, finalTarget, deadline,
+      routeSwaps, balanceSwap, depositPlan, finalTarget, deadline, recoverExistingPair,
       preparedCapitalCalls: allocationBootstrap ? [...swapCalls,
         { to: destinationPool.key.hooks, data: depositData, value: 0n,
           gasLimit: Number(TOP_UP_DEPOSIT_GAS_LIMIT) }] : null,
@@ -2298,7 +2330,8 @@ export class RebalanceExecutor {
         sqrtPriceX96: price.sqrtPriceX96,
         tickLower: prepared.finalTarget.tickLower, tickUpper: prepared.finalTarget.tickUpper,
         slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.getDepositLiquidityReserveBps()
+        liquidityReserveBps: this.getDepositLiquidityReserveBps(),
+        tickToleranceTicks: this.config.depositTickTolerance ?? -1
       });
       executableDeposit = { ...refit, amount0Max: caps[0], amount1Max: caps[1] };
       this.assertValidDeposit(executableDeposit, 'Refitted allocation deposit liquidity is invalid');
@@ -2345,6 +2378,21 @@ export class RebalanceExecutor {
       return this.config.autoTopupMaxSwapPriceImpactBps ?? this.config.maxSwapPriceImpactBps ?? 200;
     }
     return this.samePoolRebalanceMaxImpactBps(pool);
+  }
+
+  shouldRecoverAllocationWithExistingPair(pool, inventory) {
+    const failure = this.state?.getSetting('allocationDepositFailures', {})?.[pool.id];
+    const age = Date.now() - Number(failure?.at || 0);
+    if (!(Number(failure?.count || 0) > 0) || age < 0 || age >= 3_600_000
+      || BigInt(inventory.raw0) <= 0n || BigInt(inventory.raw1) <= 0n) return false;
+    try {
+      const { tokenAddress, priceUsdG } = usdGAssetPriceFromPool(pool, this.config.usdgAddress);
+      const values = [pool.token0, pool.token1].map((token, index) =>
+        Number(formatUnits(index === 0 ? inventory.raw0 : inventory.raw1, token.decimals))
+          * (token.address.toLowerCase() === tokenAddress ? priceUsdG : 1));
+      const minimum = Number(this.config.autoTopupMinIdleUsd ?? 25) / 2;
+      return values.every(value => Number.isFinite(value) && value >= minimum);
+    } catch { return false; }
   }
 
   getDepositLiquidityReserveBps() {
@@ -2425,6 +2473,11 @@ export class RebalanceExecutor {
       target: preflight.finalTarget,
       mintedLiquidity: preflight.mintedLiquidity,
       simulatedGasUsed: preflight.simulatedGasUsed,
+      recoverExistingPair: preflight.recoverExistingPair,
+      simulatedCallCount: preflight.simulatedCallCount,
+      scopedBeforeRaw: serializeAddressBalances(preflight.scopedBefore),
+      depositFailureMarker: this.state?.getSetting('allocationDepositFailures', {})?.[pool.id] || null,
+      balanceSwap: preflight.balanceSwap ? serializeSwapPlan(preflight.balanceSwap.plan) : null,
       pendingApprovalCount: preflight.pendingApprovalCount
     };
   }
@@ -2693,35 +2746,45 @@ export class RebalanceExecutor {
         sqrtPriceX96: destinationState.sqrtPriceX96,
         tickLower: target.tickLower, tickUpper: target.tickUpper,
         slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.getDepositLiquidityReserveBps()
+        liquidityReserveBps: this.getDepositLiquidityReserveBps(),
+        tickToleranceTicks: this.config.depositTickTolerance ?? -1
       });
       this.assertValidDeposit(depositPlan, 'Actual cross-pool deposit plan is invalid');
-      const allocationDepositCaps = plan.allocationBootstrap === true
-        ? { amount0Max: inventory.raw0, amount1Max: inventory.raw1 } : null;
-      if (allocationDepositCaps) depositPlan = { ...depositPlan, ...allocationDepositCaps };
-      await this.ensureHookAllowance(destinationPool.token0, destinationPool.key.hooks,
-        depositPlan.amount0Max);
-      await this.ensureHookAllowance(destinationPool.token1, destinationPool.key.hooks,
-        depositPlan.amount1Max);
+      const approvedCaps = plan.allocationBootstrap === true
+        ? { amount0Max: BigInt(preflight.depositPlan.amount0Max), amount1Max: BigInt(preflight.depositPlan.amount1Max) }
+        : { amount0Max: depositPlan.amount0Max, amount1Max: depositPlan.amount1Max };
+      if (plan.allocationBootstrap !== true) {
+        await this.ensureHookAllowance(destinationPool.token0, destinationPool.key.hooks, approvedCaps.amount0Max);
+        await this.ensureHookAllowance(destinationPool.token1, destinationPool.key.hooks, approvedCaps.amount1Max);
+      }
       destinationState = await this.fables.readPoolState(destinationPool);
       if (destinationState.paused !== false) throw new Error('Destination pool paused after deposit approvals');
       target = buildTargetRange(destinationState.tick, destinationPool.key.tickSpacing,
         this.config.tightWidthBps, this.config.rangePreset);
       depositPlan = buildExactDepositPlan({
-        rawAmount0: inventory.raw0, rawAmount1: inventory.raw1,
+        rawAmount0: minBigIntLocal(inventory.raw0, approvedCaps.amount0Max),
+        rawAmount1: minBigIntLocal(inventory.raw1, approvedCaps.amount1Max),
         sqrtPriceX96: destinationState.sqrtPriceX96,
         tickLower: target.tickLower, tickUpper: target.tickUpper,
         slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.getDepositLiquidityReserveBps()
+        liquidityReserveBps: this.getDepositLiquidityReserveBps(),
+        tickToleranceTicks: this.config.depositTickTolerance ?? -1
       });
-      if (allocationDepositCaps) depositPlan = { ...depositPlan, ...allocationDepositCaps };
+      depositPlan = { ...depositPlan, ...approvedCaps,
+        liquidity: plan.allocationBootstrap === true
+          ? minBigIntLocal(depositPlan.liquidity, preflight.depositPlan.liquidity) : depositPlan.liquidity };
       this.assertValidDeposit(depositPlan, 'Refreshed cross-pool deposit plan is invalid');
-      await this.ensureHookAllowance(destinationPool.token0, destinationPool.key.hooks,
-        depositPlan.amount0Max);
-      await this.ensureHookAllowance(destinationPool.token1, destinationPool.key.hooks,
-        depositPlan.amount1Max);
-      const depositData = this.fables.encodeDeposit(destinationPool, target,
-        depositPlan.liquidity, depositPlan.amount0Max, depositPlan.amount1Max, this.deadline());
+      await this.assertExactHookAllowance(destinationPool.token0, destinationPool.key.hooks, depositPlan.amount0Max);
+      await this.assertExactHookAllowance(destinationPool.token1, destinationPool.key.hooks, depositPlan.amount1Max);
+      const depositDeadline = this.deadline();
+      const fittedDeposit = await this.simulateScopedDepositSequence([
+        { to: destinationPool.key.hooks, value: 0n, gasLimit: Number(TOP_UP_DEPOSIT_GAS_LIMIT),
+          data: this.fables.encodeDeposit(destinationPool, target, depositPlan.liquidity,
+            depositPlan.amount0Max, depositPlan.amount1Max, depositDeadline) }
+      ], depositPlan, (liquidity) => this.fables.encodeDeposit(destinationPool, target,
+        liquidity, depositPlan.amount0Max, depositPlan.amount1Max, depositDeadline));
+      depositPlan = fittedDeposit.depositPlan;
+      const depositData = fittedDeposit.calls[0].data;
       let allocationDepositBefore = null;
       if (plan.allocationBootstrap === true) {
         this.assertAllocationJobCurrent(destinationPool, plan.allocationFundingScope);
@@ -2766,6 +2829,11 @@ export class RebalanceExecutor {
         allocationRemainingRaw: allocationDepositReceipt?.remaining || null,
         newPosition: { id: depositEvent.rangeId, shares: shares.toString(), target } });
       this.clearJournal();
+      if (plan.allocationBootstrap === true) {
+        const failures = { ...this.state.getSetting('allocationDepositFailures', {}) };
+        delete failures[destinationPool.id];
+        this.state.setSetting('allocationDepositFailures', failures);
+      }
       this.ledger.append('rebalance.cross_pool_completed', {
         manualIdle: plan.manualIdle === true,
         sourcePoolId: plan.pool.id, destinationPoolId: destinationPool.id,
@@ -2785,6 +2853,18 @@ export class RebalanceExecutor {
         routeSwapHashes: routeHashes, swapHash: journal.tx.swap || null,
         depositHash: journal.tx.deposit, newPositionId: depositEvent.rangeId, target };
     } catch (error) {
+      if (plan.allocationBootstrap === true && phase === 'swap_sent') {
+        try {
+          const raw = journal.allocationPhysicalBaselineRaw;
+          if (raw && await this.reconcileConfirmedNoOp({ pool: destinationPool, journal, error, phase,
+            baseline: { raw0: raw[destinationPool.token0.address.toLowerCase()],
+              raw1: raw[destinationPool.token1.address.toLowerCase()] } })) {
+            return { status: 'deferred', reason: 'confirmed revert; scoped funds unchanged' };
+          }
+        } catch (reconcileError) {
+          this.ledger.append('rebalance.reconciliation_blocked', { error: reconcileError.message });
+        }
+      }
       let deferred = false;
       if (plan.allocationBootstrap === true && phase === 'deposit_sent') {
         try { deferred = await this.deferConfirmedAllocationDepositFailure(plan, destinationPool,
@@ -2811,6 +2891,65 @@ export class RebalanceExecutor {
       }
       throw error;
     }
+  }
+
+  async reconcileConfirmedNoOp({ pool, journal, error, phase, baseline, position = null }) {
+    const receipt = error?.receipt;
+    const hashKey = { withdraw_sent: 'withdraw', swap_sent: 'swap', deposit_sent: 'deposit' }[phase];
+    if (!hashKey || !baseline || error.code !== 'TRANSACTION_REVERTED' || receipt?.status !== 0
+      || !journal.tx?.[hashKey] || String(receipt.hash).toLowerCase() !== String(journal.tx[hashKey]).toLowerCase()
+      || !Number.isSafeInteger(receipt.blockNumber) || receipt.blockNumber <= 0
+      || journal.tx?.routeSwaps?.length || (hashKey !== 'withdraw' && journal.tx?.withdraw)
+      || (hashKey !== 'swap' && journal.tx?.swap)) return false;
+    const now = Date.now(), failures = this.state.getSetting('confirmedRevertFailures', {}), old = failures[pool.id] || {};
+    const count = now - Number(old.at || 0) < 3_600_000 ? Number(old.count || 0) : 0;
+    if (count >= 2) return false;
+    const expected = { raw0: BigInt(baseline.raw0), raw1: BigInt(baseline.raw1) };
+    const readAt = async (blockTag) => {
+      const values = await Promise.all([pool.token0, pool.token1].map(token =>
+        new Contract(token.address, ERC20_ABI, this.writeProvider).balanceOf(this.config.walletAddress, { blockTag })));
+      return { raw0: BigInt(values[0]), raw1: BigInt(values[1]) };
+    };
+    for (const tag of [receipt.blockNumber, 'latest']) {
+      const actual = await readAt(tag);
+      if (actual.raw0 !== expected.raw0 || actual.raw1 !== expected.raw1) return false;
+      if (position) {
+        const shares = await new Contract(pool.key.hooks, HOOK_ABI, this.writeProvider)
+          .balanceOf(this.config.walletAddress, position.id, { blockTag: tag });
+        if (BigInt(shares) !== BigInt(position.shares)) return false;
+      }
+    }
+    const [latest, pending] = await Promise.all([
+      this.writeProvider.getTransactionCount(this.config.walletAddress, 'latest'),
+      this.writeProvider.getTransactionCount(this.config.walletAddress, 'pending')]);
+    if (latest !== pending) return false;
+    this.state.setSetting('confirmedRevertFailures', { ...failures, [pool.id]: { at: now, count: count + 1 } });
+    this.patchJournal(journal, { phase: 'failed', failedAt: now, error: error.message,
+      reconciliation: { hash: receipt.hash, status: 0, blockNumber: receipt.blockNumber,
+        pairBalancesUnchanged: true, sharesUnchanged: Boolean(position), nonce: latest } });
+    this.ledger.append('rebalance.confirmed_revert_reconciled', { poolId: pool.id, phase, hash: receipt.hash, retryCount: count + 1 });
+    return true;
+  }
+
+  async reconcileStartupJournal() {
+    const journal = this.state?.getSetting('activeRebalanceExecution', null);
+    if (!journal || !['prepared', 'cross_pool_preflighted', 'approvals_ready', 'sequence_preflighted',
+      'withdraw_preflighted', 'withdraw_not_required'].includes(journal.phase)
+      || journal.pendingTx || Object.values(journal.tx || {}).flat().some(Boolean)
+      || !Number.isFinite(Number(journal.startedAt)) || Number(journal.startedAt) <= 0) return false;
+    // An approval signed just before a crash can be known only to the ledger.
+    const events = this.ledger.all().filter(event => Number(event.ts) >= Number(journal.startedAt));
+    const broadcasts = events.filter(event => event.type === 'tx.broadcast_pending' || event.type === 'tx.broadcast_uncertain');
+    if (broadcasts.some(event => !events.some(done => ['tx.confirmed', 'tx.reverted'].includes(done.type)
+      && done.hash === event.hash))) return false;
+    const [latest, pending] = await Promise.all([
+      this.writeProvider.getTransactionCount(this.config.walletAddress, 'latest'),
+      this.writeProvider.getTransactionCount(this.config.walletAddress, 'pending')]);
+    if (latest !== pending) return false;
+    this.patchJournal(journal, { phase: 'failed', failedAt: Date.now(), error: 'Restarted before capital movement',
+      reconciliation: { noCapitalHash: true, nonce: latest } });
+    this.ledger.append('rebalance.startup_no_capital_reconciled', { id: journal.id });
+    return true;
   }
 
   async deferConfirmedAllocationDepositFailure(plan, pool, journal, error, before) {
@@ -3527,3 +3666,5 @@ function serializeDepositPlan(plan) {
 function jsonSafe(value) {
   return JSON.parse(JSON.stringify(value, (_key, v) => typeof v === 'bigint' ? v.toString() : v));
 }
+
+function minBigIntLocal(a, b) { return BigInt(a) < BigInt(b) ? BigInt(a) : BigInt(b); }

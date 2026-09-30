@@ -182,6 +182,7 @@ export class AutoLpBot {
       });
       log('info', 'rpc.health', { endpoints: this.rpcHealth.map((x) => ({ index: x.index, ok: x.ok, chainId: x.chainId })) });
       this.useHealthyRpcEndpoints();
+      await this.executor.reconcileStartupJournal();
       await this.refreshMarket(true);
     } finally {
       this.initializing = false;
@@ -758,8 +759,9 @@ export class AutoLpBot {
   }
 
   setInvestmentAllocation(input = {}) {
-    if (this.cycleActive || this.initializing || this.rpcManagementActive) {
-      throw new Error('Wait for the current wallet operation before changing allocations');
+    const disablingPausedStrategy = input.enabled === false && this.executionPaused === true;
+    if ((this.cycleActive && !disablingPausedStrategy) || this.initializing || this.rpcManagementActive) {
+      throw new Error('目前掃描或設定更新中，請等本輪完成後再切換模式。');
     }
     if (this.executor?.hasPendingWrite) throw new Error('Wait for queued wallet transactions before changing allocations');
     const activeExecution = this.state?.getSetting('activeRebalanceExecution', null);
@@ -772,10 +774,8 @@ export class AutoLpBot {
     const previous = this.getInvestmentAllocationConfig();
     let normalized;
     if (!enabled) {
-      const retained = allocations === undefined || (Array.isArray(allocations) && allocations.length === 0)
-        ? previous.allocations
-        : normalizeInvestmentAllocation({ enabled: true, allocations },
-          this.market.pools, this.config.usdgAddress).allocations;
+      // Disabling must not depend on current liquidity/paused state of the old pools.
+      const retained = previous.invalid ? [] : previous.allocations.map((entry) => ({ ...entry }));
       normalized = { version: 1, enabled: false, allocations: retained };
     } else {
       normalized = normalizeInvestmentAllocation({ enabled: true,
@@ -1665,7 +1665,7 @@ export class AutoLpBot {
           .filter((position) => position.outside === true && position.shouldRebalance === true)
           .map((position) => ({ pool, position }))
       );
-      if (!executeRebalances) return snapshot;
+      if (!executeRebalances || this.allocationUpdatePending) return snapshot;
       if (this.getInvestmentAllocationConfig?.()?.enabled === true) {
         await this.runAllocationExecutionCycle(targetPools, pendingRebalances);
         if (this.snapshot) {
@@ -1691,8 +1691,47 @@ export class AutoLpBot {
     }
   }
 
+  async runAllocationJob(pool, kind, run) {
+    const key = pool.id.toLowerCase() + ':' + kind;
+    const backoffs = this.state.getSetting('allocationJobBackoffs', {}) || {};
+    if (Date.now() < Number(backoffs[key]?.nextRetryAt || 0)) return { status: 'deferred', reason: 'allocation-backoff' };
+    try {
+      const result = await run();
+      if (result?.status === 'completed') {
+        const next = { ...backoffs }; delete next[key]; this.state.setSetting('allocationJobBackoffs', next);
+      } else if (result?.status === 'dry-run' || result?.status === 'full-sequence-simulated' || result?.status === 'deferred') {
+        this.ledger.append(result.status === 'deferred' ? 'allocation.job_deferred' : 'allocation.bootstrap_dry_run', { poolId: pool.id, ...result });
+        this.state.setSetting('allocationJobBackoffs', { ...backoffs,
+          [key]: { count: 0, nextRetryAt: Date.now() + (this.config.autoTopupMinIntervalSec || 300) * 1000 } });
+      }
+      return result;
+    } catch (error) {
+      const count = Number(backoffs[key]?.count || 0) + 1;
+      const nextRetryAt = Date.now() + Math.min(30 * 60_000, 5 * 60_000 * 2 ** Math.min(count - 1, 6));
+      this.state.setSetting('allocationJobBackoffs', { ...backoffs, [key]: { count, nextRetryAt } });
+      this.ledger.append('allocation.job_failed', { poolId: pool.id, kind, error: sanitize(error.message), nextRetryAt });
+      if (this.state.getSetting('activeRebalanceExecution', null)?.phase === 'recovery_required') {
+        this.setExecutionPaused(true, 'allocation_recovery_required');
+        this.ledger.append('rebalance.auto_paused', { poolId: pool.id, reason: 'allocation_recovery_required' });
+      }
+      return { status: 'failed', reason: sanitize(error.message), nextRetryAt };
+    }
+  }
+
   async runAllocationExecutionCycle(targetPools, pendingRebalances) {
-    if (this.executionPaused || (this.config.dryRun !== true
+    try {
+      return await this.runAllocationExecutionCycleUnlocked(targetPools, pendingRebalances);
+    } catch (error) {
+      this.ledger.append('allocation.cycle_blocked', { error: sanitize(error.message) });
+      if (this.state.getSetting('activeRebalanceExecution', null)?.phase === 'recovery_required') {
+        this.setExecutionPaused(true, 'allocation_recovery_required');
+      }
+      return { status: 'blocked', reason: sanitize(error.message) };
+    }
+  }
+
+  async runAllocationExecutionCycleUnlocked(targetPools, pendingRebalances) {
+    if (this.allocationUpdatePending || this.executionPaused || (this.config.dryRun !== true
       && (!this.config.enableLiveWrites || !this.config.enableAutoRedeploy || !this.config.privateKey))) return null;
     const journal = this.state.getSetting('activeRebalanceExecution', null);
     if (journal?.phase && !['completed', 'failed'].includes(journal.phase)) return null;
@@ -1700,7 +1739,10 @@ export class AutoLpBot {
     // One capital-moving job per monitor cycle. This keeps the token caps fixed
     // across every receipt in a sequence; the next cycle recomputes balances,
     // LP equity, and shared USDG reservations from chain state.
-    await this.refreshAllocationFundingSnapshot({ pools: targetPools, refreshPositions: true });
+    if (this.getInvestmentAllocationSnapshot().status !== 'ready') {
+      this.ledger.append('allocation.blocked', { reason: 'allocation-valuation-not-ready' });
+      return { status: 'blocked', reason: 'allocation-valuation-not-ready' };
+    }
     const refreshedDue = [];
     for (const candidate of pendingRebalances) {
       const pool = targetPools.find((entry) => entry.id.toLowerCase() === candidate.pool.id.toLowerCase());
@@ -1729,25 +1771,31 @@ export class AutoLpBot {
       return Number(hasActive(a)) - Number(hasActive(b));
     });
     for (const pool of fundingOrder) {
+      const kind = (pool.positions || []).some(entry => BigInt(entry.shares || 0) > 0n) ? 'topup' : 'bootstrap';
+      const backoff = this.state.getSetting('allocationJobBackoffs', {})?.[pool.id.toLowerCase() + ':' + kind];
+      if (Date.now() < Number(backoff?.nextRetryAt || 0)) continue;
       const scope = this.getAllocationFundingScope(pool.id);
       const availableUsdG = Number(scope.availableUsdG || 0);
       if (!Number.isFinite(availableUsdG) || availableUsdG < this.config.autoTopupMinIdleUsd) continue;
       const active = (pool.positions || []).filter((position) => BigInt(position.shares || 0) > 0n);
       if (active.length === 0) {
-        const result = await this.executor.executeAllocationBootstrap({
+        const result = await this.runAllocationJob(pool, 'bootstrap', () => this.executor.executeAllocationBootstrap({
           pool,
           allocationFundingScope: scope,
           maxPriceImpactBps: this.executor.allocationSwapMaxImpactBps?.(pool)
             ?? this.config.maxSwapPriceImpactBps ?? 200,
           minGasReserveWei: this.config.topUpMinGasReserveWei
-        });
+        }));
         if (result?.status === 'completed') {
           await this.refreshAllocationFundingSnapshot({ pools: targetPools, refreshPositions: true });
         }
         return result;
       }
-      if (active.length !== 1) continue;
-      const [position] = active;
+      const position = active.filter((entry) => entry.outside === false
+        && pool.state.tick >= entry.tickLower && pool.state.tick < entry.tickUpper)
+        .sort((a, b) => { const left = BigInt(a.shares), right = BigInt(b.shares);
+          return left === right ? String(a.id).localeCompare(String(b.id)) : left > right ? -1 : 1; })[0];
+      if (!position) continue;
       if (position.outside !== false || pool.state.tick < position.tickLower
         || pool.state.tick >= position.tickUpper) continue;
       const key = `${pool.id.toLowerCase()}:${position.id.toLowerCase()}`;
@@ -1759,11 +1807,11 @@ export class AutoLpBot {
         .filter(([, entry]) => Date.now() - Number(entry?.at || 0) < 7 * 24 * 60 * 60_000));
       next[key] = { at: Date.now(), idleUsd: availableUsdG };
       this.state.setSetting('autoTopupAttempts', next);
-      const result = await this.executor.topUpPoolPosition({
+      const result = await this.runAllocationJob(pool, 'topup', () => this.executor.topUpPoolPosition({
         pool, position, dustBps: this.config.autoTopupDustBps,
         minGasReserveWei: this.config.topUpMinGasReserveWei,
         allocationFundingScope: scope
-      });
+      }));
       if (result?.status === 'completed') {
         await this.refreshAllocationFundingSnapshot({ pools: targetPools, refreshPositions: true });
       }
