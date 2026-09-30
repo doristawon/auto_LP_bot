@@ -2218,6 +2218,9 @@ export class RebalanceExecutor {
       scopedBefore: allocationBootstrap ? scopedBefore : null,
       withdrawnRaw: { raw0: withdrawn[0].toString(), raw1: withdrawn[1].toString() },
       routeSwaps, balanceSwap, depositPlan, finalTarget, deadline,
+      preparedCapitalCalls: allocationBootstrap ? [...swapCalls,
+        { to: destinationPool.key.hooks, data: depositData, value: 0n,
+          gasLimit: Number(TOP_UP_DEPOSIT_GAS_LIMIT) }] : null,
       simulatedGasUsed: fullSimulation.reduce((total, receipt) =>
         total + BigInt(receipt.gasUsed || 0), 0n).toString(),
       simulatedCallCount: fullSimulation.length,
@@ -2227,6 +2230,57 @@ export class RebalanceExecutor {
       totalImpactBps,
       mintedLiquidity: deposited.liquidity.toString()
     };
+  }
+
+  async resimulatePreparedAllocationBootstrap(plan, pool, prepared, balanceSwapRequest = null) {
+    this.assertAllocationJobCurrent(pool, plan.allocationFundingScope);
+    if (!plan.allocationBootstrap || prepared.routeSwaps.length || prepared.withdrawCall
+      || !prepared.preparedCapitalCalls?.length) {
+      throw new Error('Prepared allocation bootstrap must contain only its pair swap and deposit');
+    }
+    if (prepared.deadline <= Math.floor(Date.now() / 1000)) {
+      throw new Error('Prepared allocation transaction deadline expired before capital movement');
+    }
+    const balances = await this.readRawTokenBalances([pool.token0, pool.token1]);
+    for (const token of [pool.token0, pool.token1]) {
+      const address = token.address.toLowerCase();
+      if (balances.get(address) !== prepared.before.get(address)) {
+        throw new Error('Wallet pair balances changed while allocation approvals were mined');
+      }
+    }
+    const pending = await this.buildTopUpApprovalRequests(pool,
+      prepared.balanceSwap?.plan || { direction: 'none' }, prepared.depositPlan);
+    if (pending.length) throw new Error('Prepared allocation exact allowances are not ready');
+    const poolState = await this.fables.readPoolState(pool);
+    if (poolState.paused !== false || BigInt(poolState.liquidity || 0) <= 0n) {
+      throw new Error('Prepared allocation pool is paused or empty');
+    }
+    const calls = prepared.preparedCapitalCalls.map((call) => ({ ...call }));
+    if (balanceSwapRequest) {
+      if (!prepared.balanceSwap || calls.length !== 2) throw new Error('Unexpected prepared allocation swap replacement');
+      calls[0] = { to: balanceSwapRequest.router, data: balanceSwapRequest.data,
+        value: balanceSwapRequest.value, gasLimit: Number(TOP_UP_SWAP_GAS_LIMIT) };
+    }
+    const simulated = await simulateSequentialCalls(this.writeProvider, {
+      walletAddress: this.config.walletAddress, chainId: this.config.chainId, calls
+    });
+    const deposited = this.findWalletDepositEvent(pool, simulated.at(-1));
+    if (!deposited || deposited.liquidity <= 0n) {
+      throw new Error('Prepared allocation sequence did not mint LP liquidity');
+    }
+    let tickAfterSwap = poolState.tick;
+    for (const receipt of simulated) for (const entry of receipt.logs || []) {
+      try {
+        const event = swapEventInterface.parseLog(entry);
+        if (String(event.args.id).toLowerCase() === pool.id.toLowerCase()) tickAfterSwap = Number(event.args.tick);
+      } catch {}
+    }
+    if (tickAfterSwap < prepared.finalTarget.tickLower || tickAfterSwap >= prepared.finalTarget.tickUpper) {
+      throw new Error('Prepared allocation range moved out of range before capital movement');
+    }
+    return { ...prepared, pendingApprovalCount: 0, simulatedCallCount: simulated.length,
+      simulatedGasUsed: simulated.reduce((sum, receipt) => sum + BigInt(receipt.gasUsed || 0), 0n).toString(),
+      mintedLiquidity: deposited.liquidity.toString() };
   }
 
   samePoolRebalanceMaxImpactBps(pool) {
@@ -2365,7 +2419,9 @@ export class RebalanceExecutor {
 
       // Approvals may take blocks. Rebuild and simulate the entire transaction
       // sequence against their actual on-chain allowance state before moving LP.
-      preflight = await this.preflightCrossPoolSequence(plan, destinationPool);
+      preflight = plan.allocationBootstrap === true
+        ? await this.resimulatePreparedAllocationBootstrap(plan, destinationPool, preflight)
+        : await this.preflightCrossPoolSequence(plan, destinationPool);
       if (plan.allocationBootstrap === true) {
         allocationInventory = Object.fromEntries(preflight.funding.map((entry) => [entry.address, BigInt(entry.maxSpendRaw)]));
         journal = this.patchJournal(journal, {
@@ -2479,12 +2535,16 @@ export class RebalanceExecutor {
         const refreshedPlan = await this.refreshSingleSwapQuote(destinationPool,
           swap.plan, 'cross-pool-before-balance-swap',
           plan.manualImmediate === true ? Number(plan.manualMaxCostBps)
-            : this.config.crossPoolMaxSwapPriceImpactBps);
+            : plan.allocationBootstrap === true ? Number(plan.maxPriceImpactBps)
+              : this.config.crossPoolMaxSwapPriceImpactBps);
         const refreshedRequest = this.router.buildV4ExactInputSingle({
           pool: refreshedPlan.swapPool || destinationPool,
           quote: refreshedPlan.quote, deadline: this.deadline()
         });
         executedBalanceSwapPoolId = (refreshedPlan.swapPool || destinationPool).id;
+        if (plan.allocationBootstrap === true) {
+          await this.resimulatePreparedAllocationBootstrap(plan, destinationPool, preflight, refreshedRequest);
+        }
         await this.readProvider.call({ from: this.config.walletAddress,
           to: refreshedRequest.router, data: refreshedRequest.data,
           value: refreshedRequest.value });

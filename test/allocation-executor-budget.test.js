@@ -234,6 +234,36 @@ test('actual same-pool allocation bootstrap scopes both assets with no conversio
   const plan = executor.allocationBootstrapPlan(bootstrapPool, scope, 1n, 200);
   const preview = await executor.preflightCrossPoolSequence(plan, bootstrapPool);
   assert.equal(preview.status, 'full-sequence-simulated');
+  const preparedDeposit = preview.depositPlan;
+  const preparedSwap = preview.balanceSwap?.plan;
+  const approvalChecks = [];
+  executor.buildTopUpApprovalRequests = async (_pool, swap, deposit) => {
+    approvalChecks.push({ swap, deposit });
+    return [];
+  };
+  const resimulated = await executor.resimulatePreparedAllocationBootstrap(plan, bootstrapPool, preview);
+  assert.equal(resimulated.pendingApprovalCount, 0);
+  assert.equal(resimulated.depositPlan, preparedDeposit, 'mined exact approval amounts stay pinned while resimulating');
+  assert.equal(approvalChecks[0].deposit, preparedDeposit);
+  if (preparedSwap) assert.equal(approvalChecks[0].swap, preparedSwap);
+  assert.equal(resimulated.scopedBefore, preview.scopedBefore, 'resimulation cannot enlarge this pool funding scope');
+  assert.equal(resimulated.simulatedCallCount, preview.preparedCapitalCalls.length);
+  const oldBefore = preview.before;
+  preview.before = new Map(oldBefore);
+  preview.before.set(USDG, oldBefore.get(USDG) + 1n);
+  await assert.rejects(executor.resimulatePreparedAllocationBootstrap(plan, bootstrapPool, preview), /balances changed/);
+  preview.before = oldBefore;
+  executor.buildTopUpApprovalRequests = async () => [{ label: 'still missing' }];
+  await assert.rejects(executor.resimulatePreparedAllocationBootstrap(plan, bootstrapPool, preview), /allowances are not ready/);
+  executor.buildTopUpApprovalRequests = async () => [];
+  await assert.rejects(executor.resimulatePreparedAllocationBootstrap(plan, bootstrapPool,
+    { ...preview, deadline: 1 }), /deadline expired/);
+  await assert.rejects(executor.resimulatePreparedAllocationBootstrap(plan, bootstrapPool,
+    { ...preview, finalTarget: { tickLower: 0, tickUpper: 1 } }), /range moved out of range/);
+  const validEvent = executor.findWalletDepositEvent;
+  executor.findWalletDepositEvent = () => null;
+  await assert.rejects(executor.resimulatePreparedAllocationBootstrap(plan, bootstrapPool, preview), /did not mint/);
+  executor.findWalletDepositEvent = validEvent;
   assert.equal(preview.scopedBefore.get(USDG), rawStable);
   assert.equal(preview.scopedBefore.get(MOO), rawMoo);
   assert.deepEqual(preview.routeSwaps, []);
