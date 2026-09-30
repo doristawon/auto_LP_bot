@@ -3092,7 +3092,10 @@ export class RebalanceExecutor {
     const request = { to, data, value: BigInt(value), chainId: Number(chainId), ...fees };
     const populated = await this.signer.populateTransaction({
       ...request,
-      gasLimit: gasEstimate * 120n / 100n
+      // Delegated EOAs can incur execution overhead beyond a node's estimate.
+      // Gas is charged by actual usage; preserve the fee-price guard and add
+      // a fixed margin as well as proportional headroom.
+      gasLimit: gasEstimate * 150n / 100n + 25_000n
     });
     const rawTransaction = await this.signer.signTransaction(populated);
     const hash = keccak256(rawTransaction);
@@ -3148,6 +3151,21 @@ export class RebalanceExecutor {
     try {
       receipt = await tx.wait(this.config.confirmations);
     } catch (error) {
+      const reverted = error.receipt;
+      if (reverted?.status === 0 && String(reverted.hash).toLowerCase() === hash.toLowerCase()
+        && Number.isSafeInteger(reverted.blockNumber) && reverted.blockNumber > 0) {
+        this.restoreBroadcastJournal(defaultJournal, { label, hash, status: 'reverted' });
+        const gasPrice = reverted.gasPrice || tx.gasPrice || fees.maxFeePerGas || fees.gasPrice || 0n;
+        const gasEth = Number(formatUnits(BigInt(reverted.gasUsed) * gasPrice, 18));
+        const ethUsd = Number(this.getUsdPrice?.(ZERO_ADDRESS) || 0);
+        this.ledger.append('tx.reverted', { label, hash, blockNumber: reverted.blockNumber,
+          gasUsed: reverted.gasUsed.toString(), gasPriceWei: gasPrice.toString(), gasEth,
+          gasUsd: ethUsd > 0 ? gasEth * ethUsd : 0 });
+        const failed = new Error(`${label} reverted in confirmed block ${reverted.blockNumber}: ${hash}`);
+        failed.code = 'TRANSACTION_REVERTED';
+        failed.txHash = hash;
+        throw failed;
+      }
       this.markUncertainBroadcast({ label, hash, to, error, defaultJournal, stage: 'receipt-wait' });
       const uncertain = new Error(`${label} receipt outcome is uncertain for ${hash}: ${error.message}`);
       uncertain.code = 'BROADCAST_OUTCOME_UNCERTAIN';

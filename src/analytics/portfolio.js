@@ -305,7 +305,7 @@ function uniqueGasUsd(events) {
   for (const event of events) {
     // portfolio.snapshot carries the running total. Counting it again makes
     // gas costs grow recursively on every snapshot.
-    if (!['tx.confirmed', 'lp.deposit', 'lp.withdraw'].includes(event.type)) continue;
+    if (!['tx.confirmed', 'tx.reverted', 'lp.deposit', 'lp.withdraw'].includes(event.type)) continue;
     const gas = Number(event.gasUsd || 0);
     if (!(gas > 0)) continue;
     if (event.hash) byHash.set(String(event.hash).toLowerCase(), Math.max(gas, byHash.get(String(event.hash).toLowerCase()) || 0));

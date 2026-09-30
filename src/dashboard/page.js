@@ -393,7 +393,7 @@ function eventDetail(e){
   if(e.type==='lp.idle_moo_deployed')return'USDG/MOO Tight 存入完成 · '+safeEventText(e.spentUsdg||'',30)+' USDG · LP shares '+safeEventText(e.shares||'',36)+' · Tick '+safeEventText(e.tickLower||'',12)+'–'+safeEventText(e.tickUpper||'',12);
   if(e.type==='lp.idle_moo_recovery_required')return'MOO 建倉需要人工復原'+(e.phase?' · '+eventPhase(e.phase):'')+' · '+eventReason(e.reason||e.error||e.status);
   if(e.type==='cycle.failed')return'監控週期失敗 · '+eventReason(e.error||e.reason||e.status);
-  if(e.type==='tx.sent'||e.type==='tx.confirmed'){
+  if(e.type==='tx.sent'||e.type==='tx.confirmed'||e.type==='tx.reverted'){
     const stage=e.type==='tx.sent'?'已送出':'已確認';
     const block=e.type==='tx.confirmed'&&e.blockNumber!=null?' · 區塊 '+safeEventText(e.blockNumber,24):'';
     return stage+' · '+transactionLabel(e.label||e.reason||e.status)+block;
@@ -406,6 +406,7 @@ function eventDetail(e){
 function eventStatus(e){
   const type=String(e.type||'');
   if(type==='tx.confirmed')return{label:'鏈上交易已確認',tone:'good'};
+  if(type==='tx.reverted')return{label:'鏈上交易已失敗',tone:'bad'};
   if(type==='rebalance.completed'||type==='rebalance.cross_pool_completed'||type==='bootstrap.completed')return{label:'流程完成',tone:'good'};
   if(type==='rebalance.top_up_completed')return{label:'同池加倉完成',tone:'good'};
   if(type==='tx.sent')return{label:'鏈上交易已送出',tone:'warn'};

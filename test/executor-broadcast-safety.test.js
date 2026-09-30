@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { keccak256 } from 'ethers';
 import { RebalanceExecutor } from '../src/adapters/executor.js';
 
 const WALLET = '0x00000000000000000000000000000000000000aa';
@@ -58,6 +59,35 @@ test('contract preflight excludes fees while the signed transaction retains the 
   assert.equal(populatedRequest.maxFeePerGas, 1_900_000_000n);
   assert.equal(populatedRequest.maxPriorityFeePerGas, 100_000_000n);
   assert.equal(populatedRequest.chainId, 8453);
+  assert.equal(populatedRequest.gasLimit, 56_500n, 'gas estimate includes delegated-EOA overhead headroom');
+});
+
+test('a confirmed matching reverted approval is terminal and records gas instead of an uncertain broadcast', async () => {
+  const hash = keccak256('0x1234');
+  const { executor, settings, events } = makeExecutor({ broadcast: async () => ({ hash,
+    async wait() { throw Object.assign(new Error('execution reverted'), {
+      receipt: { hash, status: 0, blockNumber: 123, gasUsed: 30_000n, gasPrice: 1_000_000_000n }
+    }); }
+  }) });
+  await assert.rejects(executor.sendVerifiedTx({ label: 'approval-test', to: WALLET, data: '0x1234' }),
+    (error) => error.code === 'TRANSACTION_REVERTED');
+  assert.equal(settings.get('activeRebalanceExecution').phase, 'approvals_ready');
+  assert.equal(settings.get('activeRebalanceExecution').pendingTx, null);
+  assert.equal(settings.get('activeRebalanceExecution').lastApprovalTx.status, 'reverted');
+  assert.equal(events.find((event) => event.type === 'tx.reverted').data.gasEth, 0.00003);
+  assert.equal(events.some((event) => event.type === 'tx.broadcast_uncertain'), false);
+});
+
+test('a mismatched failed receipt remains uncertain and freezes execution', async () => {
+  const hash = keccak256('0x1234');
+  const { executor, settings } = makeExecutor({ broadcast: async () => ({ hash,
+    async wait() { throw Object.assign(new Error('replacement outcome'), {
+      receipt: { hash: keccak256('0x5678'), status: 0, blockNumber: 123, gasUsed: 30_000n }
+    }); }
+  }) });
+  await assert.rejects(executor.sendVerifiedTx({ label: 'approval-test', to: WALLET, data: '0x1234' }),
+    (error) => error.code === 'BROADCAST_OUTCOME_UNCERTAIN');
+  assert.equal(settings.get('activeRebalanceExecution').phase, 'recovery_required');
 });
 
 test('ambiguous broadcast rejection locks the execution journal with the signed hash', async () => {

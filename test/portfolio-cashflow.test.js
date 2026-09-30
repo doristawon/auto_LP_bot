@@ -8,6 +8,19 @@ import { dashboardPage } from '../src/dashboard/page.js';
 const USDG = '0x5fc5360d0400a0fd4f2af552add042d716f1d168';
 const WALLET = '0x0000000000000000000000000000000000000006';
 
+test('reverted transaction gas is included once without counting cumulative snapshots', () => {
+  const events = [{ type: 'tx.reverted', hash: 'synthetic-failure', gasUsd: 0.02 },
+    { type: 'tx.reverted', hash: 'synthetic-failure', gasUsd: 0.02 },
+    { type: 'portfolio.snapshot', gasUsd: 1 }];
+  const analytics = new PortfolioAnalytics({ usdgAddress: USDG }, {
+    readBaseline: () => ({ createdAt: 1, inventory: { [USDG]: 100, [ZERO_ADDRESS]: 0 }, initialValueUsd: 100 }),
+    all: () => events, sum: () => 0
+  }, { getSetting: () => ({ complete: true }) });
+  const result = analytics.build({ targetPools: [], trackedTokens: [{ address: USDG }],
+    walletBalances: { [USDG]: { amount: 100 } }, prices: new Map([[USDG, 1]]) });
+  assert.equal(result.gasUsd, 0.02);
+});
+
 test('external USDG deposit changes invested capital, while reward remains income', () => {
   const baseline = {
     createdAt: 1, inventory: { [USDG]: 100, [ZERO_ADDRESS]: 0.001 },
