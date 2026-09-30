@@ -535,7 +535,7 @@ export class RebalanceExecutor {
         tickLower: finalTarget.tickLower,
         tickUpper: finalTarget.tickUpper,
         slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.config.depositLiquidityReserveBps
+        liquidityReserveBps: this.getDepositLiquidityReserveBps()
       });
       if (exactDeposit.liquidity <= 0n || exactDeposit.liquidity > MAX_UINT128) {
         throw new Error('Exact deposit liquidity is invalid');
@@ -559,7 +559,7 @@ export class RebalanceExecutor {
         tickLower: finalTarget.tickLower,
         tickUpper: finalTarget.tickUpper,
         slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.config.depositLiquidityReserveBps
+        liquidityReserveBps: this.getDepositLiquidityReserveBps()
       });
       if (exactDeposit.liquidity <= 0n || exactDeposit.liquidity > MAX_UINT128) {
         throw new Error('Recomputed exact deposit liquidity is invalid');
@@ -813,7 +813,7 @@ export class RebalanceExecutor {
         tickLower: Number(position.tickLower),
         tickUpper: Number(position.tickUpper),
         slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.config.depositLiquidityReserveBps
+        liquidityReserveBps: this.getDepositLiquidityReserveBps()
       });
       this.assertValidDeposit(optionalSwapDepositPlan, 'Projected top-up deposit liquidity is invalid');
     } catch (error) {
@@ -829,7 +829,7 @@ export class RebalanceExecutor {
         tickLower: Number(position.tickLower),
         tickUpper: Number(position.tickUpper),
         slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.config.depositLiquidityReserveBps
+        liquidityReserveBps: this.getDepositLiquidityReserveBps()
       });
     } catch (error) {
       depositOnlyError = error.message;
@@ -1566,7 +1566,7 @@ export class RebalanceExecutor {
       tickLower: finalTarget.tickLower,
       tickUpper: finalTarget.tickUpper,
       slippageBps: this.config.depositSlippageBps,
-      liquidityReserveBps: this.config.depositLiquidityReserveBps
+      liquidityReserveBps: this.getDepositLiquidityReserveBps()
     });
     this.assertValidDeposit(depositPlan, 'Sequential preflight deposit plan is invalid');
     const fullApprovals = await this.buildTopUpApprovalRequests(pool, swapPlan, depositPlan);
@@ -1806,7 +1806,7 @@ export class RebalanceExecutor {
         tickLower: targetRange.tickLower,
         tickUpper: targetRange.tickUpper,
         slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.config.depositLiquidityReserveBps
+        liquidityReserveBps: this.getDepositLiquidityReserveBps()
       });
       this.assertValidDeposit(depositPlan, 'Cross-pool dry-run deposit liquidity is invalid');
       const output = {
@@ -2177,25 +2177,31 @@ export class RebalanceExecutor {
     }
     const finalTarget = buildTargetRange(finalPrice.tick, destinationPool.key.tickSpacing,
       this.config.tightWidthBps, this.config.rangePreset);
-    const depositPlan = buildExactDepositPlan({
+    let depositPlan = buildExactDepositPlan({
       rawAmount0: projectedAfterSwaps.raw0, rawAmount1: projectedAfterSwaps.raw1,
       sqrtPriceX96: finalPrice.sqrtPriceX96,
       tickLower: finalTarget.tickLower, tickUpper: finalTarget.tickUpper,
       slippageBps: this.config.depositSlippageBps,
-      liquidityReserveBps: this.config.depositLiquidityReserveBps
+      liquidityReserveBps: this.getDepositLiquidityReserveBps()
     });
     this.assertValidDeposit(depositPlan, 'Cross-pool sequence deposit plan is invalid');
+    if (allocationBootstrap) depositPlan = { ...depositPlan,
+      amount0Max: projectedAfterSwaps.raw0, amount1Max: projectedAfterSwaps.raw1 };
     const depositApprovals = await this.buildTopUpApprovalRequests(destinationPool,
       { direction: 'none' }, depositPlan);
-    const depositData = this.fables.encodeDeposit(destinationPool, finalTarget,
+    let depositData = this.fables.encodeDeposit(destinationPool, finalTarget,
       depositPlan.liquidity, depositPlan.amount0Max, depositPlan.amount1Max, deadline);
-    const fullSimulation = await simulateSequentialCalls(this.writeProvider, {
-      ...simulationArgs,
-      calls: [...swapApprovals.map(toSimulationCall), ...depositApprovals.map(toSimulationCall),
+    const completeCalls = [...swapApprovals.map(toSimulationCall), ...depositApprovals.map(toSimulationCall),
         ...(withdrawCall ? [withdrawCall] : []), ...swapCalls,
         { to: destinationPool.key.hooks, data: depositData, value: 0n,
-          gasLimit: Number(TOP_UP_DEPOSIT_GAS_LIMIT) }]
-    });
+          gasLimit: Number(TOP_UP_DEPOSIT_GAS_LIMIT) }];
+    const fitted = allocationBootstrap
+      ? await this.simulateScopedDepositSequence(completeCalls, depositPlan, (liquidity) =>
+        this.fables.encodeDeposit(destinationPool, finalTarget, liquidity,
+          depositPlan.amount0Max, depositPlan.amount1Max, deadline)) : null;
+    const fullSimulation = fitted?.results || await simulateSequentialCalls(this.writeProvider,
+      { ...simulationArgs, calls: completeCalls });
+    if (fitted) { depositPlan = fitted.depositPlan; depositData = fitted.calls.at(-1).data; }
     const deposited = this.findWalletDepositEvent(destinationPool, fullSimulation.at(-1));
     if (!deposited || deposited.liquidity <= 0n) {
       throw new Error('Full cross-pool sequence did not mint a destination LP position');
@@ -2292,16 +2298,18 @@ export class RebalanceExecutor {
         sqrtPriceX96: price.sqrtPriceX96,
         tickLower: prepared.finalTarget.tickLower, tickUpper: prepared.finalTarget.tickUpper,
         slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.config.depositLiquidityReserveBps
+        liquidityReserveBps: this.getDepositLiquidityReserveBps()
       });
       executableDeposit = { ...refit, amount0Max: caps[0], amount1Max: caps[1] };
       this.assertValidDeposit(executableDeposit, 'Refitted allocation deposit liquidity is invalid');
       calls[calls.length - 1] = { ...calls.at(-1), data: this.fables.encodeDeposit(pool,
         prepared.finalTarget, executableDeposit.liquidity, caps[0], caps[1], prepared.deadline) };
     }
-    const simulated = await simulateSequentialCalls(this.writeProvider, {
-      walletAddress: this.config.walletAddress, chainId: this.config.chainId, calls
-    });
+    const fitted = await this.simulateScopedDepositSequence(calls, executableDeposit, (liquidity) =>
+      this.fables.encodeDeposit(pool, prepared.finalTarget, liquidity,
+        executableDeposit.amount0Max, executableDeposit.amount1Max, prepared.deadline));
+    const simulated = fitted.results;
+    executableDeposit = fitted.depositPlan;
     const deposited = this.findWalletDepositEvent(pool, simulated.at(-1));
     if (!deposited || deposited.liquidity <= 0n) {
       throw new Error('Prepared allocation sequence did not mint LP liquidity');
@@ -2316,7 +2324,7 @@ export class RebalanceExecutor {
     if (tickAfterSwap < prepared.finalTarget.tickLower || tickAfterSwap >= prepared.finalTarget.tickUpper) {
       throw new Error('Prepared allocation range moved out of range before capital movement');
     }
-    return { ...prepared, depositPlan: executableDeposit, preparedCapitalCalls: calls,
+    return { ...prepared, depositPlan: executableDeposit, preparedCapitalCalls: fitted.calls,
       pendingApprovalCount: 0, simulatedCallCount: simulated.length,
       simulatedGasUsed: simulated.reduce((sum, receipt) => sum + BigInt(receipt.gasUsed || 0), 0n).toString(),
       mintedLiquidity: deposited.liquidity.toString() };
@@ -2328,6 +2336,52 @@ export class RebalanceExecutor {
     return scopedPoolId && scopedPoolId === String(pool.id).toLowerCase()
       ? this.config.oorRebalanceMaxSwapPriceImpactBps ?? defaultLimit
       : defaultLimit;
+  }
+
+  allocationSwapMaxImpactBps(pool) {
+    const configured = String(this.config.autoTopupSwapPoolId || '').toLowerCase();
+    if (this.config.autoTopupSwapEnabled === true && configured
+      && configured === String(pool.id).toLowerCase()) {
+      return this.config.autoTopupMaxSwapPriceImpactBps ?? this.config.maxSwapPriceImpactBps ?? 200;
+    }
+    return this.samePoolRebalanceMaxImpactBps(pool);
+  }
+
+  getDepositLiquidityReserveBps() {
+    const configured = this.config.depositLiquidityReserveBps ?? 10;
+    return this.isAllocationModeEnabled() ? Math.max(100, Number(configured)) : configured;
+  }
+
+  async simulateScopedDepositSequence(inputCalls, originalPlan, encodeDeposit) {
+    const calls = inputCalls.map((call) => ({ ...call }));
+    let depositPlan = originalPlan;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const results = await simulateSequentialCalls(this.writeProvider, {
+          walletAddress: this.config.walletAddress, chainId: this.config.chainId, calls
+        });
+        return { results, calls, depositPlan };
+      } catch (error) {
+        const results = error.simulationResults;
+        const failure = results?.at(-1);
+        const data = failure?.error?.data || failure?.returnData || '';
+        if (attempt === 2 || !Array.isArray(results) || results.length !== calls.length
+          || results.slice(0, -1).some((result) => result.status !== '0x1')
+          || failure.status === '0x1' || !/^0x0f569baf[0-9a-fA-F]{128}$/.test(data)) throw error;
+        const required = BigInt('0x'+data.slice(10, 74));
+        const cap = BigInt('0x'+data.slice(74, 138));
+        if (required <= cap || cap <= 0n
+          || (cap !== BigInt(depositPlan.amount0Max) && cap !== BigInt(depositPlan.amount1Max))) throw error;
+        const oldLiquidity = BigInt(depositPlan.liquidity);
+        const liquidity = oldLiquidity * cap / required * 9975n / 10000n;
+        if (liquidity <= 0n || liquidity >= oldLiquidity) throw error;
+        depositPlan = { ...depositPlan, liquidity,
+          required0: (BigInt(depositPlan.required0) * liquidity + oldLiquidity - 1n) / oldLiquidity,
+          required1: (BigInt(depositPlan.required1) * liquidity + oldLiquidity - 1n) / oldLiquidity,
+          basis: 'simulation-refitted liquidity within unchanged scoped caps' };
+        calls[calls.length - 1].data = encodeDeposit(liquidity);
+      }
+    }
   }
 
   async refreshSingleSwapQuote(pool, swapPlan, phase, maxOverrideBps = null) {
@@ -2639,7 +2693,7 @@ export class RebalanceExecutor {
         sqrtPriceX96: destinationState.sqrtPriceX96,
         tickLower: target.tickLower, tickUpper: target.tickUpper,
         slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.config.depositLiquidityReserveBps
+        liquidityReserveBps: this.getDepositLiquidityReserveBps()
       });
       this.assertValidDeposit(depositPlan, 'Actual cross-pool deposit plan is invalid');
       const allocationDepositCaps = plan.allocationBootstrap === true
@@ -2658,7 +2712,7 @@ export class RebalanceExecutor {
         sqrtPriceX96: destinationState.sqrtPriceX96,
         tickLower: target.tickLower, tickUpper: target.tickUpper,
         slippageBps: this.config.depositSlippageBps,
-        liquidityReserveBps: this.config.depositLiquidityReserveBps
+        liquidityReserveBps: this.getDepositLiquidityReserveBps()
       });
       if (allocationDepositCaps) depositPlan = { ...depositPlan, ...allocationDepositCaps };
       this.assertValidDeposit(depositPlan, 'Refreshed cross-pool deposit plan is invalid');

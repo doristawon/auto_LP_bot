@@ -375,6 +375,61 @@ test('confirmed allocation deposit revert is deferred only with unchanged balanc
     'third failed deposit within the hour must remain locked for inspection');
 });
 
+test('allocation bootstrap inherits only its own explicitly configured swap cost limit', () => {
+  const { executor } = makeExecutor();
+  Object.assign(executor.config, { maxSwapPriceImpactBps: 200,
+    autoTopupSwapEnabled: true, autoTopupSwapPoolId: POOL, autoTopupMaxSwapPriceImpactBps: 350 });
+  assert.equal(executor.allocationSwapMaxImpactBps(pool), 350);
+  assert.equal(executor.allocationSwapMaxImpactBps({ id: `0x${'cc'.repeat(32)}` }), 200);
+  executor.config.autoTopupSwapEnabled = false;
+  assert.equal(executor.allocationSwapMaxImpactBps(pool), 200);
+});
+
+test('scoped deposit simulation only reduces liquidity after a matching final amount-cap failure', async () => {
+  const executor = Object.create(RebalanceExecutor.prototype);
+  executor.config = { walletAddress: OTHER, chainId: 4663 };
+  const plan = { liquidity: 1000n, amount0Max: 100n, amount1Max: 200n, required0: 100n, required1: 200n };
+  const calls = [{ to: OTHER, data: '0xaaaa', value: 0n, gasLimit: 100000 },
+    { to: OTHER, data: '0xbbbb', value: 0n, gasLimit: 700000 }];
+  const errorData = (required, cap) => '0x0f569baf'+BigInt(required).toString(16).padStart(64,'0')
+    +BigInt(cap).toString(16).padStart(64,'0');
+  let simulations = 0;
+  let alwaysFails = false;
+  let cap = 100n;
+  executor.writeProvider = { async send(method, params) {
+    if(method==='eth_chainId')return '0x1237';
+    assert.equal(method,'eth_simulateV1');
+    simulations++;
+    const submitted = params[0].blockStateCalls[0].calls;
+    return [{ calls: submitted.map((_call,index) => index===submitted.length-1 && (simulations===1||alwaysFails)
+      ? {status:'0x0',error:{message:'amount cap',data:errorData(125n,cap)}}
+      : {status:'0x1',logs:[]}) }];
+  } };
+  const result = await executor.simulateScopedDepositSequence(calls,plan,liquidity=>'0x'+liquidity.toString(16));
+  assert.equal(result.depositPlan.liquidity,798n);
+  assert.equal(result.depositPlan.amount0Max,plan.amount0Max);
+  assert.equal(result.depositPlan.amount1Max,plan.amount1Max);
+  assert.equal(calls.at(-1).data,'0xbbbb','original requests remain immutable');
+  assert.equal(simulations,2);
+  alwaysFails=true;simulations=0;
+  await assert.rejects(executor.simulateScopedDepositSequence(calls,plan,()=> '0xcccc'),/amount cap/);
+  assert.equal(simulations,3,'simulation retries are bounded');
+  cap=99n;simulations=0;
+  await assert.rejects(executor.simulateScopedDepositSequence(calls,plan,()=> '0xcccc'),/amount cap/);
+  assert.equal(simulations,1,'unrelated cap failures must not be refitted');
+});
+
+test('allocation deposits retain one percent liquidity headroom without changing legacy reserves', () => {
+  const {executor,settings}=makeExecutor();
+  executor.config.depositLiquidityReserveBps=10;
+  assert.equal(executor.getDepositLiquidityReserveBps(),100);
+  executor.config.depositLiquidityReserveBps=250;
+  assert.equal(executor.getDepositLiquidityReserveBps(),250);
+  settings.set('investmentAllocation',{version:1,enabled:false,allocations:[]});
+  executor.config.depositLiquidityReserveBps=10;
+  assert.equal(executor.getDepositLiquidityReserveBps(),10);
+});
+
 test('actual wallet write queue is serial and reports active and queued writes', async () => {
   const { executor } = makeExecutor();
   executor.writeTail = Promise.resolve();

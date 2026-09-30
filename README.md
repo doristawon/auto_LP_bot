@@ -559,4 +559,6 @@ npm test
 
 首次建倉在報價刷新後，可在已核准的精確額度內重算流動性，仍須通過完整換幣與存入模擬。換幣成功後的存入上限只涵蓋該池回執確認的剩餘代幣；授權後依最新價格重算 Tight。若存入有明確失敗回執、兩種代幣餘額均未變且沒有待確認 nonce，下一輪可重新估值投入；每小時最多允許兩次這類恢復，第三次會鎖定待檢查，結果不明的交易一律維持恢復鎖定。
 
+兩池模式的存入至少保留 1% 流動性餘量，降低 Tight 區間對數個 ticks 變動的敏感度。完整模擬只有最後存入的明確金額上限錯誤時，最多三次向下修正流動性；代幣上限與換幣輸入不會增加。首次建倉也沿用該池已明確設定的換幣成本上限，不會誤套用另一個池子的設定。
+
 The dashboard can store a per-wallet allocation across up to two supported USDG-denominated Fables ERC20 pools. Weights are integer basis points totaling 10,000. Saving a configuration changes strategy settings only; it does not submit a transaction. Fresh capital estimates come from the existing scan cycle and may remain pending until the next valuation refresh. Allocation mode handles OOR reconstruction within each pool and does not withdraw healthy LP solely to restore target weights. The single-pool APR and immediate-rotation controls are disabled while allocation mode is active.

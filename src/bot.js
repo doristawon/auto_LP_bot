@@ -1737,7 +1737,8 @@ export class AutoLpBot {
         const result = await this.executor.executeAllocationBootstrap({
           pool,
           allocationFundingScope: scope,
-          maxPriceImpactBps: this.config.maxSwapPriceImpactBps ?? 200,
+          maxPriceImpactBps: this.executor.allocationSwapMaxImpactBps?.(pool)
+            ?? this.config.maxSwapPriceImpactBps ?? 200,
           minGasReserveWei: this.config.topUpMinGasReserveWei
         });
         if (result?.status === 'completed') {
