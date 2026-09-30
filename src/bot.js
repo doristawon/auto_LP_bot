@@ -1724,7 +1724,11 @@ export class AutoLpBot {
     }
 
     if (!this.config.autoTopupEnabled) return null;
-    for (const pool of targetPools) {
+    const fundingOrder = [...targetPools].sort((a, b) => {
+      const hasActive = (pool) => (pool.positions || []).some((position) => BigInt(position.shares || 0) > 0n);
+      return Number(hasActive(a)) - Number(hasActive(b));
+    });
+    for (const pool of fundingOrder) {
       const scope = this.getAllocationFundingScope(pool.id);
       const availableUsdG = Number(scope.availableUsdG || 0);
       if (!Number.isFinite(availableUsdG) || availableUsdG < this.config.autoTopupMinIdleUsd) continue;

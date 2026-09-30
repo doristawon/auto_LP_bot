@@ -205,7 +205,7 @@ test('fresh allocation scan preserves LP range decoration for the top-up schedul
     position.outside = false;
     position.shouldRebalance = false;
   };
-  bot.getAllocationFundingScope = (poolId) => ({ availableUsdG: 20, poolId,
+  bot.getAllocationFundingScope = (poolId) => ({ availableUsdG: poolId === POOL_A ? 20 : 0, poolId,
     allocationUpdatedAt: 1234, tokenCaps: { [USDG]: '1000000', [CASHCAT]: '1000000' } });
   let topUpCalled = 0;
   bot.executor = { async topUpPoolPosition() { topUpCalled++; return { status: 'completed' }; } };
@@ -213,4 +213,25 @@ test('fresh allocation scan preserves LP range decoration for the top-up schedul
   assert.equal(result?.status, 'completed');
   assert.equal(topUpCalled, 1, 'fresh range scan should retain inside/in-range eligibility');
   assert.equal(decorateCalls, 2, 'the scheduled scan and post-top-up refresh both decorate the discovered position');
+});
+
+test('allocation bootstraps the empty second pool before topping up the first healthy pool', async () => {
+  const { bot, pools } = makeBot();
+  bot.config.dryRun = true;
+  bot.config.autoTopupEnabled = true;
+  bot.config.autoTopupMinIdleUsd = 1;
+  bot.executionPaused = false;
+  for (const pool of pools) pool.state = { ...pool._initialState, tick: 0 };
+  pools[0].positions = [{ id: 'healthy', shares: 1n, outside: false }];
+  pools[1].positions = [];
+  bot.refreshAllocationFundingSnapshot = async () => {};
+  bot.getAllocationFundingScope = (poolId) => ({ poolId, availableUsdG: 20 });
+  const jobs = [];
+  bot.executor = {
+    async executeAllocationBootstrap({ pool }) { jobs.push(pool.id); return { status: 'completed' }; },
+    async topUpPoolPosition() { throw new Error('Healthy pool top-up must not starve an empty allocation'); }
+  };
+  const result = await bot.runAllocationExecutionCycle(pools, []);
+  assert.equal(result.status, 'completed');
+  assert.deepEqual(jobs, [POOL_B]);
 });

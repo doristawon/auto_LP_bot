@@ -721,9 +721,11 @@ export class RebalanceExecutor {
     if (!allocationEnabled && allocationFundingScope) {
       throw new Error('Allocation scope was supplied while saved allocation mode is disabled');
     }
+    const usesConfiguredSwapLimit = String(pool?.id || '').toLowerCase()
+      === String(this.config.autoTopupSwapPoolId || '').toLowerCase();
     const swapEnabledForPool = this.config.autoTopupSwapEnabled === true
-      && String(pool?.id || '').toLowerCase() === String(this.config.autoTopupSwapPoolId || '').toLowerCase();
-    const topUpMaxPriceImpactBps = swapEnabledForPool
+      && (allocationEnabled || usesConfiguredSwapLimit);
+    const topUpMaxPriceImpactBps = usesConfiguredSwapLimit
       ? this.config.autoTopupMaxSwapPriceImpactBps
       : this.config.maxSwapPriceImpactBps ?? 200;
     if (!Number.isInteger(Number(dustBps)) || Number(dustBps) < 0 || Number(dustBps) >= 10_000) {
@@ -1004,6 +1006,10 @@ export class RebalanceExecutor {
         executableSwapPlan || { direction: 'none' },
         depositPlan
       );
+      if (!executableSwapPlan) {
+        await this.simulateTopUpSequence({ pool, position, approvalRequests,
+          swapPlan: { direction: 'none' }, depositPlan });
+      }
       const feeOverrides = await this.getPinnedFeeOverrides();
       const maxFeePerGas = feeCap(feeOverrides);
       if (maxFeePerGas <= 0n) throw new Error('Cannot determine a native gas fee for top-up preflight');
@@ -1122,19 +1128,12 @@ export class RebalanceExecutor {
           postSwapBalancesRaw: stringifyRawBalances(postExecutionBalances)
         });
       } else {
-        const refreshedDepositPlan = buildExactDepositPlan({
-          rawAmount0: funding.raw0,
-          rawAmount1: funding.raw1,
-          sqrtPriceX96: validation.state.sqrtPriceX96,
-          tickLower: Number(position.tickLower),
-          tickUpper: Number(position.tickUpper),
-          slippageBps: this.config.depositSlippageBps,
-          liquidityReserveBps: this.config.depositLiquidityReserveBps
-        });
-        this.assertValidDeposit(refreshedDepositPlan, 'Refreshed top-up deposit-only liquidity is invalid');
-        await this.assertExactHookAllowance(pool.token0, pool.key.hooks, refreshedDepositPlan.amount0Max);
-        await this.assertExactHookAllowance(pool.token1, pool.key.hooks, refreshedDepositPlan.amount1Max);
-        depositPlan = refreshedDepositPlan;
+        // Keep the plan whose exact caps were approved. Price movement can
+        // invalidate that plan, but must never silently resize its allowance.
+        await this.assertExactHookAllowance(pool.token0, pool.key.hooks, depositPlan.amount0Max);
+        await this.assertExactHookAllowance(pool.token1, pool.key.hooks, depositPlan.amount1Max);
+        await this.simulateTopUpSequence({ pool, position, approvalRequests: [],
+          swapPlan: { direction: 'none' }, depositPlan });
       }
 
       validation = await this.validateTopUpPosition(pool, position, 'top-up-pre-deposit');
@@ -1150,21 +1149,9 @@ export class RebalanceExecutor {
       if (actualInventory.raw0 < 0n || actualInventory.raw1 < 0n) {
         throw new Error('Top-up pair balance fell below the retained dust reserve');
       }
-      if (executableSwapPlan) {
-        if (BigInt(depositPlan.amount0Max) > actualInventory.raw0
-          || BigInt(depositPlan.amount1Max) > actualInventory.raw1) {
-          throw new Error('Post-swap inventory is below the sequentially simulated deposit caps');
-        }
-      } else {
-        depositPlan = buildExactDepositPlan({
-          rawAmount0: actualInventory.raw0,
-          rawAmount1: actualInventory.raw1,
-          sqrtPriceX96: validation.state.sqrtPriceX96,
-          tickLower: Number(position.tickLower),
-          tickUpper: Number(position.tickUpper),
-          slippageBps: this.config.depositSlippageBps,
-          liquidityReserveBps: this.config.depositLiquidityReserveBps
-        });
+      if (BigInt(depositPlan.amount0Max) > actualInventory.raw0
+        || BigInt(depositPlan.amount1Max) > actualInventory.raw1) {
+        throw new Error('Actual inventory is below the sequentially simulated deposit caps');
       }
       this.assertValidDeposit(depositPlan, 'Recomputed top-up deposit liquidity is invalid');
       await this.assertExactHookAllowance(pool.token0, pool.key.hooks, depositPlan.amount0Max);
@@ -1195,7 +1182,7 @@ export class RebalanceExecutor {
       await this.assertTopUpGasBudget({
         reserveWei,
         maxFeePerGas,
-        futureGasLimit: depositGas * 120n / 100n,
+        futureGasLimit: depositGas * 150n / 100n + 25_000n,
         phase: 'before-deposit'
       });
       phase = 'deposit_preflighted';
@@ -1401,13 +1388,14 @@ export class RebalanceExecutor {
   }
 
   async simulateTopUpSequence({ pool, position, approvalRequests, swapPlan, depositPlan }) {
-    if (!swapPlan || swapPlan.direction === 'none' || !swapPlan.quote) {
+    const hasSwap = swapPlan?.direction !== 'none';
+    if (!swapPlan || (hasSwap && !swapPlan.quote)) {
       throw new Error('A priced swap is required for sequential top-up simulation');
     }
     const deadline = this.deadline();
-    const swapRequest = this.router.buildV4ExactInputSingle({
+    const swapRequest = hasSwap ? this.router.buildV4ExactInputSingle({
       pool: swapPlan.swapPool || pool, quote: swapPlan.quote, deadline
-    });
+    }) : null;
     const depositData = this.fables.encodeDeposit(
       pool,
       { tickLower: Number(position.tickLower), tickUpper: Number(position.tickUpper) },
@@ -1421,10 +1409,10 @@ export class RebalanceExecutor {
         to: tx.to, data: tx.data, value: tx.value || 0n,
         gasLimit: Number(TOP_UP_APPROVAL_GAS_RESERVE)
       })),
-      {
+      ...(swapRequest ? [{
         to: swapRequest.router, data: swapRequest.data, value: swapRequest.value,
         gasLimit: Number(TOP_UP_SWAP_GAS_LIMIT)
-      },
+      }] : []),
       {
         to: pool.key.hooks, data: depositData, value: 0n,
         gasLimit: Number(TOP_UP_DEPOSIT_GAS_LIMIT)

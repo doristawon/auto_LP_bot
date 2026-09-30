@@ -555,4 +555,6 @@ npm test
 
 中控台可為各錢包設定最多兩個支援的 USDG Fables ERC20 池，權重以整數 basis points 表示且合計 10,000。儲存只更新策略設定，不會立即送出交易；若自動平衡已啟動，新配置會在後續符合條件的週期生效。資金估值沿用既有掃描週期更新，下一輪估值前會維持待更新狀態。啟用配置時，各池依自己的 OOR 政策處理；不會只因權重漂移就撤出健康 LP。單池 APR 及立即換倉控制會停用。
 
+在「池子監控與 APR → 兩池資金配置」可搜尋池子及修改百分比，合計必須為 100%。每輪最多執行一個資金操作；到期的 OOR 優先，其次是尚未建倉的指定池，最後才處理既有 LP 加倉。啟用 `AUTO_TOPUP_SWAP_ENABLED` 時，配置內的各池都能在自己的資金上限內檢查餘額換幣；沿用指定池的獨立換幣成本上限，其餘池使用 `MAX_SWAP_PRICE_IMPACT_BPS`。加倉保留完整模擬與授權的原始存入數量，授權後再次模擬；價格變動造成原計畫失效時會停止，不會任意擴大授權或動用另一池的預留資金。
+
 The dashboard can store a per-wallet allocation across up to two supported USDG-denominated Fables ERC20 pools. Weights are integer basis points totaling 10,000. Saving a configuration changes strategy settings only; it does not submit a transaction. Fresh capital estimates come from the existing scan cycle and may remain pending until the next valuation refresh. Allocation mode handles OOR reconstruction within each pool and does not withdraw healthy LP solely to restore target weights. The single-pool APR and immediate-rotation controls are disabled while allocation mode is active.
