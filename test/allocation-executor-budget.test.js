@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Interface } from 'ethers';
 import { RebalanceExecutor } from '../src/adapters/executor.js';
-import { getSqrtPriceAtTick } from '../src/math/v4-fixed.js';
+import { buildExactDepositPlan, getSqrtPriceAtTick } from '../src/math/v4-fixed.js';
 import { addAllocationReceiptDeltas, allocationPairCaps, assertAllocationRawCaps,
   clipAllocationPairBalances } from '../src/execution/allocation-funding.js';
 
@@ -200,6 +200,7 @@ test('actual same-pool allocation bootstrap scopes both assets with no conversio
     tokenCaps: { [USDG]: { rawCap: rawStable.toString(), priceUsdG: 1 },
       [MOO]: { rawCap: rawMoo.toString(), priceUsdG: 0.02 } } };
   const erc20 = new Interface(['function balanceOf(address) view returns(uint256)']);
+  const requestQuotes = new Map();
   Object.assign(executor, {
     config: { ...executor.config, chainId: 4663, usdgAddress: USDG, autoTopupDustBps: 0,
       tightWidthBps: 120, rangePreset: 'custom-bps', swapSlippageBps: 50, depositSlippageBps: 50,
@@ -211,20 +212,33 @@ test('actual same-pool allocation bootstrap scopes both assets with no conversio
       if (method === 'eth_chainId') return '0x1237';
       assert.equal(method, 'eth_simulateV1');
       const calls = params[0].blockStateCalls[0].calls;
-      return [{ calls: calls.map((call) => ({ status: '0x1', gasUsed: '0x5208',
-        returnData: call.data.startsWith(erc20.getFunction('balanceOf').selector)
-          ? erc20.encodeFunctionResult('balanceOf', [call.to.toLowerCase() === USDG ? rawStable * 2n : rawMoo * 2n])
-          : '0x', logs: [] })) }];
+      let stable = rawStable, moo = rawMoo;
+      return [{ calls: calls.map((call) => {
+        const quote = requestQuotes.get(call.data);
+        if (quote) {
+          if (quote.tokenIn === USDG) { stable -= BigInt(quote.rawAmountIn); moo += BigInt(quote.rawAmountOut); }
+          else { moo -= BigInt(quote.rawAmountIn); stable += BigInt(quote.rawAmountOut); }
+        }
+        return { status: '0x1', gasUsed: '0x5208',
+          returnData: call.data.startsWith(erc20.getFunction('balanceOf').selector)
+            ? erc20.encodeFunctionResult('balanceOf', [call.to.toLowerCase() === USDG ? stable : moo])
+            : '0x', logs: [] };
+      }) }];
     } },
     quoter: {
       selectSamePairSwapPool: async () => ({ pool: bootstrapPool }),
       async quoteExactInputSingleRaw(_pool, tokenIn, rawAmountIn) {
         const rawAmountOut = tokenIn === 0 ? BigInt(rawAmountIn) * 50n : BigInt(rawAmountIn) / 50n;
         return { rawAmountIn: BigInt(rawAmountIn), rawAmountOut,
-          minRawAmountOut: rawAmountOut, tokenOut: tokenIn === 0 ? MOO : USDG };
+          minRawAmountOut: rawAmountOut, tokenIn: tokenIn === 0 ? USDG : MOO,
+          tokenOut: tokenIn === 0 ? MOO : USDG };
       }
     },
-    router: { buildV4ExactInputSingle() { return { router: `0x${'66'.repeat(20)}`, data: '0x1234', value: 0n }; } },
+    router: { buildV4ExactInputSingle({ quote }) {
+      const data = '0x'+BigInt(quote.rawAmountIn).toString(16).padStart(64, '0');
+      requestQuotes.set(data, quote);
+      return { router: `0x${'66'.repeat(20)}`, data, value: 0n };
+    } },
     readRawTokenBalances: async () => new Map([[USDG, rawStable], [MOO, rawMoo]]),
     buildTopUpApprovalRequests: async () => [],
     assertValidDeposit() {},
@@ -243,7 +257,8 @@ test('actual same-pool allocation bootstrap scopes both assets with no conversio
   };
   const resimulated = await executor.resimulatePreparedAllocationBootstrap(plan, bootstrapPool, preview);
   assert.equal(resimulated.pendingApprovalCount, 0);
-  assert.equal(resimulated.depositPlan, preparedDeposit, 'mined exact approval amounts stay pinned while resimulating');
+  assert.equal(resimulated.depositPlan.amount0Max, preparedDeposit.amount0Max);
+  assert.equal(resimulated.depositPlan.amount1Max, preparedDeposit.amount1Max);
   assert.equal(approvalChecks[0].deposit, preparedDeposit);
   if (preparedSwap) assert.equal(approvalChecks[0].swap, preparedSwap);
   assert.equal(resimulated.scopedBefore, preview.scopedBefore, 'resimulation cannot enlarge this pool funding scope');
@@ -269,6 +284,95 @@ test('actual same-pool allocation bootstrap scopes both assets with no conversio
   assert.deepEqual(preview.routeSwaps, []);
   assert.ok(preview.balanceSwap === null || typeof preview.balanceSwap === 'object');
   assert.ok(preview.funding.every((entry) => BigInt(entry.maxSpendRaw) <= BigInt(scope.tokenCaps[entry.address].rawCap)));
+});
+
+test('allocation bootstrap refits refreshed swap output within unchanged exact approval and funding caps', async () => {
+  const executor = Object.create(RebalanceExecutor.prototype);
+  const unit = 10n ** 18n;
+  const target = { tickLower: 39000, tickUpper: 39400 };
+  const livePool = { id: POOL, key: { hooks: OTHER },
+    token0: { address: USDG }, token1: { address: MOO } };
+  const original = buildExactDepositPlan({ rawAmount0: 50n * unit, rawAmount1: 2500n * unit,
+    sqrtPriceX96: getSqrtPriceAtTick(39121), ...target });
+  const prepared = { before: new Map([[USDG, 500n * unit], [MOO, 0n]]),
+    routeSwaps: [], withdrawCall: null, deadline: Math.floor(Date.now()/1000) + 1200,
+    funding: [{ address: USDG, maxSpendRaw: 100n * unit }, { address: MOO, maxSpendRaw: 0n }],
+    depositPlan: original, finalTarget: target,
+    balanceSwap: { plan: { tokenIn: 0, tokenOut: 1, rawAmountIn: 50n * unit } },
+    preparedCapitalCalls: [{ to: CASHCAT, data: '0xaaaa', value: 0n, gasLimit: 500000 },
+      { to: OTHER, data: '0xdddd', value: 0n, gasLimit: 700000 }] };
+  const erc20 = new Interface(['function balanceOf(address) view returns(uint256)']);
+  let stableAfter = 450n * unit;
+  let encoded;
+  const submissions = [];
+  Object.assign(executor, {
+    config: { chainId: 4663, walletAddress: OTHER, depositSlippageBps: 50, depositLiquidityReserveBps: 10 },
+    assertAllocationJobCurrent() {}, buildTopUpApprovalRequests: async () => [],
+    readRawTokenBalances: async () => prepared.before,
+    fables: { readPoolState: async () => ({ tick: 39160, sqrtPriceX96: getSqrtPriceAtTick(39160),
+      paused: false, liquidity: 1n }), encodeDeposit(_pool, _target, liquidity, cap0, cap1) {
+      encoded = { liquidity, cap0, cap1 }; return '0xeeee';
+    } },
+    findWalletDepositEvent: () => ({ liquidity: 1n }),
+    writeProvider: { async send(method, params) {
+      if (method === 'eth_chainId') return '0x1237';
+      const calls = params[0].blockStateCalls[0].calls;
+      submissions.push(calls);
+      return [{ calls: calls.map((call) => ({ status: '0x1', gasUsed: '0x5208', logs: [],
+        returnData: call.data.startsWith(erc20.getFunction('balanceOf').selector)
+          ? erc20.encodeFunctionResult('balanceOf', [call.to === USDG ? stableAfter : 2475n * unit]) : '0x' })) }];
+    } }
+  });
+  const plan = { allocationBootstrap: true, allocationFundingScope: {} };
+  const result = await executor.resimulatePreparedAllocationBootstrap(plan, livePool, prepared,
+    { router: CASHCAT, data: '0xbbbb', value: 0n });
+  assert.equal(result.depositPlan.amount0Max, original.amount0Max);
+  assert.equal(result.depositPlan.amount1Max, original.amount1Max);
+  assert.equal(encoded.cap0, original.amount0Max);
+  assert.equal(encoded.cap1, original.amount1Max);
+  assert.ok(encoded.liquidity < original.liquidity, 'latest output/price changes adjust liquidity, not approvals');
+  assert.equal(submissions.length, 2, 'preview plus complete swap/deposit simulation are both required');
+  assert.equal(submissions.at(-1)[0].data, '0xbbbb');
+  assert.equal(submissions.at(-1).at(-1).data, '0xeeee');
+  assert.strictEqual(result.funding, prepared.funding);
+  stableAfter = 449n * unit;
+  await assert.rejects(executor.resimulatePreparedAllocationBootstrap(plan, livePool, prepared), /scoped exact input/);
+});
+
+test('confirmed allocation deposit revert is deferred only with unchanged balances, no pending nonce and bounded retries', async () => {
+  const { executor, settings } = makeExecutor();
+  const hash = `0x${'aa'.repeat(32)}`;
+  const scope = { allocationUpdatedAt: 123, poolId: POOL,
+    tokenCaps: { [USDG]: '1000', [MOO]: '500' } };
+  const plan = { allocationBootstrap: true, allocationFundingScope: scope };
+  const journal = { phase: 'deposit_sent', tx: { deposit: hash, routeSwaps: [] },
+    allocationRemainingRaw: { [USDG]: '100', [MOO]: '400' } };
+  const error = { code: 'TRANSACTION_REVERTED', message: 'known deposit revert',
+    receipt: { hash, status: 0, blockNumber: 500 } };
+  const before = { raw0: 100n, raw1: 400n };
+  let after = before;
+  let pending = 50;
+  const events = [];
+  executor.ledger = { append(type, data) { events.push({ type, data }); } };
+  executor.readRawPairBalances = async () => after;
+  executor.readProvider = { async getTransactionCount(_wallet, tag) { return tag === 'pending' ? pending : 50; } };
+  assert.equal(await executor.deferConfirmedAllocationDepositFailure(plan, pool, journal,
+    { ...error, code: 'BROADCAST_OUTCOME_UNCERTAIN' }, before), false);
+  assert.equal(await executor.deferConfirmedAllocationDepositFailure(plan, pool, journal,
+    { ...error, receipt: { ...error.receipt, hash: `0x${'bb'.repeat(32)}` } }, before), false);
+  after = { ...before, raw0: 99n };
+  assert.equal(await executor.deferConfirmedAllocationDepositFailure(plan, pool, journal, error, before), false);
+  after = before; pending = 51;
+  assert.equal(await executor.deferConfirmedAllocationDepositFailure(plan, pool, journal, error, before), false);
+  pending = 50;
+  assert.equal(await executor.deferConfirmedAllocationDepositFailure(plan, pool, journal, error, before), true);
+  assert.equal(settings.get('activeRebalanceExecution').phase, 'failed');
+  assert.deepEqual(settings.get('activeRebalanceExecution').allocationRemainingRaw, journal.allocationRemainingRaw);
+  assert.equal(settings.get('allocationDepositFailures')[POOL].count, 1);
+  assert.equal(events[0].type, 'rebalance.deposit_retry_deferred');
+  assert.equal(await executor.deferConfirmedAllocationDepositFailure(plan, pool, journal, error, before), true);
+  assert.equal(await executor.deferConfirmedAllocationDepositFailure(plan, pool, journal, error, before), false,
+    'third failed deposit within the hour must remain locked for inspection');
 });
 
 test('actual wallet write queue is serial and reports active and queued writes', async () => {
