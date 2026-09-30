@@ -11,6 +11,8 @@ import { fetchWalletCashflowCandidates, fetchEthUsdCloseAt, fetchNativeBalanceAt
 import { buildUsdPriceMap } from './analytics/prices.js';
 import { computeAllocationFunding, normalizeInvestmentAllocation, valuePoolPositionsUsdG } from './analytics/allocation.js';
 import { PortfolioAnalytics } from './analytics/portfolio.js';
+import { evaluateStopLoss, normalizeStopLoss } from './analytics/stop-loss.js';
+import { executeStopLiquidation, reconcileStopLiquidation } from './execution/stop-liquidation.js';
 import { rebalanceTiming } from './dashboard/rebalance-timing.js';
 import { PointsTracker } from './analytics/points-tracker.js';
 import { POINTS_DAY_MS, pointsCampaignDayStartMs } from './analytics/points.js';
@@ -130,7 +132,8 @@ export class AutoLpBot {
     this.points = new PointsTracker(config, this.ledger, this.state);
     this.market = { refreshedAt: 0, stateRefreshedAt: 0, pools: [], prices: new Map(), latestBlock: 0, fablesStats: null };
     this.rpcHealth = [];
-    this.resumeExecutionAfterStartup = this.state.getSetting('executionPaused', true) === false;
+    this.resumeExecutionAfterStartup = this.state.getSetting('executionPaused', true) === false
+      && !this.state.getSetting('stopLossLatched', false);
     this.executionPaused = true;
     // Keep the persisted operator intent until the first healthy wallet scan.
     // If this process dies during startup, the next one must still retry the
@@ -182,7 +185,13 @@ export class AutoLpBot {
       });
       log('info', 'rpc.health', { endpoints: this.rpcHealth.map((x) => ({ index: x.index, ok: x.ok, chainId: x.chainId })) });
       this.useHealthyRpcEndpoints();
+      await reconcileStopLiquidation(this.executor);
       await this.executor.reconcileStartupJournal();
+      const stopped = this.state.getSetting('stopLiquidationStatus', null);
+      if (['queued', 'running'].includes(stopped?.status)) {
+        this.state.setSetting('stopLiquidationStatus', { ...stopped, status: 'failed',
+          error: '服務中斷；已維持停止狀態，請查看交易復原狀態後重試剩餘清倉。', at: Date.now() });
+      }
       await this.refreshMarket(true);
     } finally {
       this.initializing = false;
@@ -209,6 +218,7 @@ export class AutoLpBot {
     if (next && source === 'dashboard') this.resumeExecutionAfterStartup = false;
     if (!next && source !== 'startup-restore') this.resumeExecutionAfterStartup = false;
     if (!next) {
+      if (this.state.getSetting('stopLossLatched', false)) throw new Error('已停止清倉；請確認清倉結果後重新設定停損基準才能啟動。');
       const activeExecution = this.state.getSetting('activeRebalanceExecution', null);
       const terminal = new Set(['completed', 'failed']);
       if (activeExecution?.phase && !terminal.has(activeExecution.phase)) {
@@ -256,6 +266,9 @@ export class AutoLpBot {
       && !executionBusy
       && !recoveryRequired;
     const startBlockers = [];
+    const stopLoss = this.getStopLossSnapshot();
+    if (stopLoss.latched) startBlockers.push('stop-loss-latched');
+    else if (stopLoss.settings.enabled && stopLoss.status === 'unavailable') startBlockers.push('stop-loss-valuation-unavailable');
     const allocationConfig = this.getInvestmentAllocationConfig();
     const allocationEnabled = allocationConfig.enabled === true;
     const allocationSnapshot = allocationEnabled ? this.getInvestmentAllocationSnapshot() : null;
@@ -312,6 +325,7 @@ export class AutoLpBot {
         chainId: this.config.chainId
       },
       runtimeIntervals: this.getRuntimeIntervals(),
+      stopLoss,
       targetMode: this.config.targetMode,
       selectedExecutionTargetPoolId: selectedTargetPoolId || null,
       investmentTarget: this.getInvestmentTargetSnapshot(),
@@ -1108,6 +1122,108 @@ export class AutoLpBot {
     };
   }
 
+  getStopLossSnapshot() {
+    const settings = this.state.getSetting('stopLossSettings', { enabled: false, lossPct: 15, basisMode: 'armed-equity', version: 1 });
+    const reference = this.state.getSetting('stopLossReference', null);
+    return { ...evaluateStopLoss(settings, reference, this.snapshot), settings, reference,
+      latched: this.state.getSetting('stopLossLatched', false),
+      liquidation: this.state.getSetting('stopLiquidationStatus', null),
+      scanIntervalMs: this.config.pollIntervalMs };
+  }
+
+  setStopLossSettings(value) {
+    const settings = normalizeStopLoss(value);
+    if (this.stopLiquidationPromise || this.initializing || this.rpcManagementActive
+      || (this.cycleActive && this.state.getSetting('stopLossLatched', false))) throw new Error('停止清倉或初始化正在執行，請稍後修改。');
+    const journal = this.state.getSetting('activeRebalanceExecution', null);
+    if (journal?.phase && !['completed', 'failed'].includes(journal.phase)) throw new Error('有待確認交易，無法重設停損。');
+    const previous = this.state.getSetting('stopLossSettings', { enabled: false });
+    const capture = settings.enabled && (!previous.enabled || value.rebase === true
+      || !this.state.getSetting('stopLossReference', null));
+    if (capture) {
+      const portfolio = this.snapshot?.portfolio;
+      const equity = portfolio?.currentValueUsd;
+      const age = Date.now() - Number(this.snapshot?.generatedAt || 0);
+      if (this.cycleActive || !Number.isFinite(equity) || !(equity > 0) || !Number.isFinite(age)
+        || !(Number(this.snapshot?.generatedAt) > 0) || age < -30_000 || age > 15 * 60_000) throw new Error('請先完成最新且所有追蹤資產都有價格的錢包掃描，再設定啟用估值基準。');
+      if (this.snapshot?.bot?.wallet && this.snapshot.bot.wallet.toLowerCase() !== this.config.walletAddress.toLowerCase()) throw new Error('停損基準的快照錢包不符，請重新掃描。');
+      this.state.setSetting('stopLossReference', { equityUsd: equity, at: this.snapshot.generatedAt,
+        asOfBlock: this.snapshot.blockNumber, netCashflowUsd: portfolio.netCashflowUsd,
+        flowAccountingComplete: portfolio.accountingComplete === true,
+        wallet: this.config.walletAddress.toLowerCase() });
+      this.state.setSetting('stopLossLatched', false);
+    }
+    this.state.setSetting('stopLossSettings', settings);
+    this.ledger.append('stop_loss.settings', { ...settings, rebased: capture });
+    return this.getStopLossSnapshot();
+  }
+
+  requestStopLiquidation({ confirm, maxCostBps = 500 } = {}) {
+    if (!this.config.dashboardManualControlEnabled) throw new Error('人工交易控制尚未啟用。');
+    if (confirm !== 'STOP_AND_LIQUIDATE') throw new Error('請確認撤出全部 LP 並換回 USDG。');
+    if (!Number.isInteger(maxCostBps) || maxCostBps < 1 || maxCostBps > 500) throw new Error('換幣成本上限須介於 1 與 500 bps。');
+    if (this.stopLiquidationPromise || (this.cycleActive
+      && this.state.getSetting('stopLiquidationStatus', null)?.status === 'running')) return this.getStopLossSnapshot();
+    this.state.setSetting('stopLossLatched', true);
+    this.resumeExecutionAfterStartup = false;
+    this.setExecutionPaused(true, 'stop-liquidate-request');
+    this.state.setSetting('stopLiquidationStatus', { status: 'queued', requestedAt: Date.now(), source: 'manual' });
+    this.stopLiquidationPromise = (async () => {
+      const until = Date.now() + 120_000;
+      while (this.cycleActive || this.initializing || this.rpcManagementActive) {
+        if (Date.now() > until) throw new Error('等待既有流程逾時；已停止新交易，請確認現有交易後重試清倉。');
+        await sleep(250);
+      }
+      await this.runOnce({ executeRebalances: false, source: 'stop-liquidate-scan' });
+      this.cycleActive = true;
+      let liquidation;
+      try { liquidation = await this.performStopLiquidation({ maxCostBps, source: 'manual' }); }
+      finally { this.cycleActive = false; }
+      try { await this.runOnce({ executeRebalances: false, source: 'stop-liquidate-readback' }); }
+      catch (error) { this.ledger.append('stop_loss.readback_deferred', { error: sanitize(error.message) }); }
+      return liquidation;
+    })().catch(error => {
+      this.state.setSetting('stopLiquidationStatus', { status: 'failed', error: sanitize(error.message), at: Date.now() });
+      this.ledger.append('stop_loss.request_failed', { error: sanitize(error.message) });
+    }).finally(() => { this.stopLiquidationPromise = null; });
+    return this.getStopLossSnapshot();
+  }
+
+  async performStopLiquidation({ maxCostBps = 500, source = 'auto-stop-loss' } = {}) {
+    this.state.setSetting('stopLossLatched', true);
+    this.resumeExecutionAfterStartup = false;
+    this.setExecutionPaused(true, source);
+    this.state.setSetting('stopLiquidationStatus', { status: 'running', source, at: Date.now() });
+    try {
+      // Discover ALL wallet Fables ranges, regardless of the selected investment pool.
+      const latest = await this.providers.readProvider.getBlockNumber();
+      const result = await this.fables.discoverWalletActivePools(this.market.pools,
+        Math.max(this.config.walletPoolDiscoveryFromBlock,
+          this.state.getCursor('walletPoolDiscovery', this.config.walletPoolDiscoveryFromBlock) - this.config.reorgLookbackBlocks),
+        latest, this.state.getSetting('walletRangeCandidates', []), { strict: true });
+      this.state.setSetting('walletRangeCandidates', result.knownRangeKeys);
+      const hydrated = await this.fables.hydratePoolStates(this.market.pools);
+      const pools = hydrated.map(pool => ({ ...pool, positions: [] }));
+      for (const pool of pools) {
+        if (!result.activePoolIds.some(id => id.toLowerCase() === pool.id.toLowerCase())) continue;
+        const positions = await this.fables.discoverPositions(pool,
+          Math.max(this.config.logFromBlock, latest - this.config.reorgLookbackBlocks), latest);
+        pool.positions = positions.positions;
+      }
+      const extraTokens = Object.keys(this.snapshot?.portfolio?.inventory || {}).map(address => ({ address }));
+      const liquidation = await executeStopLiquidation(this.executor, { pools, extraTokens, maxCostBps });
+      this.state.setSetting('stopLiquidationStatus', { ...liquidation, source, at: Date.now() });
+      if (source === 'auto-stop-loss') this.stopLiquidationReadbackPending = true;
+      this.state.setSetting('lastAction', { type: 'stop-liquidate', status: liquidation.status, at: Date.now() });
+      // The current portfolio is pre-exit; next readonly monitor replaces it.
+      if (this.snapshot?.bot) this.snapshot.bot.executionPaused = true;
+      return liquidation;
+    } catch (error) {
+      this.state.setSetting('stopLiquidationStatus', { status: 'failed', error: sanitize(error.message), at: Date.now() });
+      throw error;
+    }
+  }
+
   async startExecution(source = 'dashboard') {
     const status = await this.controlStatus();
     if (!status.startReadiness.ready) {
@@ -1256,6 +1372,7 @@ export class AutoLpBot {
 
   async manualImmediateRotation({ poolId, positionId, destinationPoolId, previewId = '',
     previewOnly = false, directExecute = false, maxCostBps = null }) {
+    if (this.state.getSetting('stopLossLatched', false) || this.stopLiquidationPromise) throw new Error('停止清倉已鎖定；請先完成清倉並重新設定停損基準。');
     if (this.rpcManagementActive || this.initializing) throw new Error('busy');
     if (this.getInvestmentAllocationConfig?.()?.enabled === true) {
       throw new Error('Disable pool allocation before using legacy manual rotation');
@@ -1606,7 +1723,7 @@ export class AutoLpBot {
         await this.refreshAllocationFundingSnapshot({ pools: targetPools, walletBalances, asOfBlock: latestBlock });
       }
       const portfolio = this.analytics.build({
-        targetPools,
+        targetPools: accountingPools,
         walletBalances,
         prices: this.market.prices,
         trackedTokens: uniqueTokens,
@@ -1666,6 +1783,20 @@ export class AutoLpBot {
           .map((position) => ({ pool, position }))
       );
       if (!executeRebalances || this.allocationUpdatePending) return snapshot;
+      if (this.state.getSetting('stopLossLatched', false) || this.stopLiquidationPromise) return snapshot;
+      const risk = this.getStopLossSnapshot();
+      if (!this.executionPaused && risk.settings.enabled) {
+        if (risk.status === 'unavailable') {
+          this.setExecutionPaused(true, 'stop-loss-valuation-unavailable');
+          return snapshot;
+        }
+        if (risk.triggered) {
+          this.ledger.append('stop_loss.triggered', risk);
+          try { await this.performStopLiquidation(); }
+          catch (error) { log('error', 'stop_loss.liquidation_failed', { error: error.message }); }
+          return snapshot;
+        }
+      }
       if (this.getInvestmentAllocationConfig?.()?.enabled === true) {
         await this.runAllocationExecutionCycle(targetPools, pendingRebalances);
         if (this.snapshot) {
@@ -1688,6 +1819,14 @@ export class AutoLpBot {
       return snapshot;
     } finally {
       this.cycleActive = false;
+      if (this.stopLiquidationReadbackPending) {
+        this.stopLiquidationReadbackPending = false;
+        const timer = setTimeout(() => {
+          void this.runOnce({ executeRebalances: false, source: 'auto-stop-readback' })
+            .catch(error => log('warn', 'stop_loss.readback_deferred', { error: error.message }));
+        }, 0);
+        timer.unref?.();
+      }
     }
   }
 

@@ -115,6 +115,19 @@ export class DashboardServer {
         return sendJson(res, 400, { error: sanitize(error.message || '更新週期設定失敗') });
       }
     }
+    if (req.method === 'GET' && url.pathname === '/api/risk/stop-loss') {
+      return sendJson(res, 200, bot.getStopLossSnapshot());
+    }
+    if (req.method === 'POST' && url.pathname === '/api/risk/stop-loss') {
+      const body = await readJsonBody(req);
+      try { return sendJson(res, 200, { ok: true, stopLoss: bot.setStopLossSettings(body) }); }
+      catch (error) { return sendJson(res, 409, { error: sanitize(error.message) }); }
+    }
+    if (req.method === 'POST' && url.pathname === '/api/control/stop-liquidate') {
+      const body = await readJsonBody(req);
+      try { return sendJson(res, 202, { ok: true, stopLoss: bot.requestStopLiquidation(body) }); }
+      catch (error) { return sendJson(res, 409, { error: sanitize(error.message) }); }
+    }
     if (req.method === 'POST' && url.pathname === '/api/control/pause') {
       bot.setExecutionPaused(true, 'dashboard');
       return sendJson(res, 200, { ok: true, executionPaused: true });

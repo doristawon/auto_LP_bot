@@ -8,6 +8,7 @@ import {
   pointsCampaignDayStartMs
 } from './points.js';
 import { fetchOfficialPoints, fetchWalletFeeEvidence } from './points-evidence.js';
+import { buildOfficialPointsCalibration } from './points-calibration.js';
 import {
   FABLES_POINTS_END_MS,
   FABLES_POINTS_START_MS
@@ -261,42 +262,6 @@ export class PointsTracker {
       this.setActualBaseline(totalPoints, new Date(official.settledAt).toISOString());
     }
 
-    // The bot may restart between settlements. Recover the prior official
-    // checkpoint from this wallet's ledger instead of retaining an obsolete
-    // first-day calibration merely because pointsOfficial is already current.
-    const ledgerPrior = this.ledger.all()
-      .filter((event) => event.type === 'points.official_settlement'
-        && Number(event.settledAt) < official.settledAt)
-      .sort((a, b) => Number(b.settledAt) - Number(a.settledAt))[0];
-    const previousSettlement = ledgerPrior || (priorForWallet
-      && Number(priorForWallet.settledAt) < official.settledAt ? priorForWallet : null);
-    if (previousSettlement) {
-      const addedPoints = Number(official.lpPoints || 0) - Number(previousSettlement.lpPoints || 0);
-      const addedFees = Number(official.settledFeesUsd || 0) - Number(previousSettlement.settledFeesUsd || 0);
-      if (addedPoints >= 0 && addedFees > 0.005) {
-        this.state.setSetting('pointsCalibration', {
-          wallet: official.wallet,
-          pointsPerFeeUsd: addedPoints / addedFees,
-          feeUsd: addedFees,
-          points: addedPoints,
-          programmeDayEnd: official.settledAt,
-          source: 'consecutive-official-settlements'
-        });
-      }
-    } else if (!priorForWallet && walletEvidence?.firstDepositAt != null
-      && walletEvidence.firstDepositAt >= official.settledAt - POINTS_DAY_MS
-      && walletEvidence.firstDepositAt < official.settledAt
-      && Number(official.lpPoints) > 0 && Number(official.settledFeesUsd) > 0.005) {
-      this.state.setSetting('pointsCalibration', {
-        wallet: official.wallet,
-        pointsPerFeeUsd: Number(official.lpPoints) / Number(official.settledFeesUsd),
-        feeUsd: Number(official.settledFeesUsd),
-        points: Number(official.lpPoints),
-        programmeDayEnd: official.settledAt,
-        source: 'first-wallet-lp-day'
-      });
-    }
-
     if (settlementChanged || !priorForWallet || priorForWallet.settledFeesUsd !== official.settledFeesUsd) {
       this.ledger.appendUnique(
         `points-settled:${official.wallet}:${official.settledAt}`,
@@ -310,6 +275,32 @@ export class PointsTracker {
         }
       );
       this.state.setSetting('pointsOfficial', official);
+    }
+
+    const coverageBroken = this.state.getSetting('pointsUserCoverageBrokenV2', null);
+    const calibrationAudit = buildOfficialPointsCalibration({
+      official,
+      settlementEvents: this.ledger.all(),
+      feeEvents: this.ledger.all(),
+      trackingStartedAt: Number(this.state.getSetting('pointsUserTrackingStartedAtV2', 0) || 0),
+      coverageBrokenAt: Number(coverageBroken?.at || 0) || null,
+      nowMs: Date.now()
+    });
+    this.state.setSetting('pointsCalibrationAudit', calibrationAudit);
+    if (calibrationAudit.status === 'ready') {
+      this.state.setSetting('pointsCalibration', {
+        wallet: official.wallet,
+        pointsPerFeeUsd: calibrationAudit.pointsPerFeeUsd,
+        feeUsd: calibrationAudit.officialFeeUsd,
+        points: calibrationAudit.officialLpPoints,
+        programmeDayEnd: calibrationAudit.referenceDayEnd,
+        sampleDays: calibrationAudit.sampleDays,
+        source: calibrationAudit.source
+      });
+    } else {
+      // Do not retain a stale single-day calibration when current coverage is
+      // insufficient to support the multi-day fit.
+      this.state.setSetting('pointsCalibration', null);
     }
   }
 
@@ -436,7 +427,10 @@ export class PointsTracker {
     const official = this.state.getSetting('pointsOfficial', null);
     const calibration = this.state.getSetting('pointsCalibration', null);
     const matchingEvidence = official && this.walletEvidence?.wallet === official.wallet ? this.walletEvidence : null;
-    const matchingCalibration = official && calibration?.wallet === official.wallet ? calibration : null;
+    const calibrationAudit = this.state.getSetting('pointsCalibrationAudit', null);
+    const matchingCalibration = official && calibration?.wallet === official.wallet
+      && calibration?.source === 'official-multi-day-weighted'
+      && Number(calibration.sampleDays) >= 2 ? calibration : null;
     const unsettled = matchingEvidence && official
       ? Number(matchingEvidence.lifetimeFeeUsd) - Number(official.settledFeesUsd || 0)
       : null;
@@ -458,6 +452,16 @@ export class PointsTracker {
       && Number.isFinite(Number(matchingCalibration.pointsPerFeeUsd))
       && localFeeCoverageComplete
       ? Object.values(snapshot.buckets).reduce((sum, bucket) => {
+        const dayBudget = dailyPointBudget(Number(bucket.timestampMs));
+        return sum + Number(bucket.userFeeUsd || 0)
+          * Number(matchingCalibration.pointsPerFeeUsd) * dayBudget / settledBudget;
+      }, 0)
+      : null;
+    const officialSettlementAt = Number(official?.settledAt || 0);
+    const recordedFeeEstimatedDelta = matchingCalibration && settledBudget > 0
+      && Number.isFinite(Number(matchingCalibration.pointsPerFeeUsd))
+      ? Object.values(snapshot.buckets).reduce((sum, bucket) => {
+        if (Number(bucket.timestampMs) < officialSettlementAt) return sum;
         const dayBudget = dailyPointBudget(Number(bucket.timestampMs));
         return sum + Number(bucket.userFeeUsd || 0)
           * Number(matchingCalibration.pointsPerFeeUsd) * dayBudget / settledBudget;
@@ -496,7 +500,17 @@ export class PointsTracker {
       calibratedPointsPerFeeUsd,
       calibratedEstimatedDelta,
       calibratedEstimatedTotal,
+      recordedFeeEstimatedDelta,
+      recordedFeeEstimatedTotal: recordedFeeEstimatedDelta == null || snapshot.actualBaseline <= 0
+        ? null : snapshot.actualBaseline + recordedFeeEstimatedDelta,
+      recordedFeeCoverageComplete: recordedFeeEstimatedDelta == null
+        ? null : localFeeCoverageComplete,
+      recordedFeeEstimateStatus: recordedFeeEstimatedDelta == null ? null
+        : localFeeCoverageComplete ? 'calibrated-recorded-fees' : 'provisional-incomplete-coverage',
+      recordedFeeEstimateBasis: recordedFeeEstimatedDelta == null ? null
+        : 'locally-recorded fee.accrual after the latest official settlement; may omit fees and is not an exact or guaranteed lower-bound estimate',
       calibrationSource: matchingCalibration?.source || null,
+      calibrationAudit: calibrationAudit?.wallet === official?.wallet ? calibrationAudit : null,
       evidenceError: this.evidenceError,
       simulatedAt: this.lastSimulationAt,
       simulationIntervalMs: Math.max(5_000, Number(this.config.pointsSimulationIntervalMs) || 15_000),

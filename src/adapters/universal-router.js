@@ -23,10 +23,13 @@ export class UniversalRouterAdapter {
     this.address = address;
   }
 
-  buildV4ExactInputSingle({ pool, quote, deadline }) {
+  buildV4ExactInputSingle({ pool, quote, deadline, allowNative = false }) {
     if (pool.protocol === 'v3') return this.buildV3ExactInput({ pool, quote, deadline });
     if (!quote) throw new Error('A verified V4 quote is required');
-    if (pool.token0.address.toLowerCase() === ZERO_ADDRESS || pool.token1.address.toLowerCase() === ZERO_ADDRESS) {
+    const nativeInput = quote.zeroForOne ? pool.token0.address.toLowerCase() === ZERO_ADDRESS
+      : pool.token1.address.toLowerCase() === ZERO_ADDRESS;
+    const hasNative = pool.token0.address.toLowerCase() === ZERO_ADDRESS || pool.token1.address.toLowerCase() === ZERO_ADDRESS;
+    if (hasNative && !(allowNative === true && nativeInput)) {
       throw new Error('Native-token V4 swap encoding is not enabled in the minimal router path');
     }
     const amountIn = BigInt(quote.rawAmountIn);
@@ -55,17 +58,20 @@ export class UniversalRouterAdapter {
       coder.encode(['address', 'uint256'], [tokenOut.address, minAmountOut])
     ];
     const v4Input = coder.encode(['bytes', 'bytes[]'], [actions, params]);
+    const commands = nativeInput ? '0x1004' : COMMAND_V4_SWAP;
+    const inputs = nativeInput ? [v4Input,
+      coder.encode(['address', 'address', 'uint256'], [ZERO_ADDRESS, this.config.walletAddress, 0n])] : [v4Input];
     const data = routerInterface.encodeFunctionData('execute', [
-      COMMAND_V4_SWAP,
-      [v4Input],
+      commands,
+      inputs,
       BigInt(deadline)
     ]);
     return {
       router: this.address,
       data,
-      value: 0n,
+      value: nativeInput ? amountIn : 0n,
       deadline: Number(deadline),
-      commands: COMMAND_V4_SWAP,
+      commands,
       v4Actions: actions,
       amountIn: amountIn.toString(),
       minAmountOut: minAmountOut.toString(),

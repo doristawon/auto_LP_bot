@@ -84,7 +84,7 @@ export class FablesAdapter {
     return this.config.targetSymbols.every((symbol) => symbols.has(symbol));
   }
 
-  async discoverWalletActivePools(allPools, fromBlock, latestBlock, knownRangeKeys = []) {
+  async discoverWalletActivePools(allPools, fromBlock, latestBlock, knownRangeKeys = [], { strict = false } = {}) {
     const poolByFingerprint = new Map(allPools.map((pool) => [poolKeyFingerprint(pool.key), pool]));
     const hookAddresses = new Map();
     for (const pool of allPools) hookAddresses.set(pool.key.hooks.toLowerCase(), pool.key.hooks);
@@ -92,7 +92,8 @@ export class FablesAdapter {
     const candidates = new Map();
     for (const value of knownRangeKeys || []) {
       const parsed = parseRangeCandidateKey(value);
-      if (parsed && hookAddresses.has(parsed.hook.toLowerCase())) {
+      if (parsed && (strict || hookAddresses.has(parsed.hook.toLowerCase()))) {
+        if (strict) hookAddresses.set(parsed.hook.toLowerCase(), parsed.hook);
         candidates.set(rangeCandidateKey(parsed.hook, parsed.rangeId), parsed);
       }
     }
@@ -131,6 +132,7 @@ export class FablesAdapter {
           hook.rangeKey(candidate.rangeId)
         ]);
       } catch (error) {
+        if (strict) throw new Error('清倉 LP 探測未完整，未送出交易：' + error.message);
         log('warn', 'wallet_pool.range_probe_failed', {
           hook: candidate.hook,
           rangeId: candidate.rangeId,
@@ -141,6 +143,7 @@ export class FablesAdapter {
       if (!range.exists) continue;
       const pool = poolByFingerprint.get(poolKeyFingerprint(range.key));
       if (!pool) {
+        if (strict && BigInt(shares) > 0n) throw new Error('有 LP 不在已驗證的池子清單中；請更新池子後重試清倉。');
         log('warn', 'wallet_pool.registry_miss', {
           hook: candidate.hook,
           rangeId: candidate.rangeId,
