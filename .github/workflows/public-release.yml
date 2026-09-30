@@ -42,10 +42,10 @@ jobs:
           npm test
 
       - name: Build sanitized public snapshot
-        run: node scripts/build-public-release.js
+        run: node scripts/build-public-release.js --out=artifacts/public-release
 
       - name: Validate sanitized public snapshot
-        working-directory: public-release
+        working-directory: artifacts/public-release
         run: |
           npm ci
           npm audit --omit=dev --audit-level=high
@@ -55,24 +55,19 @@ jobs:
 
       - name: Remove validation-only generated files
         run: |
-          rm -rf public-release/node_modules
-          rm -rf public-release/artifacts
+          rm -rf artifacts/public-release/node_modules
+          rm -rf artifacts/public-release/artifacts
 
       - name: Final privacy scan summary
         run: |
-          test -f public-release/PUBLIC_RELEASE_MANIFEST.md
-          ! grep -Rni --exclude='package-lock.json' \
-            -e 'doristawon@gmail.com' \
-            -e '6F196aF3B69c521eEd9436Abc9130699dF1c50bF' \
-            -e '2Ea3d6F7b1841687324819c239E6f657435FDe6e' \
-            -e '4473378d0f20e03c647fe0d5b22a482b5700af7638578046d41396b5adf2dd30' \
-            public-release
+          test -f artifacts/public-release/PUBLIC_RELEASE_MANIFEST.md
+          test ! -e public-release
 
       - name: Upload public-ready source
         uses: actions/upload-artifact@v4
         with:
           name: auto-lp-bot-public-ready
-          path: public-release/
+          path: artifacts/public-release/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 30

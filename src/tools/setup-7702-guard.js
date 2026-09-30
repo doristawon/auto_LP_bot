@@ -1,15 +1,17 @@
 import fs from 'node:fs';
-import { Interface, Wallet, getAddress, id } from 'ethers';
+import { Interface, Wallet, getAddress, id, parseUnits } from 'ethers';
 import { loadDotEnv } from '../env.js';
 import { loadConfig } from '../config.js';
 import { createProviders, verifyProviders } from '../rpc/providers.js';
 import { ZERO_ADDRESS } from '../constants.js';
+import { selectToolWallet } from '../wallet-tool-config.js';
 
 loadDotEnv();
-const config = loadConfig();
+const config = selectToolWallet(loadConfig());
 if (!config.privateKey) throw new Error('PRIVATE_KEY is required');
-const { writeProvider, rawProviders } = createProviders(config);
-await verifyProviders(rawProviders, config.chainId);
+const { rawProviders } = createProviders(config);
+const rpcHealth = await verifyProviders(rawProviders, config.chainId);
+const writeProvider = rawProviders[rpcHealth.find(item => item.ok).index];
 const wallet = new Wallet(config.privateKey, writeProvider);
 if (wallet.address.toLowerCase() !== config.walletAddress.toLowerCase()) throw new Error('PRIVATE_KEY does not match WALLET_ADDRESS');
 
@@ -30,13 +32,22 @@ if (!revoke) {
   const artifact = JSON.parse(fs.readFileSync('artifacts/Fables7702Guard.json', 'utf8'));
   data = new Interface(artifact.abi).encodeFunctionData('guardVersion', []);
 }
-const tx = await wallet.sendTransaction({
+const fees = await writeProvider.getFeeData();
+const maxFeePerGas = parseUnits(String(config.maxGasGwei), 'gwei');
+if (!fees.gasPrice || fees.gasPrice > maxFeePerGas) throw new Error('Guard setup gas price exceeds configured limit');
+const request = {
   to: wallet.address,
   data,
   nonce: txNonce,
   type: 4,
-  authorizationList: [authorization]
-});
+  authorizationList: [authorization],
+  maxFeePerGas,
+  maxPriorityFeePerGas: (fees.maxPriorityFeePerGas || 0n) > maxFeePerGas ? maxFeePerGas : (fees.maxPriorityFeePerGas || 0n)
+};
+const estimatedGas = await wallet.estimateGas(request);
+const gasLimit = (estimatedGas * 125n + 99n) / 100n;
+if (gasLimit > 150000n) throw new Error('Guard setup requires more than the 150000 gas limit');
+const tx = await wallet.sendTransaction({ ...request, gasLimit });
 console.log(JSON.stringify({ sent: tx.hash, revoke, guardAddress }, null, 2));
 const receipt = await tx.wait(config.confirmations);
 if (!receipt || receipt.status !== 1) throw new Error('EIP-7702 setup transaction failed');

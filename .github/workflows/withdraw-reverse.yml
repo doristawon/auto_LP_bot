@@ -30,16 +30,34 @@ jobs:
             echo "configured=false" >> "$GITHUB_OUTPUT"
             echo "Wallet history analysis skipped: WALLET_ADDRESS secret is not configured."
           fi
+      - name: Check optional transaction hash secret
+        id: transactions
+        env:
+          REFERENCE_TX_HASHES: ${{ secrets.REFERENCE_WITHDRAW_TX_HASHES }}
+        run: |
+          if [[ -n "$REFERENCE_TX_HASHES" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Wallet history analysis skipped: REFERENCE_WITHDRAW_TX_HASHES secret is not configured."
+          fi
       - name: Reverse real Fables withdraw transactions
-        if: steps.wallet.outputs.configured == 'true'
+        if: steps.wallet.outputs.configured == 'true' && steps.transactions.outputs.configured == 'true'
         env:
           RPC_URLS: "https://rpc.mainnet.chain.robinhood.com"
           WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
+          REFERENCE_TX_HASHES: ${{ secrets.REFERENCE_WITHDRAW_TX_HASHES }}
           TARGET_MODE: "wallet-active"
           DATA_DIR: "./data"
           STATE_FILE: "./state/reverse-state.json"
         run: |
-          if node src/tools/reverse-withdraw.js > "$RUNNER_TEMP/withdraw-reverse.log" 2>&1; then
+          IFS=',' read -r -a tx_hashes <<< "$REFERENCE_TX_HASHES"
+          tx_args=()
+          for tx_hash in "${tx_hashes[@]}"; do
+            tx_hash="$(printf '%s' "$tx_hash" | xargs)"
+            [[ -z "$tx_hash" ]] || tx_args+=(--tx "$tx_hash")
+          done
+          if node src/tools/reverse-withdraw.js "${tx_args[@]}" > "$RUNNER_TEMP/withdraw-reverse.log" 2>&1; then
             status=0
           else
             status=$?

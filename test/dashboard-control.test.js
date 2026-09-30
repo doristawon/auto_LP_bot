@@ -5,7 +5,7 @@ import { DashboardServer } from '../src/dashboard/server.js';
 import { dashboardPage } from '../src/dashboard/page.js';
 
 function makeHarness() {
-  const calls = { scans: [], manual: [], rotation: [], pause: [], investmentTarget: [], manualBaselines: [], quoteRefreshes: 0, evidenceRefreshes: 0 };
+  const calls = { scans: [], manual: [], rotation: [], pause: [], investmentTarget: [], allocation: [], manualBaselines: [], quoteRefreshes: 0, evidenceRefreshes: 0 };
   const config = {
     dashboardEnabled: true,
     dashboardHost: '127.0.0.1',
@@ -47,6 +47,8 @@ function makeHarness() {
       calls.investmentTarget.push({ mode, poolId });
       return { mode, poolId: poolId || null, pair: mode === 'specific-pool' ? 'USDG/MOO' : 'USDG/UBIK' };
     },
+    async getInvestmentAllocationSnapshot() { return { version: 1, enabled: false, allocations: [], totalWeightBps: 0, capital: { denomination: 'USDG', totalUsdG: 12, byPool: [], priceStatus: { status: 'fresh' } }, status: 'disabled' }; },
+    async setInvestmentAllocation(value) { calls.allocation.push(value); return { version: 1, ...value, status: value.enabled ? 'ready' : 'disabled' }; },
     async startExecution(source) {
       this.setExecutionPaused(false, source);
       return { ok: true, executionPaused: false, mode: 'dry-run' };
@@ -151,9 +153,9 @@ test('dashboard transaction ledger excludes unrelated market swaps', async () =>
   });
 });
 
-test('dashboard names an unavailable custom RPC and its public fallback', () => {
+test('dashboard names unavailable custom RPC without assuming a public fallback', () => {
   const html = dashboardPage();
-  assert.match(html, /自訂 RPC 不可用，使用官方公開 RPC/);
+  assert.match(html, /自訂 RPC 暫不可用，正使用其他可用 RPC/);
   assert.match(html, /全市場 Swap 僅供積分估算/);
 });
 
@@ -171,6 +173,50 @@ test('dashboard accepts an explicit auto-APR or specified-pool reinvest target',
   });
 });
 
+test('investment allocation is wallet-scoped, read back, and accepts a synthetic 70/30 split', async () => {
+  await withServer(async ({ calls }, base) => {
+    const get = await fetch(base + '/api/investment/allocation');
+    assert.equal(get.status, 200);
+    assert.equal((await get.json()).enabled, false);
+    const put = await fetch(base + '/api/investment/allocation', {
+      method: 'PUT', headers: { 'content-type': 'application/json', origin: base },
+      body: JSON.stringify({ enabled: true, allocations: [{ poolId: 'synthetic-pool-a', weightBps: 7000 }, { poolId: 'synthetic-pool-b', weightBps: 3000 }] })
+    });
+    assert.equal(put.status, 200);
+    assert.deepEqual(calls.allocation, [{ enabled: true, allocations: [{ poolId: 'synthetic-pool-a', weightBps: 7000 }, { poolId: 'synthetic-pool-b', weightBps: 3000 }] }]);
+  });
+});
+
+test('investment allocation rejects malformed shape without exposing backend details', async () => {
+  await withServer(async (_h, base) => {
+    const response = await fetch(base + '/api/investment/allocation', {
+      method: 'PUT', headers: { 'content-type': 'application/json', origin: base },
+      body: JSON.stringify({ enabled: true, allocations: [{ poolId: 'x' }, { poolId: 'y' }, { poolId: 'z' }] })
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: '請提供最多兩個池子及有效的啟用狀態。' });
+  });
+});
+
+test('legacy single-pool and immediate-rotation APIs reject writes while two-pool mode is enabled', async () => {
+  await withServer(async ({ bot, calls, config }, base) => {
+    bot.getInvestmentAllocationSnapshot = async () => ({ enabled: true });
+    const target = await fetch(base + '/api/investment/target', {
+      method: 'POST', headers: { 'content-type': 'application/json', origin: base },
+      body: JSON.stringify({ mode: 'specific-pool', poolId: 'synthetic-pool' })
+    });
+    assert.equal(target.status, 409);
+    assert.equal(calls.investmentTarget.length, 0);
+    config.dashboardManualControlEnabled = true;
+    const rotation = await fetch(base + '/api/control/rotate/preview', {
+      method: 'POST', headers: { 'content-type': 'application/json', origin: base },
+      body: JSON.stringify({ poolId: 'source', destinationPoolId: 'destination' })
+    });
+    assert.equal(rotation.status, 409);
+    assert.equal(calls.rotation.length, 0);
+  });
+});
+
 test('dashboard provides a keyword-filtered specified-pool selector', () => {
   const html = dashboardPage();
   assert.match(html, /id="investmentPoolSearch" type="search"/);
@@ -178,6 +224,9 @@ test('dashboard provides a keyword-filtered specified-pool selector', () => {
   assert.match(html, /investmentPoolSearch'\)\.addEventListener\('input'/);
   assert.match(html, /destinationPoolId=\$\('investmentPool'\)\.value\.toLowerCase\(\)/);
   assert.match(html, /錢包餘額（目前沒有 LP）/);
+  assert.match(html, /id="allocationPanel"/);
+  assert.match(html, /id="allocationPoolSearch" type="search"/);
+  assert.match(html, /兩池各自依本池 OOR 政策重建/);
 });
 
 test('dashboard manual rebalance is fail-closed until explicitly armed', async () => {

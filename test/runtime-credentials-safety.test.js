@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { persistRuntimeCredentials } from '../src/runtime-credentials.js';
 
-const oldAddress = '0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF';
+const oldAddress = '0x0000000000000000000000000000000000000007';
 const newAddress = '0x00000000000000000000000000000000000000aa';
 const oldKey = '0x' + '11'.repeat(32);
 const newKey = '0x' + '22'.repeat(32);

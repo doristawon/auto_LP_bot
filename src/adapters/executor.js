@@ -24,6 +24,9 @@ import { UniversalRouterAdapter } from './universal-router.js';
 import { V4QuoterAdapter } from './quoter.js';
 import { buildExactBalancedSwapPlan, quotePriceImpactBps } from '../execution/exact-rebalance.js';
 import { buildPairFundingScope } from '../execution/pair-funding.js';
+import { addAllocationReceiptDeltas, allocationPairCaps,
+  clipAllocationPairBalances } from '../execution/allocation-funding.js';
+import { usdGAssetPriceFromPool } from '../analytics/allocation.js';
 import { simulateSequentialCalls } from '../execution/sequential-simulation.js';
 import {
   MAX_UINT128,
@@ -45,6 +48,9 @@ const guardInterface = new Interface(EIP7702_GUARD_ABI);
 const hookInterface = new Interface(HOOK_ABI);
 const swapEventInterface = new Interface([
   'event Swap(bytes32 indexed id,address indexed sender,int128 amount0,int128 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint24 fee)'
+]);
+const transferEventInterface = new Interface([
+  'event Transfer(address indexed from,address indexed to,uint256 value)'
 ]);
 const depositedTopic = id(DEPOSITED_EVENT).toLowerCase();
 const TOP_UP_DEPOSIT_GAS_LIMIT = 1_200_000n;
@@ -77,10 +83,106 @@ export class RebalanceExecutor {
     this.quoter = new V4QuoterAdapter(readProvider, undefined, config.externalSwapRoutesEnabled,
       { getUsdPrice, maxGasGwei: config.maxGasGwei });
     this.router = new UniversalRouterAdapter(readProvider, config);
+    this.writeTail = Promise.resolve();
+    this.activeWrites = 0;
+    this.queuedWrites = 0;
   }
 
-  async execute(plan) {
+  get hasPendingWrite() { return this.activeWrites > 0 || this.queuedWrites > 0; }
+
+  isAllocationModeEnabled() {
+    const saved = this.state?.getSetting('investmentAllocation', null);
+    if (saved == null) return false;
+    if (saved.version !== 1 || typeof saved.enabled !== 'boolean' || !Array.isArray(saved.allocations)) {
+      throw new Error('Saved investment allocation schema is invalid; wallet writes are blocked');
+    }
+    const seen = new Set();
+    const entriesValid = saved.allocations.every((entry) => {
+      const poolId = String(entry?.poolId || '').toLowerCase();
+      const weightBps = Number(entry?.weightBps);
+      if (!/^0x[0-9a-f]{64}$/.test(poolId) || seen.has(poolId)
+        || !Number.isInteger(weightBps) || weightBps < 1 || weightBps > 10_000) return false;
+      seen.add(poolId);
+      return true;
+    });
+    const sum = saved.allocations.reduce((total, entry) => total + Number(entry?.weightBps), 0);
+    const shapeValid = entriesValid && (saved.enabled
+      ? saved.allocations.length >= 1 && saved.allocations.length <= 2 && sum === 10_000
+      : saved.allocations.length === 0 || (saved.allocations.length <= 2 && sum === 10_000));
+    if (!shapeValid) throw new Error('Saved investment allocation schema is invalid; wallet writes are blocked');
+    return saved.enabled;
+  }
+
+  runWalletWrite(operation) {
+    if (!this.writeTail || typeof this.writeTail.then !== 'function') this.writeTail = Promise.resolve();
+    if (!Number.isFinite(this.activeWrites)) this.activeWrites = 0;
+    if (!Number.isFinite(this.queuedWrites)) this.queuedWrites = 0;
+    this.queuedWrites++;
+    let release;
+    const previous = this.writeTail;
+    this.writeTail = new Promise((resolve) => { release = resolve; });
+    return previous.then(async () => {
+      this.queuedWrites--;
+      this.activeWrites++;
+      try { return await operation(); }
+      finally { this.activeWrites--; release(); }
+    });
+  }
+
+  assertAllocationFundingScope(pool, scope, { requireFresh = false } = {}) {
+    if (!this.isAllocationModeEnabled()) {
+      throw new Error('Allocation execution is not enabled in the saved wallet configuration');
+    }
+    const updatedAt = Number(this.state.getSetting('investmentAllocationUpdatedAt', 0));
+    if (!scope || Number(scope.allocationUpdatedAt) !== updatedAt || updatedAt <= 0
+      || String(scope.poolId || '').toLowerCase() !== String(pool?.id || '').toLowerCase()) {
+      throw new Error('Fresh matching pool allocation scope is required; full-wallet fallback is disabled');
+    }
+    if (requireFresh && (!Number.isFinite(Number(scope.priceObservedAt))
+      || Date.now() < Number(scope.priceObservedAt)
+      || Date.now() - Number(scope.priceObservedAt) > 5 * 60_000)) {
+      throw new Error('Fresh allocation valuation is required before the first capital movement');
+    }
+    const allocations = this.state.getSetting('investmentAllocation', {}).allocations || [];
+    if (!allocations.some((entry) => String(entry.poolId).toLowerCase() === String(pool.id).toLowerCase())) {
+      throw new Error('Pool is not in the current saved allocation');
+    }
+    for (const token of [pool.token0, pool.token1]) {
+      const cap = scope.tokenCaps?.[String(token.address).toLowerCase()];
+      const rawCap = cap?.rawCap ?? cap;
+      if (rawCap === undefined || BigInt(rawCap) < 0n) throw new Error('Allocation pair-token raw cap is missing or invalid');
+    }
+    return scope;
+  }
+
+  clipPairToAllocation(pool, balances, scope) {
+    this.assertAllocationFundingScope(pool, scope);
+    const caps = allocationPairCaps(pool, scope);
+    const clipped = clipAllocationPairBalances({
+      [pool.token0.address.toLowerCase()]: BigInt(balances.raw0),
+      [pool.token1.address.toLowerCase()]: BigInt(balances.raw1)
+    }, caps);
+    return { raw0: clipped[pool.token0.address.toLowerCase()],
+      raw1: clipped[pool.token1.address.toLowerCase()] };
+  }
+
+  assertAllocationJobCurrent(pool, scope) {
+    this.assertAllocationFundingScope(pool, scope, { requireFresh: false });
+  }
+
+  execute(plan) { return this.runWalletWrite(() => this.executeUnlocked(plan)); }
+
+  async executeUnlocked(plan) {
     const destinationPool = plan.destinationPool || plan.pool;
+    const allocationEnabled = this.isAllocationModeEnabled();
+    if (allocationEnabled) {
+      this.assertAllocationFundingScope(plan.pool, plan.allocationFundingScope, { requireFresh: true });
+      if (String(destinationPool.id).toLowerCase() !== String(plan.pool.id).toLowerCase()) {
+        throw new Error('Enabled pool allocation forbids cross-pool OOR/manual rotation');
+      }
+    } else if (plan.allocationFundingScope) {
+      throw new Error('Allocation scope was supplied while saved allocation mode is disabled');
+    }
     if (plan.manualImmediate === true) {
       if (plan.manualSource !== 'dashboard'
         || String(destinationPool.id).toLowerCase() === String(plan.pool.id).toLowerCase()) {
@@ -89,11 +191,11 @@ export class RebalanceExecutor {
       if (this.config.dryRun || !this.config.enableLiveWrites) {
         throw new Error('Manual immediate rotation requires live writes');
       }
-      return this.executeCrossPool(plan, destinationPool);
+      return this.executeCrossPoolUnlocked(plan, destinationPool);
     }
     await this.assertPlanStillOutOfRange(plan, 'executor-entry');
     if (String(destinationPool.id).toLowerCase() !== String(plan.pool.id).toLowerCase()) {
-      return this.executeCrossPool(plan, destinationPool);
+      return this.executeCrossPoolUnlocked(plan, destinationPool);
     }
 
     if (this.config.dryRun || !this.config.enableLiveWrites) {
@@ -106,6 +208,7 @@ export class RebalanceExecutor {
     await this.assertLiveReady(plan);
     this.assertNoUnfinishedExecution();
     const rebalanceMaxImpactBps = this.samePoolRebalanceMaxImpactBps(plan.pool);
+    const allocationScope = plan.allocationFundingScope || null;
     let phase = 'prepared';
     let journal = {
       id: `${Date.now()}:${plan.pool.id}:${plan.position.id}`,
@@ -119,14 +222,23 @@ export class RebalanceExecutor {
         tickUpper: plan.position.tickUpper,
         shares: plan.position.shares.toString()
       },
+      allocationJobId: allocationScope ? (plan.allocationJobId
+        || `allocation:${allocationScope.allocationUpdatedAt}:${plan.pool.id}:${plan.position.id}`) : null,
+      allocationFundingScope: allocationScope ? jsonSafe(allocationScope) : null,
       tx: {}
     };
     this.saveJournal(journal);
 
     try {
       const preBalances = await this.readRawPairBalances(plan.pool);
+      if (allocationScope) this.assertAllocationFundingScope(plan.pool, allocationScope);
+      const scopedPreBalances = allocationScope
+        ? this.clipPairToAllocation(plan.pool, preBalances, allocationScope) : preBalances;
       journal = this.patchJournal(journal, {
-        preBalancesRaw: stringifyRawBalances(preBalances)
+        preBalancesRaw: stringifyRawBalances(preBalances),
+        allocationPhysicalBaselineRaw: allocationScope ? stringifyRawBalances(preBalances) : null,
+        allocationScopedBaselineRaw: allocationScope ? stringifyRawBalances(scopedPreBalances) : null,
+        allocationRemainingRaw: allocationScope ? stringifyRawBalances(scopedPreBalances) : null
       });
       const approvalState = await this.fables.readPoolState(plan.pool);
       const approvalBounds = buildExactWithdrawBounds({
@@ -139,8 +251,8 @@ export class RebalanceExecutor {
 
       // Prepare every approval path before principal is withdrawn. If a meme token
       // rejects approve/Permit2, fail while the LP is still intact.
-      const approval0 = approvalBounds.expected0 + BigInt(plan.position.owed0 || 0n) + preBalances.raw0;
-      const approval1 = approvalBounds.expected1 + BigInt(plan.position.owed1 || 0n) + preBalances.raw1;
+      const approval0 = approvalBounds.expected0 + BigInt(plan.position.owed0 || 0n) + scopedPreBalances.raw0;
+      const approval1 = approvalBounds.expected1 + BigInt(plan.position.owed1 || 0n) + scopedPreBalances.raw1;
       await this.ensureSwapAllowances(plan.pool.token0, approval0);
       await this.ensureSwapAllowances(plan.pool.token1, approval1);
       await this.ensureHookAllowance(plan.pool.token0, plan.pool.key.hooks, approval0);
@@ -150,6 +262,7 @@ export class RebalanceExecutor {
       // Approvals can consume blocks; re-check OOR only after all non-capital-moving
       // setup transactions are complete.
       const latest = await this.assertPlanStillOutOfRange(plan, 'pre-atomic-withdraw');
+      if (allocationScope) this.assertAllocationJobCurrent(plan.pool, allocationScope);
       const withdrawBounds = buildExactWithdrawBounds({
         sqrtPriceX96: latest.sqrtPriceX96,
         tickLower: plan.position.tickLower,
@@ -202,6 +315,8 @@ export class RebalanceExecutor {
         position: plan.position,
         guardedData,
         preBalances,
+        scopedPreBalances,
+        allocationScope,
         poolState: latest,
         deadline: withdrawDeadline,
         maxPriceImpactBps: rebalanceMaxImpactBps
@@ -239,16 +354,53 @@ export class RebalanceExecutor {
       if (oldShares !== 0n) throw new Error(`Old LP shares remain after full withdraw: ${oldShares}`);
 
       const postWithdrawBalances = await this.readRawPairBalances(plan.pool);
+      const actualWithdrawDelta = operationDelta(preBalances, postWithdrawBalances);
       const withdrawn = positiveOperationDelta(preBalances, postWithdrawBalances);
+      if (allocationScope) {
+        this.assertAllocationJobCurrent(plan.pool, allocationScope);
+        if (actualWithdrawDelta.raw0 < 0n || actualWithdrawDelta.raw1 < 0n) {
+          throw new Error('Allocation OOR withdrawal decreased a pool token balance');
+        }
+        const predicted = sequencePreflight.withdrawnRaw;
+        for (const key of ['raw0', 'raw1']) {
+          const expected = BigInt(predicted[key]);
+          const actual = actualWithdrawDelta[key];
+          const tolerance = expected / 100n + 2n;
+          if (actual + tolerance < expected || actual > expected + tolerance) {
+            throw new Error('Allocation OOR withdrawal receipt differs from the simulated LP credit');
+          }
+        }
+        const receiptDelta = this.getAllocationWalletReceiptDeltas(withdrawReceipt, [plan.pool.token0, plan.pool.token1]);
+        if (receiptDelta.raw0 !== actualWithdrawDelta.raw0 || receiptDelta.raw1 !== actualWithdrawDelta.raw1) {
+          throw new Error('Allocation OOR withdrawal physical delta differs from wallet ERC20 receipt transfers');
+        }
+        const withdrawalExpected = nonZeroExpectedDeltaMap(plan.pool, receiptDelta);
+        const scopedReceipt = addAllocationReceiptDeltas({
+          [plan.pool.token0.address.toLowerCase()]: scopedPreBalances.raw0,
+          [plan.pool.token1.address.toLowerCase()]: scopedPreBalances.raw1
+        }, {
+          [plan.pool.token0.address.toLowerCase()]: preBalances.raw0,
+          [plan.pool.token1.address.toLowerCase()]: preBalances.raw1
+        }, {
+          [plan.pool.token0.address.toLowerCase()]: postWithdrawBalances.raw0,
+          [plan.pool.token1.address.toLowerCase()]: postWithdrawBalances.raw1
+        }, withdrawalExpected);
+        if (Object.keys(scopedReceipt).length !== 2) throw new Error('Allocation withdrawal receipt did not cover the pair');
+      }
       if (withdrawn.raw0 === 0n && withdrawn.raw1 === 0n) {
         throw new Error('Withdraw confirmed but no token principal/fees reached the wallet');
       }
+      const scopedPostWithdraw = allocationScope ? {
+        raw0: scopedPreBalances.raw0 + actualWithdrawDelta.raw0,
+        raw1: scopedPreBalances.raw1 + actualWithdrawDelta.raw1
+      } : postWithdrawBalances;
       const fundingScope = buildPairFundingScope(
-        plan.pool, postWithdrawBalances, this.config.usdgAddress, this.config.autoTopupDustBps ?? 25
+        plan.pool, scopedPostWithdraw, this.config.usdgAddress, this.config.autoTopupDustBps ?? 25
       );
       journal = this.patchJournal(journal, {
         postWithdrawBalancesRaw: stringifyRawBalances(postWithdrawBalances),
         withdrawnRaw: stringifyRawBalances(withdrawn),
+        allocationRemainingRaw: allocationScope ? stringifyRawBalances(scopedPostWithdraw) : null,
         initialWalletFundingRaw: stringifyRawBalances(preBalances),
         dustRetainedRaw: stringifyRawBalances(fundingScope.dustRaw),
         combinedFundingRaw: stringifyRawBalances(fundingScope.funding)
@@ -313,9 +465,43 @@ export class RebalanceExecutor {
         phase = 'swap_confirmed';
         postSwapBalances = await this.readRawPairBalances(plan.pool);
         this.assertSwapReceiptBalances(plan.pool, executableSwapPlan, beforeSwap, postSwapBalances);
+        if (allocationScope) {
+          this.assertAllocationJobCurrent(plan.pool, allocationScope);
+          const delta = operationDelta(beforeSwap, postSwapBalances);
+          const transferDelta = this.getAllocationWalletReceiptDeltas(swapReceipt, [plan.pool.token0, plan.pool.token1]);
+          this.assertAllocationSwapEndpoints(transferDelta, executableSwapPlan);
+          if (delta.raw0 !== transferDelta.raw0 || delta.raw1 !== transferDelta.raw1) {
+            throw new Error('Allocation OOR swap physical balances differ from the pool swap receipt');
+          }
+          addAllocationReceiptDeltas({
+            [plan.pool.token0.address.toLowerCase()]: scopedPostWithdraw.raw0,
+            [plan.pool.token1.address.toLowerCase()]: scopedPostWithdraw.raw1
+          }, {
+            [plan.pool.token0.address.toLowerCase()]: beforeSwap.raw0,
+            [plan.pool.token1.address.toLowerCase()]: beforeSwap.raw1
+          }, {
+            [plan.pool.token0.address.toLowerCase()]: postSwapBalances.raw0,
+            [plan.pool.token1.address.toLowerCase()]: postSwapBalances.raw1
+          }, nonZeroExpectedDeltaMap(plan.pool, transferDelta));
+          addAllocationReceiptDeltas({
+            [plan.pool.token0.address.toLowerCase()]: scopedPostWithdraw.raw0,
+            [plan.pool.token1.address.toLowerCase()]: scopedPostWithdraw.raw1
+          }, {
+            [plan.pool.token0.address.toLowerCase()]: beforeSwap.raw0,
+            [plan.pool.token1.address.toLowerCase()]: beforeSwap.raw1
+          }, {
+            [plan.pool.token0.address.toLowerCase()]: postSwapBalances.raw0,
+            [plan.pool.token1.address.toLowerCase()]: postSwapBalances.raw1
+          }, {
+            [plan.pool.token0.address.toLowerCase()]: delta.raw0,
+            [plan.pool.token1.address.toLowerCase()]: delta.raw1
+          });
+        }
         journal = this.patchJournal(journal, {
           phase,
           tx: { ...journal.tx, swap: swapReceipt.hash || journal.tx.swap },
+        allocationRemainingRaw: allocationScope ? stringifyRawBalances(applyScopedSwap(scopedPostWithdraw,
+          postWithdrawBalances, postSwapBalances, plan.pool)) : null,
           swapPlan: serializeSwapPlan(executableSwapPlan),
           postSwapBalancesRaw: stringifyRawBalances(postSwapBalances)
         });
@@ -324,7 +510,10 @@ export class RebalanceExecutor {
         journal = this.patchJournal(journal, { phase });
       }
 
-      const strategyInventory = operationDelta(fundingScope.dustRaw, postSwapBalances);
+      const strategyInventory = allocationScope
+        ? operationDelta(fundingScope.dustRaw, applyScopedSwap(scopedPostWithdraw, postWithdrawBalances,
+          postSwapBalances, plan.pool))
+        : operationDelta(fundingScope.dustRaw, postSwapBalances);
       if (strategyInventory.raw0 < 0n || strategyInventory.raw1 < 0n) {
         throw new Error('Post-swap strategy inventory crossed below the retained wallet dust');
       }
@@ -395,6 +584,18 @@ export class RebalanceExecutor {
         }
       });
 
+      let allocationDepositBefore = null;
+      if (allocationScope) {
+        this.assertAllocationJobCurrent(plan.pool, allocationScope);
+        allocationDepositBefore = await this.readRawPairBalances(plan.pool);
+        if (allocationDepositBefore.raw0 !== postSwapBalances.raw0
+          || allocationDepositBefore.raw1 !== postSwapBalances.raw1) {
+          throw new Error('Allocation OOR pair balances changed after swap and before redeposit');
+        }
+        if (exactDeposit.amount0Max > strategyInventory.raw0 || exactDeposit.amount1Max > strategyInventory.raw1) {
+          throw new Error('Allocation OOR deposit caps exceed scoped LP and wallet inventory');
+        }
+      }
       const depositReceipt = await this.sendVerifiedTx({
         label: 'fablesDeposit',
         to: plan.pool.key.hooks,
@@ -406,6 +607,9 @@ export class RebalanceExecutor {
         }
       });
       phase = 'deposit_confirmed';
+      const allocationDepositReceipt = allocationScope
+        ? await this.verifyAllocationDepositReceipt(plan.pool, strategyInventory,
+          allocationDepositBefore, depositReceipt) : null;
       const depositEvent = this.findWalletDepositEvent(plan.pool, depositReceipt);
       if (!depositEvent) throw new Error('Deposit receipt is missing the wallet Deposited event');
 
@@ -433,6 +637,7 @@ export class RebalanceExecutor {
         phase: 'completed',
         completedAt: Date.now(),
         tx: { ...journal.tx, deposit: depositReceipt.hash || journal.tx.deposit },
+        allocationRemainingRaw: allocationDepositReceipt?.remaining || null,
         newPosition: {
           rangeId: depositEvent.rangeId,
           liquidity: depositEvent.liquidity.toString(),
@@ -454,6 +659,10 @@ export class RebalanceExecutor {
         depositHash: journal.tx.deposit,
         initialWalletFundingRaw: journal.initialWalletFundingRaw,
         combinedFundingRaw: journal.combinedFundingRaw,
+        allocationJobId: journal.allocationJobId || null,
+        allocationFundingScope: journal.allocationFundingScope || null,
+        allocationPhysicalBaselineRaw: journal.allocationPhysicalBaselineRaw || null,
+        allocationRemainingRaw: allocationDepositReceipt?.remaining || null,
         dustRetainedRaw: journal.dustRetainedRaw,
         target: finalTarget
       });
@@ -493,13 +702,25 @@ export class RebalanceExecutor {
     }
   }
 
-  async topUpPoolPosition({
+  topUpPoolPosition(options) {
+    return this.runWalletWrite(() => this.topUpPoolPositionUnlocked(options));
+  }
+
+  async topUpPoolPositionUnlocked({
     pool,
     position,
     dustBps = 0,
-    minGasReserveWei = this.config.topUpMinGasReserveWei
+    minGasReserveWei = this.config.topUpMinGasReserveWei,
+    allocationFundingScope = null
   }) {
     const liveWrites = this.config.enableLiveWrites && !this.config.dryRun;
+    const allocationEnabled = this.isAllocationModeEnabled();
+    if (allocationEnabled && !allocationFundingScope) {
+      throw new Error('Enabled pool allocation requires a fresh top-up scope; full-wallet fallback is disabled');
+    }
+    if (!allocationEnabled && allocationFundingScope) {
+      throw new Error('Allocation scope was supplied while saved allocation mode is disabled');
+    }
     const swapEnabledForPool = this.config.autoTopupSwapEnabled === true
       && String(pool?.id || '').toLowerCase() === String(this.config.autoTopupSwapPoolId || '').toLowerCase();
     const topUpMaxPriceImpactBps = swapEnabledForPool
@@ -521,9 +742,12 @@ export class RebalanceExecutor {
 
     let validation = await this.validateTopUpPosition(pool, position, 'top-up-entry');
     this.assertTokenPrices(pool);
+    if (allocationFundingScope) this.assertAllocationFundingScope(pool, allocationFundingScope, { requireFresh: true });
     const initialBalances = await this.readRawPairBalances(pool);
+    const scopedInitialBalances = allocationFundingScope
+      ? this.clipPairToAllocation(pool, initialBalances, allocationFundingScope) : initialBalances;
     const { dustRaw, funding, stableIndex } = buildPairFundingScope(
-      pool, initialBalances, this.config.usdgAddress, dustBps
+      pool, scopedInitialBalances, this.config.usdgAddress, dustBps
     );
     if (funding.raw0 < 0n || funding.raw1 < 0n) throw new Error('Top-up dust exceeds wallet pair balances');
     if (funding.raw0 === 0n && funding.raw1 === 0n) {
@@ -755,6 +979,12 @@ export class RebalanceExecutor {
         tickUpper: Number(position.tickUpper),
         sharesBefore: validation.shares.toString()
       },
+      allocationJobId: allocationFundingScope
+        ? `allocation:${allocationFundingScope.allocationUpdatedAt}:${pool.id}:${position.id}` : null,
+      allocationFundingScope: allocationFundingScope ? jsonSafe(allocationFundingScope) : null,
+      allocationPhysicalBaselineRaw: allocationFundingScope ? stringifyRawBalances(initialBalances) : null,
+      allocationScopedBaselineRaw: allocationFundingScope ? stringifyRawBalances(scopedInitialBalances) : null,
+      allocationRemainingRaw: allocationFundingScope ? stringifyRawBalances(scopedInitialBalances) : null,
       capitalScope: {
         source: 'wallet pair balances only',
         walletBalancesRaw: stringifyRawBalances(initialBalances),
@@ -813,6 +1043,7 @@ export class RebalanceExecutor {
         throw new Error('Pair-token wallet balances changed during top-up approvals; refusing stale plan');
       }
       let postExecutionBalances = afterApprovals;
+      let allocationInventory = scopedInitialBalances;
       if (executableSwapPlan) {
         await this.assertExactHookAllowance(pool.token0, pool.key.hooks, depositPlan.amount0Max);
         await this.assertExactHookAllowance(pool.token1, pool.key.hooks, depositPlan.amount1Max);
@@ -842,6 +1073,7 @@ export class RebalanceExecutor {
           swapPlan: serializeSwapPlan(latestSwapPlan),
           sequentialSimulationCalls: sequence.callCount
         });
+        if (allocationFundingScope) this.assertAllocationJobCurrent(pool, allocationFundingScope);
         const swapReceipt = await this.sendVerifiedTx({
           label: 'v4TopUpSwapExactInputSingle',
           to: sequence.swapRequest.router,
@@ -856,9 +1088,37 @@ export class RebalanceExecutor {
         phase = 'swap_confirmed';
         postExecutionBalances = await this.readRawPairBalances(pool);
         this.assertSwapReceiptBalances(pool, latestSwapPlan, afterApprovals, postExecutionBalances);
+        if (allocationFundingScope) {
+          this.assertAllocationJobCurrent(pool, allocationFundingScope);
+          const actualDelta = operationDelta(afterApprovals, postExecutionBalances);
+          const transferDelta = this.getAllocationWalletReceiptDeltas(swapReceipt, [pool.token0, pool.token1]);
+          this.assertAllocationSwapEndpoints(transferDelta, latestSwapPlan);
+          if (actualDelta.raw0 !== transferDelta.raw0 || actualDelta.raw1 !== transferDelta.raw1) {
+            throw new Error('Allocation swap receipt delta differs from the authorized scoped input/minOut');
+          }
+          const scopedReceipt = addAllocationReceiptDeltas({
+            [pool.token0.address.toLowerCase()]: scopedInitialBalances.raw0,
+            [pool.token1.address.toLowerCase()]: scopedInitialBalances.raw1
+          }, {
+            [pool.token0.address.toLowerCase()]: afterApprovals.raw0,
+            [pool.token1.address.toLowerCase()]: afterApprovals.raw1
+          }, {
+            [pool.token0.address.toLowerCase()]: postExecutionBalances.raw0,
+            [pool.token1.address.toLowerCase()]: postExecutionBalances.raw1
+          }, nonZeroExpectedDeltaMap(pool, transferDelta));
+          allocationInventory = { raw0: scopedReceipt[pool.token0.address.toLowerCase()],
+            raw1: scopedReceipt[pool.token1.address.toLowerCase()] };
+          if (allocationInventory.raw0 < 0n || allocationInventory.raw1 < 0n) {
+            throw new Error('Allocation swap receipt spent beyond this pool token cap');
+          }
+        }
         journal = this.patchJournal(journal, {
           phase,
           tx: { ...journal.tx, swap: swapReceipt.hash || journal.tx.swap },
+          allocationRemainingRaw: allocationFundingScope ? stringifyRawBalances({
+            raw0: allocationInventory.raw0 - dustRaw.raw0,
+            raw1: allocationInventory.raw1 - dustRaw.raw1
+          }) : null,
           postSwapBalancesRaw: stringifyRawBalances(postExecutionBalances)
         });
       } else {
@@ -883,10 +1143,10 @@ export class RebalanceExecutor {
         || postApprovalBalances.raw1 !== postExecutionBalances.raw1) {
         throw new Error('Pair-token wallet balances changed before top-up deposit; refusing to spend unplanned funds');
       }
-      const actualInventory = {
-        raw0: postApprovalBalances.raw0 - dustRaw.raw0,
-        raw1: postApprovalBalances.raw1 - dustRaw.raw1
-      };
+      const actualInventory = allocationFundingScope
+        ? { raw0: allocationInventory.raw0 - dustRaw.raw0, raw1: allocationInventory.raw1 - dustRaw.raw1 }
+        : { raw0: postApprovalBalances.raw0 - dustRaw.raw0,
+          raw1: postApprovalBalances.raw1 - dustRaw.raw1 };
       if (actualInventory.raw0 < 0n || actualInventory.raw1 < 0n) {
         throw new Error('Top-up pair balance fell below the retained dust reserve');
       }
@@ -924,6 +1184,7 @@ export class RebalanceExecutor {
         data: depositData,
         value: 0n
       });
+      if (allocationFundingScope) this.assertAllocationJobCurrent(pool, allocationFundingScope);
       const depositGas = BigInt(await this.signer.estimateGas({
         to: pool.key.hooks,
         data: depositData,
@@ -956,6 +1217,9 @@ export class RebalanceExecutor {
         }
       });
       phase = 'deposit_confirmed';
+      const allocationDepositReceipt = allocationFundingScope
+        ? await this.verifyAllocationDepositReceipt(pool, actualInventory,
+          postApprovalBalances, depositReceipt) : null;
       const depositEvent = this.findWalletDepositEvent(pool, depositReceipt);
       if (!depositEvent || depositEvent.rangeId.toLowerCase() !== position.id.toLowerCase()) {
         throw new Error('Top-up receipt did not increase the identified original range');
@@ -981,6 +1245,7 @@ export class RebalanceExecutor {
         tx: { ...journal.tx, deposit: depositReceipt.hash || journal.tx.deposit },
         sharesAfter: sharesAfter.toString(),
         liquidityAdded: depositEvent.liquidity.toString(),
+        allocationRemainingRaw: allocationDepositReceipt?.remaining || null,
         balancesAfterRaw: stringifyRawBalances(balancesAfterDeposit)
       });
       this.clearJournal();
@@ -994,6 +1259,9 @@ export class RebalanceExecutor {
         sharesBefore: validation.shares.toString(),
         sharesAfter: sharesAfter.toString(),
         liquidityAdded: depositEvent.liquidity.toString(),
+        allocationFundingScope: allocationFundingScope ? jsonSafe(allocationFundingScope) : null,
+        allocationPhysicalBaselineRaw: allocationFundingScope ? stringifyRawBalances(initialBalances) : null,
+        allocationRemainingRaw: allocationDepositReceipt?.remaining || null,
         dustRetainedRaw: stringifyRawBalances(dustRaw),
         balancesAfterRaw: stringifyRawBalances(balancesAfterDeposit)
       };
@@ -1176,8 +1444,8 @@ export class RebalanceExecutor {
   }
 
   async preflightSamePoolSequence({
-    pool, position, guardedData, preBalances, poolState, deadline,
-    maxPriceImpactBps
+    pool, position, guardedData, preBalances, scopedPreBalances = preBalances,
+    allocationScope = null, poolState, deadline, maxPriceImpactBps
   }) {
     const balanceCalls = [pool.token0, pool.token1].map((token) => ({
       to: token.address,
@@ -1205,8 +1473,15 @@ export class RebalanceExecutor {
       || withdrawn.raw0 + withdrawn.raw1 === 0n) {
       throw new Error('Sequential preflight did not return non-negative withdrawn inventory');
     }
+    const scopedPostWithdraw = allocationScope ? {
+      raw0: scopedPreBalances.raw0 + withdrawn.raw0,
+      raw1: scopedPreBalances.raw1 + withdrawn.raw1
+    } : postWithdraw;
+    if (allocationScope && (withdrawn.raw0 < 0n || withdrawn.raw1 < 0n)) {
+      throw new Error('Allocation preflight withdrawal has a negative pool-token delta');
+    }
     const fundingScope = buildPairFundingScope(
-      pool, postWithdraw, this.config.usdgAddress, this.config.autoTopupDustBps ?? 25
+      pool, scopedPostWithdraw, this.config.usdgAddress, this.config.autoTopupDustBps ?? 25
     );
 
     const target = buildTargetRange(
@@ -1282,7 +1557,10 @@ export class RebalanceExecutor {
         raw0: BigInt(erc20Interface.decodeFunctionResult('balanceOf', preview.at(-2).returnData)[0]),
         raw1: BigInt(erc20Interface.decodeFunctionResult('balanceOf', preview.at(-1).returnData)[0])
       };
-      const actualInventory = operationDelta(fundingScope.dustRaw, postSwap);
+      const actualInventory = allocationScope
+        ? operationDelta(fundingScope.dustRaw, applyScopedSwap(scopedPostWithdraw,
+          postWithdraw, postSwap, pool))
+        : operationDelta(fundingScope.dustRaw, postSwap);
       if (actualInventory.raw0 < projected.raw0 || actualInventory.raw1 < projected.raw1) {
         throw new Error('Sequential preflight swap returned less than conservative minOut inventory');
       }
@@ -1334,6 +1612,7 @@ export class RebalanceExecutor {
       ).toString(),
       swapPriceImpactBps: swapPlan.priceImpactBps ?? null,
       finalTarget,
+      withdrawnRaw: { raw0: withdrawn.raw0.toString(), raw1: withdrawn.raw1.toString() },
       mintedLiquidity: deposited.liquidity.toString()
     };
   }
@@ -1727,6 +2006,13 @@ export class RebalanceExecutor {
       throw new Error('Native-token cross-pool execution is not enabled');
     }
     const before = await this.readRawTokenBalances(trackedTokens);
+    const allocationBootstrap = plan.allocationBootstrap === true;
+    const bootstrapScope = allocationBootstrap
+      ? this.assertAllocationFundingScope(destinationPool, plan.allocationFundingScope) : null;
+    const scopedBeforeObject = allocationBootstrap
+      ? clipAllocationPairBalances(Object.fromEntries(before), allocationPairCaps(destinationPool, bootstrapScope))
+      : Object.fromEntries(before);
+    const scopedBefore = new Map(Object.entries(scopedBeforeObject));
     const balanceCall = (token) => ({
       to: token.address,
       data: erc20Interface.encodeFunctionData('balanceOf', [this.config.walletAddress]),
@@ -1758,14 +2044,15 @@ export class RebalanceExecutor {
     if (!idleWallet && (withdrawn.some((value) => value < 0n) || withdrawn.every((value) => value === 0n))) {
       throw new Error('Cross-pool preflight did not return non-negative LP inventory');
     }
+    const fundingPostWithdraw = allocationBootstrap ? scopedBefore : postWithdraw;
     const dustRawByAddress = Object.fromEntries(trackedTokens.map((token) => {
       const address = token.address.toLowerCase();
       const reserveBps = address === this.config.usdgAddress.toLowerCase()
         ? BigInt(this.config.autoTopupDustBps ?? 25) : 0n;
-      return [address, (postWithdraw.get(address) || 0n) * reserveBps / 10_000n];
+      return [address, (fundingPostWithdraw.get(address) || 0n) * reserveBps / 10_000n];
     }));
     const funding = buildCrossPoolFundingScope({
-      sourcePool, destinationPool, walletBalances: before,
+      sourcePool, destinationPool, walletBalances: allocationBootstrap ? scopedBefore : before,
       expectedWithdraw: { raw0: withdrawn[0], raw1: withdrawn[1] }, dustRawByAddress
     });
     const destinationAddresses = new Set([
@@ -1782,7 +2069,9 @@ export class RebalanceExecutor {
           && pool.token1.address.toLowerCase() !== ZERO_ADDRESS), 3)
       : { anchor: destinationPool.token0, routes: new Map() };
     const maxImpactBps = plan.manualImmediate === true
-      ? Number(plan.manualMaxCostBps) : this.config.crossPoolMaxSwapPriceImpactBps ?? 350;
+      ? Number(plan.manualMaxCostBps)
+      : plan.allocationBootstrap === true ? Number(plan.maxPriceImpactBps)
+        : this.config.crossPoolMaxSwapPriceImpactBps ?? 350;
     if (!Number.isInteger(maxImpactBps) || maxImpactBps < 1 || maxImpactBps > 500) {
       throw new Error('Cross-pool swap cost ceiling is invalid');
     }
@@ -1819,7 +2108,12 @@ export class RebalanceExecutor {
     });
     if (balancePlan.blockedReason) throw new Error(`Cross-pool balance quote is blocked: ${balancePlan.blockedReason}`);
     const usdValue = (token, raw) => {
-      const price = Number(this.getUsdPrice?.(token.address));
+      let price = Number(this.getUsdPrice?.(token.address));
+      if (allocationBootstrap) {
+        const stable = String(this.config.usdgAddress).toLowerCase();
+        price = token.address.toLowerCase() === stable ? 1
+          : usdGAssetPriceFromPool({ ...destinationPool, state: destinationState }, stable).priceUsdG;
+      }
       const value = Number(formatUnits(BigInt(raw), token.decimals)) * price;
       if (!Number.isFinite(value) || value <= 0) {
         throw new Error(`Cross-pool USD valuation is unavailable for ${token.symbol}`);
@@ -1921,6 +2215,8 @@ export class RebalanceExecutor {
     return {
       status: 'full-sequence-simulated', sourcePoolId: sourcePool.id, destinationPoolId: destinationPool.id,
       positionId: idleWallet ? null : plan.position.id, withdrawCall, before, postWithdraw, funding,
+      scopedBefore: allocationBootstrap ? scopedBefore : null,
+      withdrawnRaw: { raw0: withdrawn[0].toString(), raw1: withdrawn[1].toString() },
       routeSwaps, balanceSwap, depositPlan, finalTarget, deadline,
       simulatedGasUsed: fullSimulation.reduce((total, receipt) =>
         total + BigInt(receipt.gasUsed || 0), 0n).toString(),
@@ -1958,7 +2254,58 @@ export class RebalanceExecutor {
       priceImpactBps: Number(impactBps), poolState: state };
   }
 
-  async executeCrossPool(plan, destinationPool) {
+  executeCrossPool(plan, destinationPool) {
+    return this.runWalletWrite(() => this.executeCrossPoolUnlocked(plan, destinationPool));
+  }
+
+  allocationBootstrapPlan(pool, allocationFundingScope, minGasReserveWei = this.config.topUpMinGasReserveWei,
+    maxPriceImpactBps = this.config.maxSwapPriceImpactBps ?? 200) {
+    this.assertAllocationFundingScope(pool, allocationFundingScope, { requireFresh: true });
+    return {
+      pool, destinationPool: pool, position: null, manualIdle: true,
+      allocationBootstrap: true, allocationFundingScope,
+      routingPools: [pool], minGasReserveWei, maxPriceImpactBps
+    };
+  }
+
+  async previewAllocationBootstrap({ pool, allocationFundingScope, minGasReserveWei, maxPriceImpactBps } = {}) {
+    const plan = this.allocationBootstrapPlan(pool, allocationFundingScope, minGasReserveWei, maxPriceImpactBps);
+    const preflight = await this.preflightCrossPoolSequence(plan, pool);
+    return {
+      status: preflight.status,
+      poolId: pool.id,
+      fundingRaw: Object.fromEntries(preflight.funding.map((entry) => [entry.address, entry.maxSpendRaw.toString()])),
+      target: preflight.finalTarget,
+      mintedLiquidity: preflight.mintedLiquidity,
+      simulatedGasUsed: preflight.simulatedGasUsed,
+      pendingApprovalCount: preflight.pendingApprovalCount
+    };
+  }
+
+  executeAllocationBootstrap(options = {}) {
+    return this.runWalletWrite(async () => {
+      const plan = this.allocationBootstrapPlan(options.pool, options.allocationFundingScope,
+        options.minGasReserveWei, options.maxPriceImpactBps);
+      if (this.config.dryRun || !this.config.enableLiveWrites) {
+        return this.previewAllocationBootstrap(options);
+      }
+      return this.executeCrossPoolUnlocked(plan, options.pool);
+    });
+  }
+
+  async executeCrossPoolUnlocked(plan, destinationPool) {
+    const allocationEnabled = this.isAllocationModeEnabled();
+    if (plan.allocationBootstrap === true) {
+      if (!allocationEnabled) throw new Error('Allocation bootstrap requires enabled saved allocation mode');
+      this.assertAllocationFundingScope(destinationPool, plan.allocationFundingScope, { requireFresh: true });
+      if (plan.manualIdle !== true || String(plan.pool.id).toLowerCase() !== String(destinationPool.id).toLowerCase()) {
+        throw new Error('Allocation bootstrap requires a same-pool idle-wallet plan');
+      }
+    } else if (allocationEnabled) {
+      throw new Error('Enabled allocation mode forbids unscoped cross-pool execution');
+    } else if (plan.allocationFundingScope) {
+      throw new Error('Allocation scope was supplied while saved allocation mode is disabled');
+    }
     if (plan.manualImmediate === true && (this.config.dryRun || !this.config.enableLiveWrites)) {
       throw new Error('Manual immediate rotation requires live writes');
     }
@@ -1969,20 +2316,29 @@ export class RebalanceExecutor {
     this.assertNoUnfinishedExecution();
     let phase = 'prepared';
     let journal = {
-      id: `${Date.now()}:${plan.pool.id}:${plan.position.id}:${destinationPool.id}`,
+      id: `${Date.now()}:${plan.pool.id}:${plan.position?.id || 'allocation-bootstrap'}:${destinationPool.id}`,
       phase, startedAt: Date.now(), poolId: plan.pool.id,
       destinationPoolId: destinationPool.id,
       sourcePair: `${plan.pool.token0.symbol}/${plan.pool.token1.symbol}`,
       destinationPair: `${destinationPool.token0.symbol}/${destinationPool.token1.symbol}`,
-      oldPosition: { id: plan.position.id, tickLower: plan.position.tickLower,
-        tickUpper: plan.position.tickUpper, shares: String(plan.position.shares) },
+      oldPosition: plan.position ? { id: plan.position.id, tickLower: plan.position.tickLower,
+        tickUpper: plan.position.tickUpper, shares: String(plan.position.shares) } : null,
+      allocationJobId: plan.allocationBootstrap === true
+        ? `allocation:${plan.allocationFundingScope.allocationUpdatedAt}:${destinationPool.id}` : null,
       tx: { routeSwaps: [] }
     };
     this.saveJournal(journal);
     try {
       let preflight = await this.preflightCrossPoolSequence(plan, destinationPool);
+      let allocationInventory = plan.allocationBootstrap === true
+        ? Object.fromEntries(preflight.funding.map((entry) => [entry.address, BigInt(entry.maxSpendRaw)]))
+        : null;
       journal = this.patchJournal(journal, {
         phase: 'cross_pool_preflighted',
+        allocationFundingScope: plan.allocationBootstrap ? jsonSafe(plan.allocationFundingScope) : null,
+        allocationPhysicalBaselineRaw: plan.allocationBootstrap ? serializeAddressBalances(preflight.before) : null,
+        allocationScopedBaselineRaw: plan.allocationBootstrap ? serializeAddressBalances(preflight.scopedBefore) : null,
+        allocationRemainingRaw: plan.allocationBootstrap ? serializeAddressBalances(allocationInventory) : null,
         preflight: {
           simulatedCallCount: preflight.simulatedCallCount,
           simulatedGasUsed: preflight.simulatedGasUsed,
@@ -2010,6 +2366,14 @@ export class RebalanceExecutor {
       // Approvals may take blocks. Rebuild and simulate the entire transaction
       // sequence against their actual on-chain allowance state before moving LP.
       preflight = await this.preflightCrossPoolSequence(plan, destinationPool);
+      if (plan.allocationBootstrap === true) {
+        allocationInventory = Object.fromEntries(preflight.funding.map((entry) => [entry.address, BigInt(entry.maxSpendRaw)]));
+        journal = this.patchJournal(journal, {
+          allocationPhysicalBaselineRaw: serializeAddressBalances(preflight.before),
+          allocationScopedBaselineRaw: serializeAddressBalances(preflight.scopedBefore),
+          allocationRemainingRaw: serializeAddressBalances(allocationInventory)
+        });
+      }
       if (preflight.pendingApprovalCount > 0) {
         // An approval quote changed while permissions were being mined. Fail
         // before withdrawal; the next monitor cycle can re-quote from scratch.
@@ -2017,7 +2381,7 @@ export class RebalanceExecutor {
       }
       const feeOverrides = await this.getPinnedFeeOverrides();
       await this.assertTopUpGasBudget({
-        reserveWei: this.config.topUpMinGasReserveWei,
+        reserveWei: plan.minGasReserveWei ?? this.config.topUpMinGasReserveWei,
         maxFeePerGas: feeOverrides.maxFeePerGas || feeOverrides.gasPrice,
         futureGasLimit: BigInt(preflight.simulatedGasUsed) * 3n / 2n,
         phase: 'cross-pool-before-withdrawal'
@@ -2109,6 +2473,7 @@ export class RebalanceExecutor {
           tx: { ...journal.tx, routeSwaps: [...routeHashes] } });
       }
       if (preflight.balanceSwap) {
+        if (plan.allocationBootstrap === true) this.assertAllocationJobCurrent(destinationPool, plan.allocationFundingScope);
         const beforeBalances = await this.readRawPairBalances(destinationPool);
         const swap = preflight.balanceSwap;
         const refreshedPlan = await this.refreshSingleSwapQuote(destinationPool,
@@ -2133,15 +2498,34 @@ export class RebalanceExecutor {
         });
         const afterBalances = await this.readRawPairBalances(destinationPool);
         this.assertSwapReceiptBalances(destinationPool, refreshedPlan, beforeBalances, afterBalances);
+        if (plan.allocationBootstrap === true) {
+          const physicalDelta = operationDelta(beforeBalances, afterBalances);
+          const transferDelta = this.getAllocationWalletReceiptDeltas(receipt, [destinationPool.token0, destinationPool.token1]);
+          this.assertAllocationSwapEndpoints(transferDelta, refreshedPlan);
+          if (physicalDelta.raw0 !== transferDelta.raw0 || physicalDelta.raw1 !== transferDelta.raw1) {
+            throw new Error('Allocation bootstrap swap physical delta differs from wallet receipt transfers');
+          }
+          allocationInventory = addAllocationReceiptDeltas(allocationInventory,
+            { [destinationPool.token0.address.toLowerCase()]: beforeBalances.raw0,
+              [destinationPool.token1.address.toLowerCase()]: beforeBalances.raw1 },
+            { [destinationPool.token0.address.toLowerCase()]: afterBalances.raw0,
+              [destinationPool.token1.address.toLowerCase()]: afterBalances.raw1 },
+            nonZeroExpectedDeltaMap(destinationPool, transferDelta));
+        }
         phase = 'swap_confirmed';
         journal = this.patchJournal(journal, { phase,
+          allocationRemainingRaw: plan.allocationBootstrap ? serializeAddressBalances(allocationInventory) : null,
           tx: { ...journal.tx, swap: receipt.hash || journal.tx.swap } });
       }
       const finalBalances = await this.readRawPairBalances(destinationPool);
       const dust = new Map(preflight.funding.map((entry) => [entry.address, entry.dustRaw]));
       const inventory = {
-        raw0: finalBalances.raw0 - (dust.get(destinationPool.token0.address.toLowerCase()) || 0n),
-        raw1: finalBalances.raw1 - (dust.get(destinationPool.token1.address.toLowerCase()) || 0n)
+        raw0: plan.allocationBootstrap === true
+          ? BigInt(allocationInventory[destinationPool.token0.address.toLowerCase()] || 0n)
+          : finalBalances.raw0 - (dust.get(destinationPool.token0.address.toLowerCase()) || 0n),
+        raw1: plan.allocationBootstrap === true
+          ? BigInt(allocationInventory[destinationPool.token1.address.toLowerCase()] || 0n)
+          : finalBalances.raw1 - (dust.get(destinationPool.token1.address.toLowerCase()) || 0n)
       };
       if (inventory.raw0 < 0n || inventory.raw1 < 0n) {
         throw new Error('Cross-pool destination inventory fell below retained dust');
@@ -2180,8 +2564,20 @@ export class RebalanceExecutor {
         depositPlan.amount1Max);
       const depositData = this.fables.encodeDeposit(destinationPool, target,
         depositPlan.liquidity, depositPlan.amount0Max, depositPlan.amount1Max, this.deadline());
+      let allocationDepositBefore = null;
+      if (plan.allocationBootstrap === true) {
+        this.assertAllocationJobCurrent(destinationPool, plan.allocationFundingScope);
+        allocationDepositBefore = await this.readRawPairBalances(destinationPool);
+        if (allocationDepositBefore.raw0 !== finalBalances.raw0 || allocationDepositBefore.raw1 !== finalBalances.raw1) {
+          throw new Error('Allocation bootstrap pair balances changed before deposit');
+        }
+        if (depositPlan.amount0Max > inventory.raw0 || depositPlan.amount1Max > inventory.raw1) {
+          throw new Error('Allocation bootstrap deposit caps exceed scoped inventory');
+        }
+      }
       await this.readProvider.call({ from: this.config.walletAddress,
         to: destinationPool.key.hooks, data: depositData, value: 0n });
+      if (plan.allocationBootstrap === true) this.assertAllocationJobCurrent(destinationPool, plan.allocationFundingScope);
       journal = this.patchJournal(journal, { phase: 'deposit_preflighted', target,
         depositPlan: serializeDepositPlan(depositPlan) });
       const depositReceipt = await this.sendVerifiedTx({
@@ -2193,6 +2589,9 @@ export class RebalanceExecutor {
         }
       });
       phase = 'deposit_confirmed';
+      const allocationDepositReceipt = plan.allocationBootstrap === true
+        ? await this.verifyAllocationDepositReceipt(destinationPool, inventory,
+          allocationDepositBefore, depositReceipt) : null;
       const depositEvent = this.findWalletDepositEvent(destinationPool, depositReceipt);
       if (!depositEvent) throw new Error('Cross-pool deposit receipt lacks the wallet deposit event');
       const mintedRange = await this.fables.readRangeKey(destinationPool, depositEvent.rangeId);
@@ -2205,6 +2604,7 @@ export class RebalanceExecutor {
       if (shares <= 0n) throw new Error('Cross-pool deposit confirmed without new LP shares');
       journal = this.patchJournal(journal, { phase: 'completed', completedAt: Date.now(),
         tx: { ...journal.tx, deposit: depositReceipt.hash || journal.tx.deposit },
+        allocationRemainingRaw: allocationDepositReceipt?.remaining || null,
         newPosition: { id: depositEvent.rangeId, shares: shares.toString(), target } });
       this.clearJournal();
       this.ledger.append('rebalance.cross_pool_completed', {
@@ -2217,6 +2617,9 @@ export class RebalanceExecutor {
         routeSwapPoolIds: executedRouteIds,
         balanceSwapHash: journal.tx.swap || null, depositHash: journal.tx.deposit,
         balanceSwapPoolId: executedBalanceSwapPoolId,
+        allocationFundingScope: journal.allocationFundingScope || null,
+        allocationPhysicalBaselineRaw: journal.allocationPhysicalBaselineRaw || null,
+        allocationRemainingRaw: allocationDepositReceipt?.remaining || null,
         target, aprPct: plan.destinationStats?.aprPct ?? null
       });
       return { status: 'completed', withdrawHash: journal.tx.withdraw,
@@ -2509,6 +2912,60 @@ export class RebalanceExecutor {
     }
   }
 
+  assertAllocationSwapEndpoints(delta, swapPlan) {
+    if ((swapPlan.tokenIn === 0 && (delta.raw0 !== -BigInt(swapPlan.rawAmountIn)
+      || delta.raw1 < BigInt(swapPlan.quote.minRawAmountOut)))
+      || (swapPlan.tokenIn === 1 && (delta.raw1 !== -BigInt(swapPlan.rawAmountIn)
+      || delta.raw0 < BigInt(swapPlan.quote.minRawAmountOut)))) {
+      throw new Error('Allocation swap wallet transfer receipt differs from exact-input/minOut constraints');
+    }
+  }
+
+  getAllocationWalletReceiptDeltas(receipt, tokens) {
+    const wallet = this.config.walletAddress.toLowerCase();
+    const deltas = new Map((tokens || []).map((token) => [token.address.toLowerCase(), 0n]));
+    for (const entry of receipt?.logs || []) {
+      const address = String(entry.address || '').toLowerCase();
+      if (!deltas.has(address)) continue;
+      try {
+        const event = transferEventInterface.parseLog(entry);
+        const from = String(event.args.from).toLowerCase();
+        const to = String(event.args.to).toLowerCase();
+        const amount = BigInt(event.args.value);
+        if (to === wallet) deltas.set(address, deltas.get(address) + amount);
+        if (from === wallet) deltas.set(address, deltas.get(address) - amount);
+      } catch {}
+    }
+    const values = [...deltas.values()];
+    if (values.every((value) => value === 0n)) throw new Error('Allocation receipt lacks wallet pair-token Transfer events');
+    const tokensByAddress = new Map((tokens || []).map((token) => [token.address.toLowerCase(), token]));
+    return {
+      raw0: deltas.get([...tokensByAddress.keys()][0]) || 0n,
+      raw1: deltas.get([...tokensByAddress.keys()][1]) || 0n
+    };
+  }
+
+  async verifyAllocationDepositReceipt(pool, scopedInventory, physicalBefore, receipt) {
+    const physicalAfter = await this.readRawPairBalances(pool);
+    const physicalDelta = operationDelta(physicalBefore, physicalAfter);
+    const transferDelta = this.getAllocationWalletReceiptDeltas(receipt, [pool.token0, pool.token1]);
+    if (physicalDelta.raw0 !== transferDelta.raw0 || physicalDelta.raw1 !== transferDelta.raw1
+      || transferDelta.raw0 > 0n || transferDelta.raw1 > 0n) {
+      throw new Error('Allocation deposit receipt does not match scoped wallet token debits');
+    }
+    const remaining = addAllocationReceiptDeltas({
+      [pool.token0.address.toLowerCase()]: BigInt(scopedInventory.raw0),
+      [pool.token1.address.toLowerCase()]: BigInt(scopedInventory.raw1)
+    }, {
+      [pool.token0.address.toLowerCase()]: physicalBefore.raw0,
+      [pool.token1.address.toLowerCase()]: physicalBefore.raw1
+    }, {
+      [pool.token0.address.toLowerCase()]: physicalAfter.raw0,
+      [pool.token1.address.toLowerCase()]: physicalAfter.raw1
+    }, nonZeroExpectedDeltaMap(pool, transferDelta));
+    return { balancesAfter: physicalAfter, remaining };
+  }
+
   findWalletDepositEvent(pool, receipt) {
     const walletTopic = zeroPadValue(this.config.walletAddress, 32).toLowerCase();
     const entry = (receipt.logs || []).find((logEntry) =>
@@ -2750,6 +3207,25 @@ function samePoolKeyLocal(left, right) {
 
 function operationDelta(before, after) {
   return { raw0: after.raw0 - before.raw0, raw1: after.raw1 - before.raw1 };
+}
+function nonZeroExpectedDeltaMap(pool, delta) {
+  const expected = {};
+  if (BigInt(delta.raw0) !== 0n) expected[pool.token0.address.toLowerCase()] = BigInt(delta.raw0);
+  if (BigInt(delta.raw1) !== 0n) expected[pool.token1.address.toLowerCase()] = BigInt(delta.raw1);
+  return expected;
+}
+function serializeAddressBalances(balances) {
+  const entries = balances instanceof Map ? [...balances.entries()] : Object.entries(balances || {});
+  return Object.fromEntries(entries.map(([address, raw]) => [String(address).toLowerCase(), BigInt(raw).toString()]));
+}
+function applyScopedSwap(scopedBefore, physicalBefore, physicalAfter) {
+  const delta = operationDelta(physicalBefore, physicalAfter);
+  const result = { raw0: BigInt(scopedBefore.raw0) + delta.raw0,
+    raw1: BigInt(scopedBefore.raw1) + delta.raw1 };
+  if (result.raw0 < 0n || result.raw1 < 0n) {
+    throw new Error('Receipt delta exceeds this allocation job token inventory');
+  }
+  return result;
 }
 function positiveOperationDelta(before, after) {
   const delta = operationDelta(before, after);

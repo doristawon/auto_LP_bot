@@ -2,14 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Interface, formatUnits, getAddress, id, Wallet } from 'ethers';
-import { createProviders, verifyProviders } from './rpc/providers.js';
+import { createProviders, probeRpcEndpoint, verifyProviders } from './rpc/providers.js';
 import { FablesAdapter, lifecycleEventType, lifecycleLiquidity } from './adapters/fables.js';
 import { RebalanceExecutor } from './adapters/executor.js';
 import { V4QuoterAdapter } from './adapters/quoter.js';
 import { fetchFablesPoolStats, fetchFablesPoolTvl } from './adapters/fables-stats.js';
 import { fetchWalletCashflowCandidates, fetchEthUsdCloseAt, fetchNativeBalanceAt } from './adapters/wallet-cashflows.js';
 import { buildUsdPriceMap } from './analytics/prices.js';
-import { spotToken1PerToken0 } from './analytics/liquidity.js';
+import { computeAllocationFunding, normalizeInvestmentAllocation, valuePoolPositionsUsdG } from './analytics/allocation.js';
 import { PortfolioAnalytics } from './analytics/portfolio.js';
 import { rebalanceTiming } from './dashboard/rebalance-timing.js';
 import { PointsTracker } from './analytics/points-tracker.js';
@@ -27,6 +27,7 @@ import { DEFAULT_RPC_URL, ZERO_ADDRESS } from './constants.js';
 import { isRpcRateLimitError, isRpcTimeoutError } from './rpc/errors.js';
 import { isLpOutOfRange } from './math/ticks.js';
 import { buildExactWithdrawBounds } from './math/v4-fixed.js';
+import { spotToken1PerToken0 } from './analytics/liquidity.js';
 import { EIP7702_GUARD_ABI, HOOK_ABI } from './abi.js';
 import { log, registerSensitiveValues, sanitize } from './logger.js';
 
@@ -114,6 +115,12 @@ export class AutoLpBot {
       ? { status: 'failed', address: config.walletAddress, error: '尚未設定有效的監控錢包地址' }
       : { status: 'scanning', address: config.walletAddress, error: null };
     this.providers = createProviders(config);
+    this.rpcEndpointIdByUrl = new Map((config.rpcUrls || []).map((endpoint) => [endpoint, randomUUID()]));
+    this.rpcDiagnostics = new Map();
+    this.activeRpcUrls = [];
+    this.rpcManagementActive = false;
+    this.guardReadinessCache = new WeakMap();
+    this.initializing = false;
     this.state = new StateStore(config.stateFile);
     this.applyStoredExecutionTarget();
     this.ledger = new LedgerStore(config.dataDir);
@@ -130,6 +137,7 @@ export class AutoLpBot {
     // previously running monitor instead of treating boot as an explicit pause.
     this.nextMonitorAt = null;
     this.snapshot = this.ledger.readSnapshot();
+    this.allocationFunding = null;
     this.running = false;
     this.cycleActive = false;
     this.globalPointScanPromise = null;
@@ -147,14 +155,42 @@ export class AutoLpBot {
   }
 
   async initialize() {
-    this.rpcHealth = await verifyProviders(this.providers.rawProviders, this.config.chainId);
-    log('info', 'rpc.health', { endpoints: this.rpcHealth.map((x) => ({ index: x.index, ok: x.ok, chainId: x.chainId })) });
-    this.useHealthyRpcEndpoints();
-    await this.refreshMarket(true);
+    if (this.initializing) throw new Error('Bot initialization is already in progress');
+    this.initializing = true;
+    try {
+      // Rebuild from the full configured URL list. useHealthyRpcEndpoints may
+      // have narrowed rawProviders after an earlier boot, while config.rpcUrls
+      // intentionally retains unhealthy entries for recovery and operator UI.
+      this.providers = createProviders(this.config);
+      this.fables = new FablesAdapter(this.providers.readProvider, this.config);
+      this.quoter = new V4QuoterAdapter(this.providers.readProvider);
+      this.executor = this.createExecutor();
+      try {
+        this.rpcHealth = await verifyProviders(this.providers.rawProviders, this.config.chainId, this.config.rpcUrls);
+      } catch (error) {
+        if (Array.isArray(error.rpcHealth)) this.rpcHealth = error.rpcHealth;
+        this.activeRpcUrls = [];
+        this.rpcHealth.forEach((result, index) => {
+          const endpoint = this.config.rpcUrls[index];
+          if (endpoint) this.rpcDiagnostics.set(endpoint, result);
+        });
+        throw error;
+      }
+      this.rpcHealth.forEach((result, index) => {
+        const endpoint = this.config.rpcUrls[index];
+        if (endpoint) this.rpcDiagnostics.set(endpoint, result);
+      });
+      log('info', 'rpc.health', { endpoints: this.rpcHealth.map((x) => ({ index: x.index, ok: x.ok, chainId: x.chainId })) });
+      this.useHealthyRpcEndpoints();
+      await this.refreshMarket(true);
+    } finally {
+      this.initializing = false;
+    }
   }
 
   useHealthyRpcEndpoints() {
     const healthy = this.rpcHealth.filter((entry) => entry.ok).map((entry) => entry.index);
+    this.activeRpcUrls = healthy.map((index) => this.config.rpcUrls[index]);
     if (!healthy.length || (healthy.length === this.config.rpcUrls.length && healthy[0] === 0)) return;
     const usableUrls = healthy.map((index) => this.config.rpcUrls[index]);
     this.providers = createProviders({ ...this.config, rpcUrls: usableUrls });
@@ -193,12 +229,9 @@ export class AutoLpBot {
     let guardRuntimeReady = false;
     let guardError = null;
     if (guardConfigured && guardVerifiedFlag) {
-      try {
-        await this.executor.assertAtomicGuardReady();
-        guardRuntimeReady = true;
-      } catch (error) {
-        guardError = error.shortMessage || error.message;
-      }
+      const guardStatus = await this.getUiGuardReadiness();
+      guardRuntimeReady = guardStatus.ready;
+      guardError = guardStatus.error;
     }
     const topologyCooldownUntil = Number(this.state.getSetting('walletTopologyCooldownUntil', 0) || 0);
     const recoveryRequired = activeExecution?.phase === 'recovery_required';
@@ -222,9 +255,12 @@ export class AutoLpBot {
       && !executionBusy
       && !recoveryRequired;
     const startBlockers = [];
+    const allocationConfig = this.getInvestmentAllocationConfig();
+    const allocationEnabled = allocationConfig.enabled === true;
+    const allocationSnapshot = allocationEnabled ? this.getInvestmentAllocationSnapshot() : null;
     const selectedTargetPoolId = this.getSelectedExecutionTargetPoolId();
-    if (!selectedTargetPoolId) startBlockers.push('target-required');
-    else if (!this.market.pools.some((pool) => pool.id.toLowerCase() === selectedTargetPoolId)) startBlockers.push('target-unavailable');
+    if (!allocationEnabled && !selectedTargetPoolId) startBlockers.push('target-required');
+    else if (!allocationEnabled && !this.market.pools.some((pool) => pool.id.toLowerCase() === selectedTargetPoolId)) startBlockers.push('target-unavailable');
     const selectedPool = this.snapshot?.pools?.find((pool) => pool.id.toLowerCase() === selectedTargetPoolId);
     const investmentMode = this.getInvestmentTargetSettings().mode;
     const activeLp = ['apr-highest', 'specific-pool'].includes(investmentMode)
@@ -241,8 +277,12 @@ export class AutoLpBot {
     // moving funds, so a routine scan must not disable the start control.
     if (recoveryRequired) startBlockers.push('recovery-required');
     else if (executionBusy) startBlockers.push('execution-busy');
+    if (allocationEnabled && (allocationSnapshot?.status !== 'ready'
+      || allocationSnapshot?.priceStatus?.status !== 'fresh')) {
+      startBlockers.push(allocationConfig.invalid ? 'allocation-config-invalid' : 'allocation-valuation-not-ready');
+    }
     if (!this.config.dryRun) {
-      if (!activeLp) startBlockers.push('active-lp-required');
+      if (!allocationEnabled && !activeLp) startBlockers.push('active-lp-required');
       const snapshotAge = Date.now() - Number(this.snapshot?.generatedAt || 0);
       if (snapshotAge > Math.max(120_000, this.config.pollIntervalMs * 3)) startBlockers.push('wallet-snapshot-stale');
       if (!this.config.enableLiveWrites) startBlockers.push('live-writes-disabled');
@@ -274,6 +314,7 @@ export class AutoLpBot {
       targetMode: this.config.targetMode,
       selectedExecutionTargetPoolId: selectedTargetPoolId || null,
       investmentTarget: this.getInvestmentTargetSnapshot(),
+      investmentAllocation: allocationSnapshot,
       dryRun: this.config.dryRun,
       liveWrites: this.config.enableLiveWrites,
       autoRedeploy: this.config.enableAutoRedeploy,
@@ -391,45 +432,177 @@ export class AutoLpBot {
     this.pointsSimulationTimer.unref?.();
   }
 
-  async setRpcEndpoint(value) {
-    if (this.cycleActive) throw new Error('Wait for the current monitor cycle before changing RPC');
+  rpcMutationBlocker() {
+    if (this.rpcManagementActive) return 'busy';
+    if (this.initializing) return 'busy';
+    if (this.cycleActive) return 'busy';
+    if (this.globalPointScanPromise) return 'busy';
+    const active = this.state.getSetting('activeRebalanceExecution', null);
+    if (active?.phase && !new Set(['completed', 'failed']).has(active.phase)) return 'busy';
+    return null;
+  }
+
+  assertRpcIdle() {
+    const blocker = this.rpcMutationBlocker();
+    if (blocker) throw new Error('busy');
+  }
+
+  rpcId(endpoint) {
+    if (!this.rpcEndpointIdByUrl.has(endpoint)) this.rpcEndpointIdByUrl.set(endpoint, randomUUID());
+    return this.rpcEndpointIdByUrl.get(endpoint);
+  }
+
+  rpcResult(endpoint, index, diagnostic = this.rpcDiagnostics.get(endpoint)) {
+    const fallback = this.rpcHealth[index] || {};
+    const status = diagnostic || fallback;
+    return {
+      id: this.rpcId(endpoint),
+      label: maskRpcEndpointLabel(endpoint),
+      priority: index + 1,
+      active: this.activeRpcUrls.includes(endpoint),
+      chainId: Number.isFinite(status.chainId) ? status.chainId : null,
+      reachable: Boolean(status.reachable ?? status.ok),
+      chainValid: Boolean(status.chainValid ?? (status.ok && Number(status.chainId) === this.config.chainId)),
+      latencyMs: Number.isFinite(status.latencyMs) ? status.latencyMs : null,
+      blockNumber: Number.isSafeInteger(status.blockNumber) ? status.blockNumber : null,
+      errorType: status.errorType ?? (this.isHealthyRpcStatus(status) ? null : status.ok ? null : 'unknown'),
+      checkedAt: status.checkedAt || null,
+      removable: true
+    };
+  }
+
+  isHealthyRpcStatus(status) {
+    return Boolean(status?.reachable ?? status?.ok)
+      && Boolean(status?.chainValid ?? (status?.ok && Number(status.chainId) === this.config.chainId))
+      && Number(status?.chainId) === this.config.chainId
+      && status?.errorType == null
+      && Number.isSafeInteger(status?.blockNumber) && status.blockNumber >= 0;
+  }
+
+  getRpcSettings() {
+    const endpoints = this.config.rpcUrls.map((endpoint, index) => this.rpcResult(endpoint, index));
+    const healthy = endpoints.some((entry) => this.isHealthyRpcStatus(entry));
+    return { ok: true, chainId: this.config.chainId, persisted: Boolean(this.config.persistRuntimeCredentials),
+      latestBlockNumber: Math.max(0, ...endpoints.map((entry) => entry.blockNumber || 0)) || null,
+      endpoints: endpoints.map((entry) => ({ ...entry, removable: endpoints.length > 1 })),
+      healthyEndpointCount: endpoints.filter((entry) => this.isHealthyRpcStatus(entry)).length,
+      hasHealthyEndpoint: healthy };
+  }
+
+  async probeRpcById(id) {
+    this.assertRpcIdle();
+    const endpoint = [...this.rpcEndpointIdByUrl].find(([, value]) => value === String(id || ''))?.[0];
+    if (!endpoint || !this.config.rpcUrls.includes(endpoint)) throw new Error('invalid_id');
+    this.rpcManagementActive = true;
+    try {
+      const result = await probeRpcEndpoint(endpoint, this.config.chainId, { timeoutMs: Math.min(8000, this.config.rpcRequestTimeoutMs || 8000) });
+      this.rpcDiagnostics.set(endpoint, result);
+      const index = this.config.rpcUrls.indexOf(endpoint);
+      this.rpcHealth[index] = { index, ...result, ok: this.isHealthyRpcStatus(result) };
+      return { ok: true, result: this.rpcResult(endpoint, index, result) };
+    } finally {
+      this.rpcManagementActive = false;
+    }
+  }
+
+  async addRpcEndpoint(value) {
+    this.assertRpcIdle();
     const endpoint = String(value || '').trim();
-    if (endpoint.length > 2048) throw new Error('RPC endpoint is too long');
+    if (!endpoint || endpoint.length > 2048) throw new Error(endpoint ? 'invalid_url' : 'invalid_url');
     let parsed;
-    try { parsed = new URL(endpoint); }
-    catch { throw new Error('Enter a valid Robinhood Chain RPC URL'); }
-    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
-      throw new Error('RPC must use HTTP(S) and must not include URL username or password');
+    try { parsed = new URL(endpoint); } catch { throw new Error('invalid_url'); }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error('invalid_url');
+    if (this.config.rpcUrls.includes(endpoint)) throw new Error('duplicate');
+    this.rpcManagementActive = true;
+    try {
+      const diagnostic = await probeRpcEndpoint(endpoint, this.config.chainId, { timeoutMs: Math.min(8000, this.config.rpcRequestTimeoutMs || 8000) });
+      this.rpcDiagnostics.set(endpoint, diagnostic);
+      if (!diagnostic.reachable || !diagnostic.chainValid || diagnostic.errorType
+        || !Number.isSafeInteger(diagnostic.blockNumber) || diagnostic.blockNumber < 0) {
+        const error = new Error(diagnostic.errorType || 'wrong_chain');
+        error.rpcResult = { ...this.rpcResult(endpoint, this.config.rpcUrls.length, diagnostic), removable: false };
+        throw error;
+      }
+      await this.applyRpcEndpointSet([endpoint, ...this.config.rpcUrls], new Map([[endpoint, diagnostic]]));
+      return { ok: true, result: this.rpcResult(endpoint, 0), persisted: Boolean(this.config.persistRuntimeCredentials),
+        healthyEndpointCount: this.getRpcSettings().healthyEndpointCount };
+    } finally {
+      this.rpcManagementActive = false;
     }
+  }
 
-    const urls = endpoint === DEFAULT_RPC_URL ? [endpoint] : [endpoint, DEFAULT_RPC_URL];
-    const nextProviders = createProviders({ ...this.config, rpcUrls: urls });
-    const health = await verifyProviders(nextProviders.rawProviders, this.config.chainId);
-    if (!health[0]?.ok || health[0].chainId !== this.config.chainId) {
-      throw new Error('RPC endpoint did not verify as Robinhood Chain (chain ID 4663)');
+  async removeRpcEndpoint(id) {
+    this.assertRpcIdle();
+    const endpoint = [...this.rpcEndpointIdByUrl].find(([, value]) => value === String(id || ''))?.[0];
+    if (!endpoint || !this.config.rpcUrls.includes(endpoint)) throw new Error('invalid_id');
+    if (this.config.rpcUrls.length <= 1) throw new Error('last_healthy');
+    this.rpcManagementActive = true;
+    try {
+      const nextUrls = this.config.rpcUrls.filter((item) => item !== endpoint);
+      await this.applyRpcEndpointSet(nextUrls);
+      this.rpcEndpointIdByUrl.delete(endpoint);
+      this.rpcDiagnostics.delete(endpoint);
+      return { ok: true, removedId: String(id), persisted: Boolean(this.config.persistRuntimeCredentials),
+        healthyEndpointCount: this.getRpcSettings().healthyEndpointCount };
+    } finally {
+      this.rpcManagementActive = false;
     }
+  }
 
-    persistRuntimeCredentials({
-      rpcUrls: urls,
-      walletAddress: this.config.walletAddress,
-      privateKey: this.config.privateKey
-    }, { enabled: this.config.persistRuntimeCredentials });
+  async applyRpcEndpointSet(urls, knownDiagnostics = new Map()) {
+    const diagnostics = [];
+    for (const endpoint of urls) {
+      const result = knownDiagnostics.get(endpoint)
+        || await probeRpcEndpoint(endpoint, this.config.chainId, { timeoutMs: Math.min(8000, this.config.rpcRequestTimeoutMs || 8000) });
+      this.rpcDiagnostics.set(endpoint, result);
+      diagnostics.push({ index: diagnostics.length, ...result,
+        ok: result.reachable && result.chainValid && result.errorType == null
+          && Number.isSafeInteger(result.blockNumber) && result.blockNumber >= 0 });
+    }
+    await this.applyRpcUrls(urls, diagnostics, { persist: true });
+  }
 
-    this.config.rpcUrls = urls;
-    registerSensitiveValues([...urls, ...[...this.walletProfiles.values()].map((profile) => profile.privateKey),
+  async applyRpcUrls(urls, health, { persist = false } = {}) {
+    const orderedUrls = [...urls];
+    const diagnostics = health.map((entry, index) => ({ ...entry, index }));
+    if (orderedUrls.length !== diagnostics.length) throw new Error('invalid_response');
+    const healthyUrls = diagnostics.filter((entry) => entry.ok && entry.chainValid
+      && Number(entry.chainId) === this.config.chainId && entry.errorType == null
+      && Number.isSafeInteger(entry.blockNumber) && entry.blockNumber >= 0).map((entry) => orderedUrls[entry.index]);
+    if (!healthyUrls.length) throw new Error('last_healthy');
+    if (persist) {
+      persistRuntimeCredentials({ rpcUrls: orderedUrls, walletAddress: this.config.walletAddress, privateKey: this.config.privateKey },
+        { enabled: this.config.persistRuntimeCredentials, filePath: this.config.runtimeCredentialsFile || path.resolve('.env') });
+    }
+    const previousEndpoints = new Set(this.config.rpcUrls);
+    this.config.rpcUrls = orderedUrls;
+    this.rpcHealth = diagnostics;
+    diagnostics.forEach((result, index) => this.rpcDiagnostics.set(orderedUrls[index], result));
+    for (const endpoint of orderedUrls) this.rpcId(endpoint);
+    for (const endpoint of previousEndpoints) {
+      if (!orderedUrls.includes(endpoint)) {
+        this.rpcEndpointIdByUrl.delete(endpoint);
+        this.rpcDiagnostics.delete(endpoint);
+      }
+    }
+    registerSensitiveValues([...orderedUrls, ...[...this.walletProfiles.values()].map((profile) => profile.privateKey),
       this.config.blockscoutApiKey || '']);
-    this.providers = nextProviders;
-    this.rpcHealth = health;
+    this.providers = createProviders({ ...this.config, rpcUrls: healthyUrls });
+    this.activeRpcUrls = healthyUrls;
     this.fables = new FablesAdapter(this.providers.readProvider, this.config);
     this.quoter = new V4QuoterAdapter(this.providers.readProvider);
     this.executor = this.createExecutor();
-    this.useHealthyRpcEndpoints();
     this.market.refreshedAt = 0;
-    await this.refreshMarket(true);
-    return { ok: true, chainId: this.config.chainId, endpointCount: urls.length };
+    this.market.stateRefreshedAt = 0;
+  }
+
+  async setRpcEndpoint(value) {
+    const result = await this.addRpcEndpoint(value);
+    return { ok: true, chainId: this.config.chainId, endpointCount: this.config.rpcUrls.length, ...result };
   }
 
   async mountWallet(addressValue, privateKey, type) {
+    if (this.initializing || this.rpcManagementActive) throw new Error('busy');
     if (this.cycleActive) throw new Error('Wait for the current monitor cycle before mounting another wallet');
     const activeExecution = this.state.getSetting('activeRebalanceExecution', null);
     if (activeExecution?.phase && !new Set(['completed', 'failed']).has(activeExecution.phase)) {
@@ -514,6 +687,212 @@ export class AutoLpBot {
         || this.getSelectedExecutionTargetPoolId()
       ).toLowerCase()
     };
+  }
+
+  getInvestmentAllocationConfig() {
+    const stored = this.state?.getSetting('investmentAllocation', null);
+    if (stored == null) return { version: 1, enabled: false, allocations: [] };
+    if (stored && stored.version === 1 && typeof stored.enabled === 'boolean'
+      && Array.isArray(stored.allocations)) {
+      const seen = new Set();
+      const validEntries = stored.allocations.every((entry) => {
+        const poolId = String(entry?.poolId || '').toLowerCase();
+        const weightBps = Number(entry?.weightBps);
+        if (!/^0x[0-9a-f]{64}$/.test(poolId) || seen.has(poolId)
+          || !Number.isInteger(weightBps) || weightBps < 1 || weightBps > 10_000) return false;
+        seen.add(poolId);
+        return true;
+      });
+      const allocationCount = stored.allocations.length;
+      const allocationTotal = stored.allocations.reduce((sum, entry) => sum + Number(entry?.weightBps), 0);
+      const validEnabled = stored.enabled
+        ? allocationCount >= 1 && allocationCount <= 2 && allocationTotal === 10_000
+        : allocationCount === 0 || (allocationCount <= 2 && allocationTotal === 10_000);
+      if (validEntries && validEnabled) return stored;
+      return { version: 1, enabled: true, allocations: [], invalid: true };
+    }
+    return { version: 1, enabled: true, allocations: [], invalid: true };
+  }
+
+  getInvestmentAllocationSnapshot() {
+    const config = this.getInvestmentAllocationConfig();
+    const updatedAt = Number(this.state?.getSetting('investmentAllocationUpdatedAt', 0) || 0);
+    const funding = this.allocationFunding;
+    const matchesConfig = funding?.allocationUpdatedAt === updatedAt;
+    const isFresh = !config.invalid && matchesConfig && funding?.status === 'ready'
+      && Date.now() >= Number(funding.priceObservedAt || 0)
+      && Date.now() - Number(funding.priceObservedAt || 0) <= 5 * 60_000;
+    const allocations = config.allocations.map((entry) => {
+      const pool = this.market.pools.find((item) => item.id.toLowerCase() === entry.poolId);
+      return { ...entry, pair: pool ? `${pool.token0.symbol}/${pool.token1.symbol}` : null };
+    });
+    const base = isFresh ? funding : null;
+    const configuredIds = new Set(allocations.map((entry) => entry.poolId));
+    const excludedAssets = isFresh ? funding.excludedAssets || [] : [];
+    return {
+      version: 1,
+      enabled: config.enabled,
+      allocations,
+      totalWeightBps: allocations.reduce((sum, entry) => sum + Number(entry.weightBps || 0), 0),
+      status: !config.enabled ? 'disabled' : config.invalid ? 'blocked' : isFresh ? 'ready'
+        : funding?.status === 'blocked' && matchesConfig ? 'blocked' : 'pending-refresh',
+      priceStatus: {
+        status: !config.enabled ? 'unavailable' : config.invalid ? 'missing'
+          : base ? 'fresh' : funding?.status === 'blocked' && matchesConfig ? 'missing' : 'unavailable',
+        source: 'pool-local-spot',
+        asOfBlock: base?.asOfBlock ?? null,
+        observedAt: base?.priceObservedAt ?? null,
+        missingPoolIds: allocations.filter((entry) => !this.market.pools.some((pool) =>
+          pool.id.toLowerCase() === entry.poolId)).map((entry) => entry.poolId)
+      },
+      capital: {
+        denomination: 'USDG',
+        asOfBlock: base?.asOfBlock ?? null,
+        observedAt: base?.priceObservedAt ?? null,
+        totalUsdG: base?.totalUsdG ?? null,
+        byPool: base?.byPool ?? [],
+        excludedAssets,
+        pendingRefresh: config.enabled && !config.invalid && !isFresh
+      }
+    };
+  }
+
+  setInvestmentAllocation(input = {}) {
+    if (this.cycleActive || this.initializing || this.rpcManagementActive) {
+      throw new Error('Wait for the current wallet operation before changing allocations');
+    }
+    if (this.executor?.hasPendingWrite) throw new Error('Wait for queued wallet transactions before changing allocations');
+    const activeExecution = this.state?.getSetting('activeRebalanceExecution', null);
+    if (activeExecution?.phase && !['completed', 'failed'].includes(activeExecution.phase)) {
+      throw new Error(`Wait for the active rebalance journal to finish before changing allocations (${activeExecution.phase})`);
+    }
+    this.executor?.assertNoUnfinishedExecution();
+    const { enabled, allocations } = input || {};
+    if (typeof enabled !== 'boolean') throw new Error('資金分配 enabled 必須是布林值');
+    const previous = this.getInvestmentAllocationConfig();
+    let normalized;
+    if (!enabled) {
+      const retained = allocations === undefined || (Array.isArray(allocations) && allocations.length === 0)
+        ? previous.allocations
+        : normalizeInvestmentAllocation({ enabled: true, allocations },
+          this.market.pools, this.config.usdgAddress).allocations;
+      normalized = { version: 1, enabled: false, allocations: retained };
+    } else {
+      normalized = normalizeInvestmentAllocation({ enabled: true,
+        allocations: allocations === undefined ? previous.allocations : allocations },
+      this.market.pools, this.config.usdgAddress);
+    }
+    const updatedAt = Date.now();
+    this.state.setSetting('investmentAllocation', normalized);
+    this.state.setSetting('investmentAllocationUpdatedAt', updatedAt);
+    this.allocationFunding = null;
+    this.ledger.append('investment.allocation_updated', {
+      enabled: normalized.enabled,
+      allocations: normalized.allocations
+    });
+    if (normalized.enabled) {
+      this.config.targetMode = 'wallet-active';
+      this.config.targetPoolIds = [];
+      this.config.targetSymbols = [];
+    } else this.applyStoredExecutionTarget();
+    return this.getInvestmentAllocationSnapshot();
+  }
+
+  getAllocationFundingScope(poolId) {
+    const config = this.getInvestmentAllocationConfig();
+    if (!config.enabled) return null;
+    const allocation = config.allocations.find((entry) => entry.poolId === String(poolId).toLowerCase());
+    if (!allocation) throw new Error('Pool is outside the saved allocation');
+    const snapshot = this.getInvestmentAllocationSnapshot();
+    if (snapshot.status !== 'ready') throw new Error('Fresh allocation valuation is required before spending');
+    const item = snapshot.capital.byPool.find((entry) => entry.poolId === allocation.poolId);
+    if (!item) throw new Error('Allocation funding cap is unavailable');
+    return {
+      allocationUpdatedAt: Number(this.state.getSetting('investmentAllocationUpdatedAt', 0)),
+      poolId: allocation.poolId,
+      weightBps: allocation.weightBps,
+      availableUsdG: Number(item.availableUsdG),
+      targetUsdG: Number(item.targetUsdG),
+      lpEquityUsdG: Number(item.lpEquityUsdG),
+      ownWalletUsdG: Number(item.ownWalletUsdG),
+      sharedUsdgAvailableUsdG: Number(item.sharedUsdgAvailableUsdG),
+      driftUsdG: Number(item.driftUsdG),
+      tokenCaps: { ...item.tokenCaps },
+      asOfBlock: snapshot.capital.asOfBlock,
+      priceObservedAt: snapshot.capital.observedAt
+    };
+  }
+
+  async refreshAllocationFundingSnapshot({ pools = null, walletBalances = null,
+    asOfBlock = null, refreshPositions = false } = {}) {
+    const config = this.getInvestmentAllocationConfig();
+    if (!config.enabled) {
+      this.allocationFunding = null;
+      return null;
+    }
+    if (config.invalid) {
+      this.allocationFunding = { status: 'blocked', reason: 'saved-allocation-invalid', allocation: config,
+        allocationUpdatedAt: Number(this.state.getSetting('investmentAllocationUpdatedAt', 0)),
+        byPool: [], totalUsdG: null, priceObservedAt: null, asOfBlock: null, excludedAssets: [] };
+      return this.allocationFunding;
+    }
+    try {
+      const selected = config.allocations.map((entry) => {
+        const pool = (pools || this.market.pools).find((item) => item.id.toLowerCase() === entry.poolId);
+        if (!pool) throw new Error('Saved allocation pool is no longer in the Fables registry');
+        return pool;
+      });
+      const block = Number(asOfBlock || await this.providers.readProvider.getBlockNumber());
+      for (const pool of selected) {
+        pool.state = await this.fables.readPoolState(pool);
+        if (refreshPositions) {
+          const fromBlock = Math.max(this.config.logFromBlock, block - this.config.reorgLookbackBlocks);
+          const discovered = await this.fables.discoverPositions(pool, fromBlock, block);
+          pool.positions = discovered.positions;
+          for (const position of pool.positions) await this.decoratePosition(pool, position);
+        }
+      }
+      const tokens = [...new Map(selected.flatMap((pool) => [pool.token0, pool.token1])
+        .map((token) => [token.address.toLowerCase(), token])).values()];
+      const currentBalances = walletBalances || await this.fables.readWalletBalances(tokens);
+      const usdG = this.config.usdgAddress.toLowerCase();
+      const tokenPricesUsdG = new Map([[usdG, 1]]);
+      const lpEquityUsdG = {};
+      for (const pool of selected) {
+        const value = valuePoolPositionsUsdG(pool, usdG);
+        tokenPricesUsdG.set(value.tokenAddress, value.priceUsdG);
+        lpEquityUsdG[pool.id.toLowerCase()] = value.lpEquityUsdG;
+      }
+      const computed = computeAllocationFunding({
+        allocation: config,
+        pools: selected,
+        lpEquityUsdG,
+        walletBalances: currentBalances,
+        pricesUsdG: tokenPricesUsdG,
+        usdgAddress: usdG,
+        priceObservedAt: Date.now(),
+        asOfBlock: block
+      });
+      const selectedTokens = new Set(tokens.map((token) => token.address.toLowerCase()));
+      const tokenByAddress = new Map(tokens.map((token) => [token.address.toLowerCase(), token]));
+      const excludedAssets = Object.entries(currentBalances)
+        .filter(([address, entry]) => !selectedTokens.has(address.toLowerCase())
+          && Number(entry?.amount || 0) > 0)
+        .map(([address]) => ({ address: address.toLowerCase(), reason: 'outside-selected-pool-assets' }));
+      this.allocationFunding = {
+        ...computed,
+        allocationUpdatedAt: Number(this.state.getSetting('investmentAllocationUpdatedAt', 0)),
+        excludedAssets
+      };
+      return this.allocationFunding;
+    } catch (error) {
+      this.allocationFunding = {
+        status: 'blocked', reason: sanitize(error.message), allocation: config,
+        allocationUpdatedAt: Number(this.state.getSetting('investmentAllocationUpdatedAt', 0)),
+        byPool: [], totalUsdG: null, priceObservedAt: null, asOfBlock: null, excludedAssets: []
+      };
+      return this.allocationFunding;
+    }
   }
 
   getInvestmentTargetSnapshot() {
@@ -653,7 +1032,7 @@ export class AutoLpBot {
       throw new Error('Stored execution target pool is invalid; refusing to start');
     }
     const investmentMode = String(this.state?.getSetting('investmentTargetMode', 'apr-highest') || 'apr-highest');
-    if (['apr-highest', 'specific-pool'].includes(investmentMode)) {
+    if (this.getInvestmentAllocationConfig?.()?.enabled === true || ['apr-highest', 'specific-pool'].includes(investmentMode)) {
       this.config.targetMode = 'wallet-active';
       this.config.targetPoolIds = [];
       this.config.targetSymbols = [];
@@ -666,6 +1045,9 @@ export class AutoLpBot {
 
   setInvestmentTarget(mode, poolId = '') {
     if (this.cycleActive) throw new Error('Wait for the current monitor cycle before changing the investment target');
+    if (this.getInvestmentAllocationConfig?.()?.enabled === true) {
+      throw new Error('Disable pool allocation before changing the legacy single investment target');
+    }
     const normalizedMode = String(mode || '').trim().toLowerCase();
     if (!['apr-highest', 'specific-pool'].includes(normalizedMode)) {
       throw new Error('再投入模式只能是最高 APR 或指定池');
@@ -687,6 +1069,11 @@ export class AutoLpBot {
   persistInvestmentTarget(mode, pool) {
     this.state.setSetting('investmentTargetMode', mode);
     if (pool) this.state.setSetting('investmentTargetPoolId', pool.id.toLowerCase());
+    if (mode === 'specific-pool' && pool) {
+      // Keep the legacy dashboard/start-readiness selection in sync with the
+      // wallet's specific reinvestment target. Each bot owns its own state.
+      this.state.setSetting('selectedExecutionTargetPoolId', pool.id.toLowerCase());
+    }
     this.applyStoredExecutionTarget();
     const target = this.getInvestmentTargetSnapshot();
     this.ledger.append('investment.target_updated', {
@@ -699,6 +1086,9 @@ export class AutoLpBot {
 
   setExecutionTargetPool(poolId = '') {
     if (this.cycleActive) throw new Error('Wait for the current monitor cycle before changing the execution target');
+    if (this.getInvestmentAllocationConfig?.()?.enabled === true) {
+      throw new Error('Disable pool allocation before changing the legacy execution target');
+    }
     const normalized = String(poolId || '').trim().toLowerCase();
     if (normalized && !/^0x[0-9a-f]{64}$/.test(normalized)) throw new Error('Invalid pool ID');
     const pool = normalized ? this.market.pools.find((item) => item.id.toLowerCase() === normalized) : null;
@@ -781,6 +1171,9 @@ export class AutoLpBot {
   }
 
   createExecutor() {
+    if (this.guardReadinessCache && this.providers?.readProvider) {
+      this.guardReadinessCache.delete(this.providers.readProvider);
+    }
     return new RebalanceExecutor(
       this.providers.readProvider,
       this.providers.writeProvider,
@@ -792,7 +1185,34 @@ export class AutoLpBot {
     );
   }
 
+  async getUiGuardReadiness() {
+    const provider = this.providers.readProvider;
+    if (!this.guardReadinessCache) this.guardReadinessCache = new WeakMap();
+    let entries = this.guardReadinessCache.get(provider);
+    if (!entries) {
+      entries = new Map();
+      this.guardReadinessCache.set(provider, entries);
+    }
+    const key = `${String(this.config.walletAddress || '').toLowerCase()}|${String(this.config.eip7702GuardAddress || '').toLowerCase()}`;
+    const now = Date.now();
+    const current = entries.get(key);
+    if (current && (current.pending || now < current.expiresAt)) return current.promise;
+
+    const entry = { pending: true, expiresAt: Infinity, promise: null };
+    entry.promise = Promise.resolve().then(() => this.executor.assertAtomicGuardReady())
+      .then(() => ({ ready: true, error: null }))
+      .catch((error) => ({ ready: false, error: sanitize(error.shortMessage || error.message || 'Guard readiness check failed') }))
+      .then((result) => {
+        entry.pending = false;
+        entry.expiresAt = Date.now() + (result.ready ? 5 * 60_000 : 60_000);
+        return result;
+      });
+    entries.set(key, entry);
+    return entry.promise;
+  }
+
   async manualRebalance(poolId, positionId, source = 'dashboard') {
+    if (this.rpcManagementActive || this.initializing) throw new Error('busy');
     poolId = String(poolId || '').toLowerCase();
     positionId = String(positionId || '').toLowerCase();
     if (!/^0x[0-9a-f]{64}$/.test(poolId)) throw new Error('Invalid poolId');
@@ -836,6 +1256,10 @@ export class AutoLpBot {
 
   async manualImmediateRotation({ poolId, positionId, destinationPoolId, previewId = '',
     previewOnly = false, directExecute = false, maxCostBps = null }) {
+    if (this.rpcManagementActive || this.initializing) throw new Error('busy');
+    if (this.getInvestmentAllocationConfig?.()?.enabled === true) {
+      throw new Error('Disable pool allocation before using legacy manual rotation');
+    }
     poolId = String(poolId || '').toLowerCase();
     positionId = String(positionId || '').toLowerCase();
     destinationPoolId = String(destinationPoolId || '').toLowerCase();
@@ -1098,6 +1522,11 @@ export class AutoLpBot {
 
   async runOnce(options = {}) {
     const executeRebalances = options.executeRebalances !== false;
+    if (this.rpcManagementActive || this.initializing) {
+      if (options.source) throw new Error('busy');
+      log('warn', 'cycle.skipped', { reason: 'rpc management is active' });
+      return this.snapshot;
+    }
     if (this.cycleActive) {
       log('warn', 'cycle.skipped', { reason: 'previous cycle still running' });
       return this.snapshot;
@@ -1173,6 +1602,9 @@ export class AutoLpBot {
         });
         log('warn', 'cashflow.scan_failed', { error: error.message });
       }
+      if (this.getInvestmentAllocationConfig?.()?.enabled === true) {
+        await this.refreshAllocationFundingSnapshot({ pools: targetPools, walletBalances, asOfBlock: latestBlock });
+      }
       const portfolio = this.analytics.build({
         targetPools,
         walletBalances,
@@ -1206,6 +1638,7 @@ export class AutoLpBot {
           lastAction: this.state.getSetting('lastAction', null),
           targetMode: this.config.targetMode,
           investmentTarget: this.getInvestmentTargetSnapshot(),
+          investmentAllocation: this.getInvestmentAllocationSnapshot(),
           activePoolIds: targetPools.map((pool) => pool.id),
           accountingPoolIds: accountingPools.map((pool) => pool.id),
           watchedPoolIds: this.state.getSetting('watchedPoolIds', []) || [],
@@ -1233,6 +1666,17 @@ export class AutoLpBot {
           .map((position) => ({ pool, position }))
       );
       if (!executeRebalances) return snapshot;
+      if (this.getInvestmentAllocationConfig?.()?.enabled === true) {
+        await this.runAllocationExecutionCycle(targetPools, pendingRebalances);
+        if (this.snapshot) {
+          this.snapshot = {
+            ...this.snapshot,
+            bot: { ...this.snapshot.bot, investmentAllocation: this.getInvestmentAllocationSnapshot() }
+          };
+          this.ledger.writeSnapshot(this.snapshot);
+        }
+        return this.snapshot;
+      }
       if (pendingRebalances.length && this.config.targetMode === 'wallet-active') {
         const stable = await this.revalidateTopologyBeforeExecution(latestBlock, pendingRebalances);
         if (!stable) return snapshot;
@@ -1245,6 +1689,82 @@ export class AutoLpBot {
     } finally {
       this.cycleActive = false;
     }
+  }
+
+  async runAllocationExecutionCycle(targetPools, pendingRebalances) {
+    if (this.executionPaused || (this.config.dryRun !== true
+      && (!this.config.enableLiveWrites || !this.config.enableAutoRedeploy || !this.config.privateKey))) return null;
+    const journal = this.state.getSetting('activeRebalanceExecution', null);
+    if (journal?.phase && !['completed', 'failed'].includes(journal.phase)) return null;
+
+    // One capital-moving job per monitor cycle. This keeps the token caps fixed
+    // across every receipt in a sequence; the next cycle recomputes balances,
+    // LP equity, and shared USDG reservations from chain state.
+    await this.refreshAllocationFundingSnapshot({ pools: targetPools, refreshPositions: true });
+    const refreshedDue = [];
+    for (const candidate of pendingRebalances) {
+      const pool = targetPools.find((entry) => entry.id.toLowerCase() === candidate.pool.id.toLowerCase());
+      const position = pool?.positions?.find((entry) => entry.id.toLowerCase() === candidate.position.id.toLowerCase());
+      if (!pool || !position) continue;
+      await this.decoratePosition(pool, position);
+      const backoff = rebalanceFailureMap(this.state)[rebalanceFailureKey(pool, position)];
+      if (position.outside === true && position.shouldRebalance === true
+        && !(backoff && Date.now() < Number(backoff.nextRetryAt || 0))) {
+        refreshedDue.push({ pool, position });
+      }
+    }
+    refreshedDue.sort((a, b) => Number(a.position.outOfRangeSince || 0)
+      - Number(b.position.outOfRangeSince || 0));
+    const due = refreshedDue[0];
+    if (due) {
+      const scope = this.getAllocationFundingScope(due.pool.id);
+      return this.maybeRebalance(due.pool, due.position, {
+        source: 'allocation-out-of-range', allocationFundingScope: scope
+      });
+    }
+
+    if (!this.config.autoTopupEnabled) return null;
+    for (const pool of targetPools) {
+      const scope = this.getAllocationFundingScope(pool.id);
+      const availableUsdG = Number(scope.availableUsdG || 0);
+      if (!Number.isFinite(availableUsdG) || availableUsdG < this.config.autoTopupMinIdleUsd) continue;
+      const active = (pool.positions || []).filter((position) => BigInt(position.shares || 0) > 0n);
+      if (active.length === 0) {
+        const result = await this.executor.executeAllocationBootstrap({
+          pool,
+          allocationFundingScope: scope,
+          maxPriceImpactBps: this.config.maxSwapPriceImpactBps ?? 200,
+          minGasReserveWei: this.config.topUpMinGasReserveWei
+        });
+        if (result?.status === 'completed') {
+          await this.refreshAllocationFundingSnapshot({ pools: targetPools, refreshPositions: true });
+        }
+        return result;
+      }
+      if (active.length !== 1) continue;
+      const [position] = active;
+      if (position.outside !== false || pool.state.tick < position.tickLower
+        || pool.state.tick >= position.tickUpper) continue;
+      const key = `${pool.id.toLowerCase()}:${position.id.toLowerCase()}`;
+      const attempts = this.state.getSetting('autoTopupAttempts', {}) || {};
+      const previous = attempts[key];
+      if (previous && Date.now() - Number(previous.at || 0)
+        < this.config.autoTopupMinIntervalSec * 1000) continue;
+      const next = Object.fromEntries(Object.entries(attempts)
+        .filter(([, entry]) => Date.now() - Number(entry?.at || 0) < 7 * 24 * 60 * 60_000));
+      next[key] = { at: Date.now(), idleUsd: availableUsdG };
+      this.state.setSetting('autoTopupAttempts', next);
+      const result = await this.executor.topUpPoolPosition({
+        pool, position, dustBps: this.config.autoTopupDustBps,
+        minGasReserveWei: this.config.topUpMinGasReserveWei,
+        allocationFundingScope: scope
+      });
+      if (result?.status === 'completed') {
+        await this.refreshAllocationFundingSnapshot({ pools: targetPools, refreshPositions: true });
+      }
+      return result;
+    }
+    return null;
   }
 
   async scanExternalCashflows(latestBlock) {
@@ -1399,7 +1919,16 @@ export class AutoLpBot {
       });
     }
 
-    return { pools: result.activePools, accountingPools: result.knownPools || result.activePools, discovery: result };
+    const allocation = this.getInvestmentAllocationConfig?.() || { enabled: false, allocations: [] };
+    if (!allocation.enabled) {
+      return { pools: result.activePools, accountingPools: result.knownPools || result.activePools, discovery: result };
+    }
+    const selectedPools = allocation.allocations.map((entry) => this.market.pools.find((pool) =>
+      pool.id.toLowerCase() === entry.poolId)).filter(Boolean);
+    const accounting = new Map((result.knownPools || result.activePools).map((pool) =>
+      [pool.id.toLowerCase(), pool]));
+    for (const pool of selectedPools) accounting.set(pool.id.toLowerCase(), pool);
+    return { pools: selectedPools, accountingPools: [...accounting.values()], discovery: result };
   }
 
   async revalidateTopologyBeforeExecution(snapshotBlock, pendingRebalances = []) {
@@ -1754,19 +2283,25 @@ export class AutoLpBot {
       return { status: 'blocked', reason: 'hourly-rate-limit' };
     }
     let destinationPool;
+    const allocationEnabled = this.getInvestmentAllocationConfig?.()?.enabled === true;
     try {
       const investmentMode = this.getInvestmentTargetSettings().mode;
-      if (!manualImmediate) {
+      if (!manualImmediate && !allocationEnabled) {
         try { await this.refreshAprForRebalance(); }
         catch (error) {
           log('warn', 'fables.stats_unavailable_for_rebalance', { error: error.message });
-          if (investmentMode === 'apr-highest') throw error;
+          if (investmentMode === 'apr-highest' && !allocationEnabled) throw error;
         }
       }
-      destinationPool = manualImmediate ? options.destinationPool
+      destinationPool = allocationEnabled && !manualImmediate ? pool
+        : manualImmediate ? options.destinationPool
         : investmentMode === 'apr-highest' && this.config.enableLiveWrites && !this.config.dryRun
           ? await this.resolveExecutableInvestmentTarget(pool, position)
           : this.resolveInvestmentTarget(pool);
+      if (allocationEnabled && (!options.allocationFundingScope
+        || options.allocationFundingScope.poolId !== pool.id.toLowerCase())) {
+        throw new Error('Fresh pool-specific allocation cap is required for execution');
+      }
       if (investmentMode === 'apr-highest' && destinationPool.id.toLowerCase() === pool.id.toLowerCase()) {
         this.ledger.append('rebalance.target_fallback', {
           sourcePoolId: pool.id, destinationPoolId: pool.id, positionId: position.id,
@@ -1795,6 +2330,10 @@ export class AutoLpBot {
         ? []
         : uniqueTargetTokens(this.market.pools, { excludeNative: true }),
       investmentTargetMode: manualImmediate ? 'specific-pool' : this.getInvestmentTargetSettings().mode,
+      allocationFundingScope: allocationEnabled ? options.allocationFundingScope : null,
+      allocationJobId: allocationEnabled
+        ? `allocation:${Number(this.state.getSetting('investmentAllocationUpdatedAt', 0))}:${pool.id.toLowerCase()}:${position.id.toLowerCase()}`
+        : null,
       manualImmediate,
       manualSource: manualImmediate ? source : null,
       manualMaxCostBps: manualImmediate ? options.manualMaxCostBps : null,
@@ -2561,6 +3100,17 @@ export class AutoLpBot {
 
   async waitForCycleIdle() {
     while (this.cycleActive) await sleep(250);
+  }
+}
+
+function maskRpcEndpointLabel(endpoint) {
+  try {
+    const parsed = new URL(endpoint);
+    const labels = parsed.hostname.split('.');
+    const host = labels.length > 2 ? `••••.${labels.slice(-2).join('.')}` : `••••.${labels.at(-1) || 'rpc'}`;
+    return `${parsed.protocol}//${host}${parsed.pathname !== '/' ? '/••••' : ''}`;
+  } catch {
+    return 'RPC endpoint';
   }
 }
 

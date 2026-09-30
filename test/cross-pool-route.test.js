@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Interface } from 'ethers';
 import { RebalanceExecutor, buildCrossPoolWithdrawCall } from '../src/adapters/executor.js';
+import { V4QuoterAdapter } from '../src/adapters/quoter.js';
 import { assertCrossPoolWeightedQuoteCost } from '../src/execution/investment-target.js';
 import { EIP7702_GUARD_ABI, HOOK_ABI, V4_QUOTER_ABI } from '../src/abi.js';
 
@@ -30,7 +31,7 @@ test('explicit manual rotation uses direct hook withdrawal while automatic OOR k
 test('manual immediate entry bypasses OOR only for an explicit different-pool dashboard plan', async () => {
   const executor = Object.create(RebalanceExecutor.prototype);
   executor.assertPlanStillOutOfRange = () => { throw new Error('OOR only'); };
-  executor.executeCrossPool = async (_plan, pool) => ({ status: 'manual-path', poolId: pool.id });
+  executor.executeCrossPoolUnlocked = async (_plan, pool) => ({ status: 'manual-path', poolId: pool.id });
   executor.config = { dryRun: false, enableLiveWrites: true };
   assert.deepEqual(await executor.execute({ pool: source, destinationPool: destination,
     manualImmediate: true, manualSource: 'dashboard' }),
@@ -60,12 +61,12 @@ test('cross-pool route accepts a roughly three percent quote within its scoped c
   executor.fables = { async readPoolState() { return {
     paused: false, liquidity: 1n, sqrtPriceX96: 2n ** 96n
   }; } };
-  executor.quoter = { async quoteExactInputSingleRaw(_pool, index, raw) {
+  executor.quoter = Object.assign(new V4QuoterAdapter(null), { async quoteExactInputSingleRaw(_pool, index, raw) {
     assert.equal(index, 1);
     assert.equal(raw, 10000n);
     return { tokenIn: EARN.address, tokenOut: USDG.address,
       rawAmountIn: '10000', rawAmountOut: '9700', minRawAmountOut: '9651' };
-  } };
+  } });
   executor.router = { buildV4ExactInputSingle() { return { router: '0xrouter', data: '0x' }; } };
   const route = await executor.quoteCrossPoolRoute([source], EARN, 10000n, 350);
   assert.equal(route.impactBps, 300);

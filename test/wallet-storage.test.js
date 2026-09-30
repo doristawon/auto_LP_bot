@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { resolveWalletStorage } from '../src/tools/wallet-storage.js';
 
-const walletAddress = '0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF';
+const walletAddress = '0x0000000000000000000000000000000000000008';
 
 test('wallet-specific state and snapshot directory follows bot wallet routing', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lpbot-wallet-state-'));

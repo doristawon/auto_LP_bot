@@ -19,7 +19,9 @@ export function sanitize(value) {
 }
 
 export function registerSensitiveValues(values = []) {
-  const candidates = new Set();
+  // All wallet workers share this logger; a later worker must not erase another
+  // signer's redactions. Keep removed RPC credentials redacted for late errors.
+  const candidates = new Set(redactionValues);
   for (const value of values) {
     const raw = String(value || '');
     if (!raw) continue;

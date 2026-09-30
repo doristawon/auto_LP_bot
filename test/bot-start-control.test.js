@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AutoLpBot } from '../src/bot.js';
+import { registerSensitiveValues } from '../src/logger.js';
 
 const POOL_ID = '0x' + '11'.repeat(32);
 const WALLET = '0x00000000000000000000000000000000000000aa';
 
 function makeBot() {
   const settings = new Map();
+  const probes = { guard: 0 };
   const bot = Object.create(AutoLpBot.prototype);
   bot.config = {
     walletAddress: WALLET,
@@ -26,7 +28,7 @@ function makeBot() {
     setSetting(key, value) { settings.set(key, value); }
   };
   bot.ledger = { append() {} };
-  bot.executor = { async assertAtomicGuardReady() {} };
+  bot.executor = { async assertAtomicGuardReady() { probes.guard++; } };
   bot.market = { pools: [{ id: POOL_ID }] };
   bot.snapshot = {
     generatedAt: Date.now(),
@@ -37,14 +39,15 @@ function makeBot() {
   bot.walletImportState = { status: 'ready', address: WALLET };
   bot.walletProfiles = new Map();
   bot.rpcHealth = [{ ok: true, chainId: 4663 }];
-  bot.providers = { rawProviders: [{}] };
+  bot.providers = { rawProviders: [{}], readProvider: {} };
+  bot.guardReadinessCache = new WeakMap();
   bot.executionPaused = true;
   bot.cycleActive = true;
   bot.getSelectedExecutionTargetPoolId = () => POOL_ID;
   bot.getInvestmentTargetSettings = () => ({ mode: 'apr-highest' });
   bot.getInvestmentTargetSnapshot = () => ({ mode: 'apr-highest', poolId: POOL_ID });
   bot.getRuntimeIntervals = () => ({});
-  return { bot, settings };
+  return { bot, settings, probes };
 }
 
 test('start control accepts a healthy paused bot during a routine monitor cycle', async () => {
@@ -67,6 +70,105 @@ test('start control still blocks an unfinished capital-moving execution', async 
   const started = await bot.startExecution('dashboard');
   assert.equal(started.ok, false);
   assert.equal(bot.executionPaused, true);
+});
+
+test('dashboard guard readiness coalesces requests and caches success for five minutes by wallet and provider', async () => {
+  const { bot, probes } = makeBot();
+  const originalNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+  try {
+    await Promise.all([bot.controlStatus(), bot.controlStatus()]);
+    assert.equal(probes.guard, 1);
+    await bot.controlStatus();
+    assert.equal(probes.guard, 1);
+    now += 5 * 60_000 + 1;
+    await bot.controlStatus();
+    assert.equal(probes.guard, 2);
+    bot.config.walletAddress = '0x00000000000000000000000000000000000000bb';
+    await bot.controlStatus();
+    assert.equal(probes.guard, 3);
+    bot.providers.readProvider = {};
+    await bot.controlStatus();
+    assert.equal(probes.guard, 4);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test('dashboard guard readiness caches failure for one minute then retries', async () => {
+  const { bot, probes } = makeBot();
+  const originalNow = Date.now;
+  let now = 2_000_000;
+  Date.now = () => now;
+  bot.executor.assertAtomicGuardReady = async () => {
+    probes.guard++;
+    throw new Error('unavailable');
+  };
+  try {
+    await bot.controlStatus();
+    await bot.controlStatus();
+    assert.equal(probes.guard, 1);
+    now += 60_000 + 1;
+    await bot.controlStatus();
+    assert.equal(probes.guard, 2);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test('dashboard guard readiness redacts registered secrets in cached API errors', async () => {
+  const { bot, probes } = makeBot();
+  const secretOne = 'guard-secret-one-6f82a19d';
+  const secretTwo = 'guard-secret-two-4c91b72e';
+  registerSensitiveValues([secretOne, secretTwo]);
+  bot.executor.assertAtomicGuardReady = async () => {
+    probes.guard++;
+    throw new Error(`RPC rejected credential ${secretOne}; fallback token ${secretTwo}`);
+  };
+
+  const first = await bot.controlStatus();
+  const cached = await bot.controlStatus();
+  assert.equal(probes.guard, 1);
+  for (const status of [first, cached]) {
+    assert.equal(status.guard.runtimeReady, false);
+    assert.ok(!JSON.stringify(status).includes(secretOne));
+    assert.ok(!JSON.stringify(status).includes(secretTwo));
+    assert.equal(status.guard.error.includes('[REDACTED]'), true);
+  }
+});
+
+test('setting a specific pool clears target-required only for that wallet and keeps the idle guard', async () => {
+  const setupTargetBot = () => {
+    const { bot } = makeBot();
+    bot.cycleActive = false;
+    bot.getSelectedExecutionTargetPoolId = AutoLpBot.prototype.getSelectedExecutionTargetPoolId.bind(bot);
+    bot.getInvestmentTargetSettings = AutoLpBot.prototype.getInvestmentTargetSettings.bind(bot);
+    bot.applyStoredExecutionTarget = () => {};
+    bot.getInvestmentTargetSnapshot = () => ({
+      mode: bot.state.getSetting('investmentTargetMode', 'apr-highest'),
+      poolId: bot.state.getSetting('investmentTargetPoolId', null)
+    });
+    bot.market.pools = [{ id: POOL_ID, state: { paused: false, liquidity: 1n },
+      token0: { address: '0x0000000000000000000000000000000000000001', symbol: 'USDG' },
+      token1: { address: '0x0000000000000000000000000000000000000002', symbol: 'CASHCAT' } }];
+    bot.snapshot.pools = [{ id: POOL_ID, positions: [{ shares: '1' }] }];
+    return bot;
+  };
+  const firstWallet = setupTargetBot();
+  const secondWallet = setupTargetBot();
+
+  assert.ok((await firstWallet.controlStatus()).startReadiness.blockers.includes('target-required'));
+  firstWallet.setInvestmentTarget('specific-pool', POOL_ID);
+  const firstStatus = await firstWallet.controlStatus();
+  const secondStatus = await secondWallet.controlStatus();
+  assert.equal(firstStatus.selectedExecutionTargetPoolId, POOL_ID);
+  assert.ok(!firstStatus.startReadiness.blockers.includes('target-required'));
+  assert.ok(secondStatus.startReadiness.blockers.includes('target-required'));
+  assert.equal(secondWallet.getSelectedExecutionTargetPoolId(), '');
+
+  firstWallet.cycleActive = true;
+  assert.throws(() => firstWallet.setInvestmentTarget('specific-pool', POOL_ID), /current monitor cycle/);
 });
 
 test('startup restores a previously running bot only after its first successful scan', async () => {

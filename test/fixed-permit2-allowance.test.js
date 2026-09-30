@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { MaxUint256 } from 'ethers';
 import { RebalanceExecutor } from '../src/adapters/executor.js';
 
-const wallet = '0x2Ea3d6F7b1841687324819c239E6f657435FDe6e';
+const wallet = '0x0000000000000000000000000000000000000005';
 const token = { address: '0xa3b6aee90017b72c0812dc1e013de70eb2917ba3' };
 
 function executorWithCall(call) {

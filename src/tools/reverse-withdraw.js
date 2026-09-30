@@ -7,31 +7,32 @@ import { loadConfig } from '../config.js';
 import { createProviders, verifyProviders } from '../rpc/providers.js';
 import { HOOK_ABI, WITHDRAWN_EVENT } from '../abi.js';
 
+function transactionHashes(argv) {
+  const hashes = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === '--tx') {
+      const value = argv[++index];
+      if (!value) throw new Error('Missing value after --tx.');
+      hashes.push(value);
+    } else if (arg.startsWith('--tx=')) {
+      hashes.push(arg.slice(5));
+    } else {
+      throw new Error('Use --tx=<transaction hash> for each transaction to inspect.');
+    }
+  }
+  if (hashes.length === 0) throw new Error('Provide at least one --tx=<transaction hash>.');
+  for (const hash of hashes) {
+    if (!/^0x[0-9a-f]{64}$/i.test(hash)) throw new Error('Invalid transaction hash format.');
+  }
+  return [...new Set(hashes.map((hash) => hash.toLowerCase()))];
+}
+
+const hashes = transactionHashes(process.argv.slice(2));
 loadDotEnv();
 const config = loadConfig();
 const { readProvider, rawProviders } = createProviders(config);
 await verifyProviders(rawProviders, config.chainId);
-
-const hashes = [
-'0x1af2774f8c98a1700fa8ac52c45b336ed49baac4b3dbbee91230713a4387702b',
-'0xc668f2cbb41a0e6d459795114153d5405f131529d4c9983bc7288a1f0f8c1a79',
-'0xe0b934f700752336414bd3176153ff1aabddb2000a368de8b0b14383315ddc6d',
-'0x5a0590acaabccc444303df844d8826b9ed467ac398f63cb5ab6153fa3fcc0038',
-'0x096e99a317389cb485bd3a646a7a3b7bd546895a7da0395b571123865a91cd4c',
-'0x7ce57b92a8c73547a5e2e7eea82ea01ec67bc269899faaf5eee7f0f51ca50c48',
-'0x2ba6dc189c53c81029d34b2b958858149fa8fd21ac2a097837a174736806c88f',
-'0xc5a7d54ee1bd0d22715646c12a89bc8fea61a699320ec2d69dbdfe18cad134d2',
-'0x9fb1319a6f82c003a4f4d796b752ff980482b9ee43ab39d6acc4902ee0071299',
-'0xa03ead3a217c8eeed74a69a0d845dae6816c21afad7a1b3d6cc05bdbd0597189',
-'0xea2682a0603435e58a2d65425ad946ec91cc43572bcf49234696543275d641f9',
-'0x398098be5f836a18b72b856294b95c69c3e355ae0cf80260c2edcf54b894cb6c',
-'0x357f7f0bfce8dc7aaf8a9f9e01b1ffcf112789c25a18e0b0aa97b6313e94df0f',
-'0x3fbe5115ee85fb26c4f550de43717e7c73b7ed1ebe1d190df41ca232b8d9c066',
-'0x8218f7225fef34a711db21d75f8d1ace9066207ab36dac2afd5eff0540580d51',
-'0x23003b7955296ed45de85931f1c85bfcca0315c986938ef26c623779dc6b49cc',
-'0x3a91a366564e6bf45cfa9ee58dc2617afb7523d866f05c794a056987c529aa71',
-'0xe23c9eae086f824de4975002d200b8ecb970ec431e9c2e4702f65c29f0a06e77'
-];
 
 const withdrawnTopic=id(WITHDRAWN_EVENT).toLowerCase();
 const iface=new Interface(HOOK_ABI);
@@ -57,9 +58,9 @@ for (const hash of hashes) {
     readProvider.getTransaction(hash),
     readProvider.getTransactionReceipt(hash)
   ]);
-  if(!tx||!receipt) throw new Error('missing tx '+hash);
+  if(!tx||!receipt) throw new Error('transaction or receipt was not found.');
   const log=receipt.logs.find(x=>String(x.topics?.[0]||'').toLowerCase()===withdrawnTopic);
-  if(!log) throw new Error('withdraw event missing '+hash);
+  if(!log) throw new Error('withdraw event was not found.');
   const rangeId=String(log.topics[2]).toLowerCase();
   const liquidity=BigInt(log.data);
   const hook=new Contract(tx.to,HOOK_ABI,readProvider);

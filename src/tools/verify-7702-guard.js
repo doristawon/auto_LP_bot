@@ -6,6 +6,7 @@ import { loadConfig } from '../config.js';
 import { createProviders, verifyProviders } from '../rpc/providers.js';
 import { FablesAdapter } from '../adapters/fables.js';
 import { EIP7702_GUARD_ABI, HOOK_ABI } from '../abi.js';
+import { selectToolWallet } from '../wallet-tool-config.js';
 
 // This canary only reads an existing snapshot and makes RPC calls. It must not
 // instantiate AutoLpBot or update the live state/ledger during another cycle.
@@ -13,7 +14,7 @@ loadDotEnv();
 process.env.DRY_RUN = 'true';
 process.env.ENABLE_LIVE_WRITES = 'false';
 process.env.ENABLE_AUTO_REDEPLOY = 'false';
-const config = loadConfig();
+const config = selectToolWallet(loadConfig());
 if (!config.eip7702GuardAddress) throw new Error('EIP7702_GUARD_ADDRESS is required');
 
 const providers = createProviders(config);

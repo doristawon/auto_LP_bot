@@ -6,34 +6,34 @@ import { fetchEthUsdCloseAt, fetchNativeBalanceAt, fetchWalletCashflowCandidates
 import { dashboardPage } from '../src/dashboard/page.js';
 
 const USDG = '0x5fc5360d0400a0fd4f2af552add042d716f1d168';
-const WALLET = '0x2ea3d6f7b1841687324819c239e6f657435fde6e';
+const WALLET = '0x0000000000000000000000000000000000000006';
 
 test('external USDG deposit changes invested capital, while reward remains income', () => {
   const baseline = {
-    createdAt: 1, inventory: { [USDG]: 300, [ZERO_ADDRESS]: 0.001 },
-    initialValueUsd: 302.6765
+    createdAt: 1, inventory: { [USDG]: 100, [ZERO_ADDRESS]: 0.001 },
+    initialValueUsd: 100
   };
   const events = [
-    { type: 'cashflow.external_transfer', token: USDG, amount: 852.384671, usd: 852.384671 },
-    { type: 'reward.claimed', token: USDG, amount: 0.563616, usd: 0.563616 }
+    { type: 'cashflow.external_transfer', token: USDG, amount: 250, usd: 250 },
+    { type: 'reward.claimed', token: USDG, amount: 1.25, usd: 1.25 }
   ];
   const state = { getSetting(key) { return key === 'cashflowCoverage' ? { complete: true } : null; } };
   const ledger = {
     readBaseline: () => baseline,
     all: () => events,
-    sum: (field, type) => type === 'fee.accrual' ? 2.545415 : 0
+    sum: (field, type) => type === 'fee.accrual' ? 2.5 : 0
   };
   const analytics = new PortfolioAnalytics({ usdgAddress: USDG }, ledger, state);
   const result = analytics.build({
     targetPools: [],
     trackedTokens: [{ address: USDG, symbol: 'USDG' }, { address: ZERO_ADDRESS, symbol: 'ETH' }],
-    walletBalances: { [USDG]: { amount: 1011.61 }, [ZERO_ADDRESS]: { amount: 0.002 } },
+    walletBalances: { [USDG]: { amount: 360 }, [ZERO_ADDRESS]: { amount: 0.002 } },
     prices: new Map([[USDG, 1], [ZERO_ADDRESS, 2645]])
   });
-  const expected = 1011.61 + 0.002 * 2645 - 302.6765 - 852.384671;
+  const expected = 360 + 0.002 * 2645 - 100 - 250;
   assert.ok(Math.abs(result.netPnlUsd - expected) < 1e-9);
-  assert.equal(result.netInvestedUsd, 302.6765 + 852.384671);
-  assert.equal(result.rewardUsd, 0.563616);
+  assert.equal(result.netInvestedUsd, 100 + 250);
+  assert.equal(result.rewardUsd, 1.25);
   assert.equal(result.accountingComplete, true);
   assert.ok(Math.abs(result.netPnlUsd - (
     result.holdPnlUsd + result.trackedFeeUsd + result.rewardUsd + result.lpAndTradingPnlUsd

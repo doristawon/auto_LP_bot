@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { loadConfig } from '../src/config.js';
 
 const BASE = {
-  WALLET_ADDRESS: '0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF',
+  WALLET_ADDRESS: '0x0000000000000000000000000000000000000004',
   DRY_RUN: 'true',
   ENABLE_LIVE_WRITES: 'false',
   ENABLE_AUTO_REDEPLOY: 'false'

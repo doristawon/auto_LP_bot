@@ -1,23 +1,36 @@
 # Auto LP Bot — Fables.fi / Robinhood Chain
 
-> 目前工作目錄包含 Fables 池級 APR 與 RPC 控制，也支援 OOR 後投入最高有效 APR 池或指定池；本機預設每 5 分鐘評估區間，淺度 OOR 最長等待 30 分鐘。
+> 支援多錢包各自監控與實盤自動再平衡、獨立指定池，以及共用 RPC 管理。本機預設每 5 分鐘掃描；首次觀測 OOR 後滿 15 分鐘再確認，仍出區間才再平衡。
 
-錢包助記詞／私鑰僅傳送至本機回環中控台；助記詞不會保存。設定 `PERSIST_RUNTIME_CREDENTIALS=true` 後，通過驗證的目前錢包私鑰／地址及 Robinhood RPC 會原子更新到 Git 忽略的本機 `.env`，並限制檔案 ACL；API 與日誌不回傳憑證。匯入或切換錢包會強制 `DRY_RUN=true`、關閉鏈上寫入與自動重新部署，並暫停執行；每次程序啟動仍保持暫停，需在條件通過後按下啟動。自訂 RPC 套用前會實際查詢 `eth_chainId`，並保留官方 RPC 作為讀取備援。
+錢包助記詞／私鑰僅傳送至本機回環中控台；助記詞不會保存。設定 `PERSIST_RUNTIME_CREDENTIALS=true` 後，共用 RPC 與原始錢包保存在 `.env`，額外錢包金鑰與實盤設定保存在 `.env.wallets.json`；兩者皆由 Git 忽略，並限制檔案 ACL。API 與日誌不回傳憑證。新增錢包預設暫停與預演，完成該地址的 EIP-7702 授權驗證後，可在前端切換實盤並啟動。每個錢包有獨立簽署器、執行迴圈、目標池、帳務及交易復原紀錄；切換查看不會停止其他錢包。重啟後先完成健康掃描，再恢復先前啟動的錢包。
+
+RPC 分頁可新增、移除與逐筆／整批測速；檢查 `eth_chainId` 與 `eth_blockNumber`，列出延遲、檢查時間、啟用狀態、鏈 ID 錯誤、限流、額度耗盡與連線失敗。清單只顯示遮罩標籤；輪詢頁面不會自動反覆測速。RPC 變更會確認所有錢包閒置，且移除後至少還有一個健康的 Robinhood Chain 端點。官方端點也可移除，重啟不會偷偷加回。
 
 池級 APR 取自 Fables 公開市場統計，沿用頁面公式「24 小時手續費 × 365 ÷ 目前 TVL」；這是近期年化估算，不代表個人實際收益或收益保證。APR、TVL 與成交量／手續費統計使用 Fables 公開來源；資料暫時無法取得時 APR 會留白，依 APR 跨池選擇再投入目標會停止。鏈上池子、range、餘額與交易狀態則由 Robinhood Chain RPC 讀取。
 
-OOR 再投入可設定為最高有效 APR 或指定池。最高 APR 候選需有新鮮統計、未暫停，且 TVL 達 `APR_POOL_MIN_TVL_USD`。ERC20 跨池候選必須在提領前完成「guarded 撤池→路由換幣→比例換幣→Tight 存入」連續 RPC 模擬，並通過整次換幣成本、Gas、餘額與授權檢查；未通過時保留原池重建。原生 ETH 池目前不具備可驗證的存入與路由交易流程，自動跨池會跳過，池清單會標示此限制。手動按「更新池子換幣報價」後，清單顯示每池約 10 美元試算的方向、時間與成本；「約 3%」標記僅代表該筆樣本落在 2.5% 至 3.5%，不代表實際換倉成本固定。預演資金範圍只涵蓋來源與目的池交易對的錢包餘額及來源提領預估，不掃入無關代幣。現有 LP 在區間內時，可將同交易對的閒置餘額加倉。預設只使用現有代幣比例；若明確設定 `AUTO_TOPUP_SWAP_ENABLED=true`、單一 `AUTO_TOPUP_SWAP_POOL_ID` 與獨立的 `AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS`，才會在「授權→兌幣→存入」整串 RPC 模擬成功後兌幣加倉。兌幣前會再次確認價格衝擊、錢包餘額、原區間及完整模擬，並保留設定的零頭與 Gas。指定池可用關鍵字篩選 APR 排序下拉選單。預設區間檢查週期為 5 分鐘，深度 OOR 仍需連續 2 次確認；淺度 OOR 最長等待 30 分鐘。
+OOR 再投入可設定為最高有效 APR 或指定池。最高 APR 候選需有新鮮統計、未暫停，且 TVL 達 `APR_POOL_MIN_TVL_USD`。ERC20 跨池候選必須在提領前完成「guarded 撤池→路由換幣→比例換幣→Tight 存入」連續 RPC 模擬，並通過整次換幣成本、Gas、餘額與授權檢查；未通過時保留原池重建。原生 ETH 池目前不具備可驗證的存入與路由交易流程，自動跨池會跳過，池清單會標示此限制。手動按「更新池子換幣報價」後，清單顯示每池約 10 美元試算的方向、時間與成本；「約 3%」標記僅代表該筆樣本落在 2.5% 至 3.5%，不代表實際換倉成本固定。預演資金範圍只涵蓋來源與目的池交易對的錢包餘額及來源提領預估，不掃入無關代幣。現有 LP 在區間內時，可將同交易對的閒置餘額加倉。預設只使用現有代幣比例；若明確設定 `AUTO_TOPUP_SWAP_ENABLED=true`、單一 `AUTO_TOPUP_SWAP_POOL_ID` 與獨立的 `AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS`，才會在「授權→兌幣→存入」整串 RPC 模擬成功後兌幣加倉。兌幣前會再次確認價格衝擊、錢包餘額、原區間及完整模擬，並保留設定的零頭與 Gas。指定池可用關鍵字篩選 APR 排序下拉選單。預設區間檢查週期為 5 分鐘；首次 OOR 後滿 15 分鐘再次確認，仍出區間才再平衡。
 
 池子頁選擇「指定池」與目的池後，按「立刻換倉到所選池」就會啟動，無須先儲存目標或取得預演權杖。有來源 LP 時先完整模擬，再撤出所選 LP、換幣並投入目的池 Tight 區間；沒有 LP 時，使用錢包的來源與目的池代幣直接換幣建倉。閒置錢包只會自動辨識一種已定價、價值至少 1 美元的非目的池代幣；若有多種，會停止以免換掉無關資產。此筆換幣成本上限預設 5%，可在按鈕旁調低，不更動自動策略的上限。人工操作不受自動再平衡冷卻與每小時次數限制，但仍遵守完整鏈上模擬、成本、Gas 與交易復原檢查。池子目標在換倉成功後保存；若重啟時因沒有 LP 而暫停自動監控，完成錢包餘額建倉後會恢復監控。此流程可能送出多筆交易；若資產移動後的後續交易失敗，會暫停自動執行並要求人工復原。自動 OOR 再平衡仍使用原有 EIP-7702 鏈上區間防護。
 
 同池 OOR 實盤現在也要求撤池前完成「guarded 撤池→必要換幣→tight 入池」連續 RPC 模擬及 Gas 預算檢查；任一步失敗就保留舊 LP。`npm run preflight:oor` 可唯讀檢查目前部位，參數 `-- --diagnostic-max-bps=350` 僅供診斷，不修改實盤上限。單一池的實盤上限可用 `OOR_REBALANCE_SWAP_POOL_ID` 與 `OOR_REBALANCE_MAX_SWAP_PRICE_IMPACT_BPS` 明確設定，其餘池沿用一般上限。Solady 固定無限額 Permit2 授權的代幣，僅在合約回傳特定固定授權錯誤時略過無法執行的 ERC20 重設，Router 仍使用定額、限時的 Permit2 授權。
 
+## 本機多錢包操作
+
+1. 在「錢包與 RPC」匯入每個地址的私鑰、助記詞或唯讀地址。
+2. 按該錢包的「查看」，在池子分頁儲存它的指定池；同一頁面的啟動、暫停、換倉和帳務操作都只作用於目前查看的錢包。
+3. 確認該錢包已有安全合約授權、Gas 與 LP，切換為實盤，再按啟動。各錢包可同時啟動，也可各自暫停。
+4. 只有地址、沒有簽署金鑰的錢包可監控但不能送出交易。額外錢包缺少授權時，須對該地址執行下方 guard 設定流程；不得沿用另一個地址的驗證旗標。
+
+HTTP API 以 `X-Wallet-Address` 選擇操作錢包；未指定時使用原始 `.env` 錢包。`GET /api/wallets` 提供不含私鑰的全錢包狀態。RPC 設定為共用。新增錢包會增加該錢包的鏈上掃描量，預設週期仍為 5 分鐘。
+
+額外錢包的 guard 工具可用 `npm run setup:guard -- --wallet=0x錢包地址` 與 `npm run verify:guard -- --wallet=0x錢包地址` 明確選擇 `.env.wallets.json` 中的簽署器；不會覆寫主要 `.env`。`setup:guard` 會送出真實鏈上授權交易，`verify:guard` 僅做 RPC 驗證。
+
 ## v0.6.0 — 本機錢包、池級 APR 與 RPC 控制
 
 - Fables 官方活躍池清單會顯示目前 Tick、TVL、24 小時成交量與手續費，以及池級 APR。
 - 可在中控台將活躍池加入或移出本機監控清單；清單依錢包分開保存。
-- 可在程序記憶體掛載多個錢包並切換目前監控錢包；每個地址使用獨立狀態與帳務紀錄。目前選取的簽署錢包可保存到受保護的本機 `.env`。
-- 可輸入自訂 Robinhood RPC；系統會先驗證鏈 ID 為 4663，並保留官方端點作為讀取備援。啟用持久化後，驗證通過的 RPC 會保存到本機 `.env`，不會由 API 回傳。
+- 可掛載多個錢包同時監控與自動執行；每個地址使用獨立狀態與帳務紀錄，前端可切換查看。
+- 可新增、檢測或移除 Robinhood RPC；系統會先驗證鏈 ID 為 4663 與有效區塊高度。啟用持久化後，RPC 清單會保存到本機 `.env`，不會由 API 回傳完整網址。
 - 錢包秘密資料只供目前程序的簽署器使用，不會寫入帳務、狀態、API 回應或紀錄檔。
 
 > Review correction: **dry-run 不得改變策略 state**。v0.3.4 起，`rebalance.dry_run` 只寫 ledger，不再重設 OOR timer、cooldown 或 rebalanceHistory；只有 executor 回報完整 `completed` 才能 commit strategy state。另將 pre-withdraw inventory / deposit plan 明確標為 provisional，live 執行前必須在 withdraw/swap receipt 後重算。
@@ -396,6 +409,8 @@ Snapshot 主要欄位：
 
 中控台也會讀取 Fables 官方 Points API 的錢包結算分數，並比對 Fables 索引器的 LP 存提／領費紀錄與鏈上可領費用。官方分數作為基準；Points V2 優先用完整的鏈上個人 fee 與全市場 swap fee 計算待結算估值。若全市場分母不完整但本錢包費用覆蓋完整，改用最近兩次官方結算的分數差／費用差，按當日點數預算調整後顯示「官方費用校正暫估」；個人費用有未解決缺口時僅顯示官方已結算分數，不顯示即時增量。EIP‑7702 guarded 撤池的費用可從錢包 receipt 對帳；歷史缺口只在找到匹配的應收費用下降紀錄，或同一部位、撤池前五分鐘內且仍持有份額的應收費用快照時補記。官方累計費用若高於錢包費用彙總，中控台會標示兩種來源不能直接相減推算待結算費用。
 
+對帳流程、資料缺口與報告原則見[Points 對帳方法](docs/POINTS_RECONCILIATION_2026-09-27.md)。
+
 ## 快速開始
 
 Node.js 20+：
@@ -534,3 +549,10 @@ npm test
 - Dashboard 預設只開 loopback。
 - live executor 只允許已驗證 contract / calldata 路徑。
 - 所有 unknown selector 都 fail closed。
+
+
+## 兩池資金配置
+
+中控台可為各錢包設定最多兩個支援的 USDG Fables ERC20 池，權重以整數 basis points 表示且合計 10,000。儲存只更新策略設定，不會立即送出交易；若自動平衡已啟動，新配置會在後續符合條件的週期生效。資金估值沿用既有掃描週期更新，下一輪估值前會維持待更新狀態。啟用配置時，各池依自己的 OOR 政策處理；不會只因權重漂移就撤出健康 LP。單池 APR 及立即換倉控制會停用。
+
+The dashboard can store a per-wallet allocation across up to two supported USDG-denominated Fables ERC20 pools. Weights are integer basis points totaling 10,000. Saving a configuration changes strategy settings only; it does not submit a transaction. Fresh capital estimates come from the existing scan cycle and may remain pending until the next valuation refresh. Allocation mode handles OOR reconstruction within each pool and does not withdraw healthy LP solely to restore target weights. The single-pool APR and immediate-rotation controls are disabled while allocation mode is active.

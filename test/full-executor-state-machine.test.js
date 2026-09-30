@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { id, zeroPadValue } from 'ethers';
 import { RebalanceExecutor } from '../src/adapters/executor.js';
+import { V4QuoterAdapter } from '../src/adapters/quoter.js';
 import { DEPOSITED_EVENT } from '../src/abi.js';
 import { buildExactDepositPlan, getSqrtPriceAtTick } from '../src/math/v4-fixed.js';
 
-const wallet = '0x6F196aF3B69c521eEd9436Abc9130699dF1c50bF';
+const wallet = '0x0000000000000000000000000000000000000001';
 const hook = '0x08E52564Bad99E05a694b4809F397edcA417A080';
 const pool = {
   id: '0x' + 'ab'.repeat(32),
@@ -106,7 +107,7 @@ function createHarness({ failSwap = false, failPreflight = false } = {}) {
     if (failPreflight) throw new Error('mock full-sequence preflight failure');
     return { status: 'full-sequence-simulated', callCount: 4, simulatedGasUsed: '1000000' };
   };
-  executor.quoter = {
+  executor.quoter = Object.assign(new V4QuoterAdapter(null), {
     async quoteExactInputSingleRaw(_pool, tokenIn, rawAmountIn, slippageBps) {
       rawAmountIn = BigInt(rawAmountIn);
       const sqrt = getSqrtPriceAtTick(1100);
@@ -123,7 +124,7 @@ function createHarness({ failSwap = false, failPreflight = false } = {}) {
         zeroForOne: tokenIn === 0
       };
     }
-  };
+  });
   executor.router = {
     buildV4ExactInputSingle({ quote, deadline }) {
       lastSwapQuote = quote;
