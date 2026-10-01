@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { Interface, id, keccak256, toBeHex, zeroPadValue } from 'ethers';
 import { DEPOSITED_EVENT, EIP7702_GUARD_ABI } from '../src/abi.js';
 import { UNISWAP_UNIVERSAL_ROUTER_212 } from '../src/constants.js';
@@ -157,9 +158,13 @@ test('one send produces one hash/receipt for swap plus deposit and preserves all
   const allocationScope = { allocationUpdatedAt: 1, poolId: POOL_ID,
     tokenCaps: { [TOKEN0]: '100', [TOKEN1]: '80' } };
   const h = makeHarness({ before, funding, allocationScope });
+  const eventMetadata = { manualIdle: false, sourcePoolId: `0x${'44'.repeat(32)}`,
+    destinationPoolId: POOL_ID, sourcePair: 'SRC/USDG', destinationPair: 'T0/T1',
+    oldPositionId: posTopic(RANGE_ID).toLowerCase(),
+    routeSwapPoolIds: [[`0x${'55'.repeat(32)}`]], aprPct: 12.5 };
   const result = await executeAtomicDeposit.call(h.executor, {
     pool: h.pool, target: TARGET, funding, balances: before, journal: h.txJournal,
-    allocationScope, onJournal: () => {}
+    allocationScope, eventMetadata, onJournal: () => {}
   });
   assert.equal(result.status, 'completed');
   assert.equal(result.atomic, true);
@@ -174,7 +179,32 @@ test('one send produces one hash/receipt for swap plus deposit and preserves all
   assert.deepEqual(result.balancesAfterRaw, { raw0: '903', raw1: '722' });
   assert.equal(result.swapHash, result.depositHash);
   assert.equal(result.atomicSwapDepositHash, result.depositHash);
-  assert.equal(h.ledgerEvents.filter(event => event.type === 'rebalance.completed').length, 1);
+  const completed = h.ledgerEvents.filter(event => event.type === 'rebalance.completed');
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0].data.pair, 'T0/T1');
+  assert.equal(completed[0].data.destinationPoolId, POOL_ID);
+  assert.deepEqual(completed[0].data.routeSwapPoolIds, eventMetadata.routeSwapPoolIds);
+  assert.equal(completed[0].data.balanceSwapHash, completed[0].data.depositHash);
+  assert.equal(completed[0].data.balanceSwapPoolId, POOL_ID);
+  assert.equal(completed[0].data.oldPositionId, eventMetadata.oldPositionId);
+  assert.deepEqual(completed[0].data.allocationFundingScope, null);
+});
+
+test('cross-pool atomic branch follows withdrawal and route swaps, before legacy balance swap', () => {
+  const source = readFileSync(new URL('../src/adapters/executor.js', import.meta.url), 'utf8');
+  const methodStart = source.indexOf('  async executeCrossPoolUnlocked(');
+  const methodEnd = source.indexOf('\n  async reconcileConfirmedNoOp(', methodStart);
+  assert.ok(methodStart >= 0 && methodEnd > methodStart);
+  const method = source.slice(methodStart, methodEnd);
+  const withdrawal = method.indexOf("label: plan.manualImmediate === true ? 'manualImmediateWithdrawAndClaim'");
+  const routeLoop = method.indexOf('for (const swap of preflight.routeSwaps) {', withdrawal);
+  const atomicCall = method.indexOf('executeAtomicDeposit.call(this, { pool: destinationPool', routeLoop);
+  const legacyBalanceSwap = method.indexOf('if (preflight.balanceSwap) {', atomicCall);
+  assert.ok(withdrawal >= 0 && routeLoop > withdrawal);
+  assert.ok(atomicCall > routeLoop);
+  assert.ok(legacyBalanceSwap > atomicCall);
+  assert.match(source, /pendingApprovalCount:\s*routeApprovals\.length/);
+  assert.match(method, /eventMetadata:\s*\{[\s\S]*routeSwapPoolIds:\s*executedRouteIds/);
 });
 
 test('allocation funding excludes reserves beyond the pool-specific caps', async () => {

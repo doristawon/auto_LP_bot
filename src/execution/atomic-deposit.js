@@ -46,7 +46,7 @@ export function findAtomicDepositEvent(receipt, walletAddress, poolId) {
 // followed by a deposit. Every retry is a new plan after a proven no-op.
 export async function executeAtomicDeposit({ pool, target, funding, balances, journal,
   position = null, oldPosition = null, allocationScope = null, maxPriceImpactBps,
-  retarget = false, eventType = 'rebalance.completed', onJournal = () => {} }) {
+  retarget = false, eventType = 'rebalance.completed', eventMetadata = {}, onJournal = () => {} }) {
   let capitalHash = null;
   let confirmed = false;
   const update = patch => { journal = this.patchJournal(journal, patch); onJournal(journal); };
@@ -175,13 +175,20 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
         newPosition: { rangeId: deposit.rangeId, shares: String(shares), liquidity: String(deposit.liquidity),
           tickLower: target.tickLower, tickUpper: target.tickUpper } });
       this.clearJournal();
-      const result = { status: 'completed', atomic: true, poolId: pool.id,
-        oldPositionId: oldPosition?.id || null, newPositionId: deposit.rangeId, positionId: deposit.rangeId,
+      const result = { ...eventMetadata, status: 'completed', atomic: true, poolId: pool.id,
+        pair: `${pool.token0.symbol}/${pool.token1.symbol}`,
+        oldPositionId: oldPosition?.id || position?.id || eventMetadata.oldPositionId || null,
+        newPositionId: deposit.rangeId, positionId: deposit.rangeId,
         withdrawHash: journal.tx.withdraw || null, routeSwapHashes: journal.tx.routeSwaps || [],
+        balanceSwapHash: executable.direction === 'none' ? null : receipt.hash,
+        balanceSwapPoolId: executable.direction === 'none' ? null : (executable.swapPool || pool).id,
         swapHash: executable.direction === 'none' ? null : receipt.hash, depositHash: receipt.hash,
         atomicSwapDepositHash: receipt.hash, sharesBefore: String(sharesBefore), sharesAfter: String(shares),
         liquidityAdded: String(deposit.liquidity), balancesAfterRaw: rawStrings(after),
         dustRetainedRaw: rawStrings({ raw0: balances.raw0 - funding.raw0, raw1: balances.raw1 - funding.raw1 }),
+        allocationJobId: journal.allocationJobId || null,
+        allocationFundingScope: journal.allocationFundingScope || null,
+        allocationPhysicalBaselineRaw: journal.allocationPhysicalBaselineRaw || null,
         allocationRemainingRaw: remaining, target, atomicResidualBps: RESIDUAL_BPS };
       this.ledger.append(eventType, result);
       return result;
