@@ -20,7 +20,8 @@ export async function buildRangeBalancedSwapPlan({
   maxPriceImpactBps = 200,
   preferRemainderTokenIndex = null,
   preferredRemainderBps = 0,
-  maxRefinements = MAX_REFINEMENTS
+  maxRefinements = MAX_REFINEMENTS,
+  expectedOutput = false
 } = {}) {
   rawAmount0 = BigInt(rawAmount0);
   rawAmount1 = BigInt(rawAmount1);
@@ -32,8 +33,9 @@ export async function buildRangeBalancedSwapPlan({
     throw new TypeError('chooseTarget must be null or a function');
   }
   if (typeof previewSwap !== 'function') throw new TypeError('previewSwap must be a function');
-  if (!Number.isInteger(maxRefinements) || maxRefinements < 0 || maxRefinements > MAX_REFINEMENTS) {
-    throw new RangeError(`maxRefinements must be an integer from 0 through ${MAX_REFINEMENTS}`);
+  const refinementLimit = expectedOutput ? 4 : MAX_REFINEMENTS;
+  if (!Number.isInteger(maxRefinements) || maxRefinements < 0 || maxRefinements > refinementLimit) {
+    throw new RangeError(`maxRefinements must be an integer from 0 through ${refinementLimit}`);
   }
 
   const spotSqrtPriceX96 = BigInt(state.sqrtPriceX96);
@@ -50,7 +52,8 @@ export async function buildRangeBalancedSwapPlan({
     slippageBps,
     maxPriceImpactBps,
     preferRemainderTokenIndex,
-    preferredRemainderBps
+    preferredRemainderBps,
+    atomicRoutesOnly: expectedOutput
   });
 
   let initialPlan = await makePlan(spotSqrtPriceX96);
@@ -72,7 +75,7 @@ export async function buildRangeBalancedSwapPlan({
     validateTarget(pinnedTarget, postState);
   }
 
-  let best = evaluate(initialPlan, pinnedTarget, postState, rawAmount0, rawAmount1);
+  let best = evaluate(initialPlan, pinnedTarget, postState, rawAmount0, rawAmount1, expectedOutput);
   let balancePrice = postState.sqrtPriceX96;
   let refinements = 0;
 
@@ -84,14 +87,15 @@ export async function buildRangeBalancedSwapPlan({
       const unchangedState = { ...state, tick: Number(state.tick), sqrtPriceX96: spotSqrtPriceX96 };
       try {
         validateTarget(pinnedTarget, unchangedState);
-        const candidate = evaluate(refined, pinnedTarget, unchangedState, rawAmount0, rawAmount1);
+        const candidate = evaluate(refined, pinnedTarget, unchangedState, rawAmount0, rawAmount1, expectedOutput);
         if (candidate.capacityMismatchBps < best.capacityMismatchBps) best = candidate;
       } catch {}
       break;
     }
     const refinedState = validatePreview(await previewSwap(refined), state, pinnedTarget);
-    const candidate = evaluate(refined, pinnedTarget, refinedState, rawAmount0, rawAmount1);
+    const candidate = evaluate(refined, pinnedTarget, refinedState, rawAmount0, rawAmount1, expectedOutput);
     if (candidate.capacityMismatchBps < best.capacityMismatchBps) best = candidate;
+    if (expectedOutput && best.capacityMismatchBps <= 10) break;
     balancePrice = refinedState.sqrtPriceX96;
   }
 
@@ -133,8 +137,8 @@ function validatePreview(preview, previousState, pinnedTarget) {
   return result;
 }
 
-function evaluate(swapPlan, target, postState, rawAmount0, rawAmount1) {
-  const inventory = projectedInventory(swapPlan, rawAmount0, rawAmount1);
+function evaluate(swapPlan, target, postState, rawAmount0, rawAmount1, expectedOutput) {
+  const inventory = projectedInventory(swapPlan, rawAmount0, rawAmount1, expectedOutput);
   return {
     swapPlan,
     target,
@@ -145,10 +149,10 @@ function evaluate(swapPlan, target, postState, rawAmount0, rawAmount1) {
   };
 }
 
-function projectedInventory(plan, rawAmount0, rawAmount1) {
+function projectedInventory(plan, rawAmount0, rawAmount1, expectedOutput) {
   if (!plan || plan.direction === 'none') return { raw0: rawAmount0, raw1: rawAmount1 };
   const amountIn = BigInt(plan.rawAmountIn);
-  const amountOut = BigInt(plan.quote?.minRawAmountOut ?? 0);
+  const amountOut = BigInt((expectedOutput ? plan.quote?.rawAmountOut : plan.quote?.minRawAmountOut) ?? 0);
   if (amountIn <= 0n || amountOut <= 0n) throw new Error('Swap plan is missing conservative input/output amounts');
   if (plan.tokenIn === 0) {
     if (amountIn > rawAmount0) throw new Error('Swap input exceeds available token0 inventory');

@@ -53,6 +53,11 @@ export function loadConfig() {
   const depositSlippageBps = envInt('DEPOSIT_SLIPPAGE_BPS', 50);
   const withdrawSlippageBps = envInt('WITHDRAW_SLIPPAGE_BPS', 50);
   const eip7702GuardAddress = optionalAddress('EIP7702_GUARD_ADDRESS');
+  const atomicDepositFeatureEnabled = envBool('ATOMIC_DEPOSIT_ENABLED', false);
+  const atomicDepositWallets = envList('ATOMIC_DEPOSIT_WALLETS', [walletAddress]).map(getAddress);
+  const legacyEip7702GuardAddress = optionalAddress('LEGACY_EIP7702_GUARD_ADDRESS');
+  const atomicDepositEnabled = atomicDepositFeatureEnabled
+    && atomicDepositWallets.some(address => address.toLowerCase() === walletAddress.toLowerCase());
   const eip7702GuardVerifiedFor = optionalAddress('EIP7702_GUARD_VERIFIED_FOR');
   const eip7702GuardVerificationEnabled = envBool('EIP7702_GUARD_VERIFIED', false);
   const eip7702GuardVerified = eip7702GuardVerificationEnabled
@@ -191,7 +196,13 @@ export function loadConfig() {
     depositTickTolerance,
     fablesWalk: envInt('FABLES_WALK', 1000),
     permit2ExpirationSec: envInt('PERMIT2_EXPIRATION_SEC', 30 * 24 * 60 * 60),
-    eip7702GuardAddress,
+    eip7702GuardAddress: atomicDepositFeatureEnabled && !atomicDepositEnabled && legacyEip7702GuardAddress
+      ? legacyEip7702GuardAddress : eip7702GuardAddress,
+    atomicEip7702GuardAddress: eip7702GuardAddress,
+    atomicDepositEnabled,
+    atomicDepositFeatureEnabled,
+    atomicDepositWallets,
+    legacyEip7702GuardAddress,
     eip7702GuardVerified,
     eip7702GuardVerificationEnabled,
     eip7702GuardVerifiedFor,

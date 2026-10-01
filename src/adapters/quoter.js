@@ -34,7 +34,10 @@ export class V4QuoterAdapter {
   }
 
   async selectSamePairSwapPool(pool, tokenInIndex, rawAmountIn, slippageBps = 50, options = {}) {
-    const candidates = this.externalRoutesEnabled ? candidateSwapPools(pool) : [pool];
+    const candidates = (this.externalRoutesEnabled ? candidateSwapPools(pool) : [pool])
+      .filter(candidate => !options.atomicRoutesOnly || candidate.protocol === 'v3'
+        || String(candidate.key?.hooks).toLowerCase() === ZERO_ADDRESS
+        || String(candidate.key?.hooks).toLowerCase() === String(pool.key?.hooks).toLowerCase());
     const results = await Promise.allSettled(candidates.map((candidate) =>
       this.quoteExactInputSingleRaw(candidate, tokenInIndex, rawAmountIn, slippageBps)));
     const viable = [];

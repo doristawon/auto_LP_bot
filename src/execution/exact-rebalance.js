@@ -19,7 +19,8 @@ export async function buildExactBalancedSwapPlan({
   iterations = 22,
   maxPriceImpactBps = 200,
   preferRemainderTokenIndex = null,
-  preferredRemainderBps = 0
+  preferredRemainderBps = 0,
+  atomicRoutesOnly = false
 }) {
   rawAmount0 = BigInt(rawAmount0);
   rawAmount1 = BigInt(rawAmount1);
@@ -62,7 +63,7 @@ export async function buildExactBalancedSwapPlan({
   const probeAmount = available / 2n > MAX_UINT128 ? MAX_UINT128 : available / 2n;
   const selected = quoter.selectSamePairSwapPool
     ? await quoter.selectSamePairSwapPool(pool, tokenIn, probeAmount, slippageBps,
-      { spotSqrtPriceX96: sqrtX, maxPriceImpactBps })
+      { spotSqrtPriceX96: sqrtX, maxPriceImpactBps, atomicRoutesOnly })
     : { pool };
   const swapPool = selected.pool;
 

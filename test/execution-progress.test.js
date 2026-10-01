@@ -83,6 +83,49 @@ test('a reconciled failed receipt is marked reverted; route swaps retain their o
   assert.deepEqual(routes.transactions.map(tx => tx.status), ['confirmed', 'confirmed', 'pending']);
 });
 
+test('atomic swap and deposit phases expose one combined transaction and never a second pending hash', () => {
+  const atomicHash = hash('4');
+  const preflight = describeExecutionProgress({ ...journal('atomic_preflighted'),
+    atomicSwapRequired: true, tx: { withdraw: hash('1') } });
+  assert.equal(preflight.currentStepLabel, '換幣');
+  assert.equal(preflight.steps[2].status, 'active');
+  assert.equal(preflight.steps[3].status, 'pending');
+  assert.equal(preflight.steps[2].status === 'skipped', false);
+
+  const sent = describeExecutionProgress({ ...journal('atomic_sent'), atomicSwapRequired: true,
+    tx: { withdraw: hash('1'), atomicSwapDeposit: atomicHash } });
+  const atomicTransactions = sent.transactions.filter(item => item.hash === atomicHash);
+  assert.equal(atomicTransactions.length, 1);
+  assert.equal(atomicTransactions[0].label, '換幣＋一次存入 LP');
+  assert.equal(atomicTransactions[0].status, 'pending');
+  assert.equal(sent.transactions.some(item => item.hash === hash('3')), false);
+
+  const confirmed = describeExecutionProgress({ ...journal('atomic_confirmed'), atomicSwapRequired: true,
+    tx: { atomicSwapDeposit: atomicHash } });
+  assert.equal(confirmed.currentStepLabel, '核對');
+  assert.equal(confirmed.transactions[0].status, 'confirmed');
+});
+
+test('atomic retry lists confirmed reverts and keeps swap visible when swapping is required', () => {
+  const revertedHash = hash('5');
+  const progress = describeExecutionProgress({ ...journal('atomic_retry'), atomicSwapRequired: true,
+    tx: { atomicSwapDeposit: null, atomicReverts: [revertedHash] } });
+  assert.equal(progress.currentStepLabel, '換幣');
+  assert.equal(progress.steps[2].status, 'active');
+  assert.equal(progress.transactions.length, 1);
+  assert.equal(progress.transactions[0].hash, revertedHash);
+  assert.equal(progress.transactions[0].status, 'reverted');
+});
+
+test('atomic deposit-only mode labels its single receipt without showing swap as pending', () => {
+  const progress = describeExecutionProgress({ ...journal('atomic_sent'), atomicSwapRequired: false,
+    tx: { atomicSwapDeposit: hash('6') } });
+  assert.equal(progress.currentStepLabel, '存入 LP');
+  assert.equal(progress.steps[2].status, 'skipped');
+  assert.equal(progress.transactions.length, 1);
+  assert.equal(progress.transactions[0].label, '一次存入 LP');
+});
+
 function botFixture(active = null) {
   const settings = new Map([['activeRebalanceExecution', active]]);
   const bot = Object.create(AutoLpBot.prototype);

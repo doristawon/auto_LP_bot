@@ -34,7 +34,9 @@ import { simulateSequentialCalls } from '../execution/sequential-simulation.js';
 import {
   MAX_UINT128,
   buildExactDepositPlan,
-  buildExactWithdrawBounds
+  buildExactWithdrawBounds,
+  getLiquidityForAmounts,
+  getSqrtPriceAtTick
 } from '../math/v4-fixed.js';
 import { buildTargetRange, isLpInRange, isLpOutOfRange } from '../math/ticks.js';
 import {
@@ -45,6 +47,8 @@ import {
 } from '../execution/investment-target.js';
 import { log } from '../logger.js';
 import { describeExecutionProgress } from '../dashboard/execution-progress.js';
+import { assertGuardVersion } from '../execution/guard-version.js';
+import { executeAtomicDeposit, buildAtomicDepositRequest } from '../execution/atomic-deposit.js';
 
 const erc20Interface = new Interface(ERC20_ABI);
 const permit2Interface = new Interface(PERMIT2_ABI);
@@ -259,8 +263,10 @@ export class RebalanceExecutor {
       const approval1 = approvalBounds.expected1 + BigInt(plan.position.owed1 || 0n) + scopedPreBalances.raw1;
       await this.ensureSwapAllowances(plan.pool.token0, approval0);
       await this.ensureSwapAllowances(plan.pool.token1, approval1);
-      await this.ensureHookAllowance(plan.pool.token0, plan.pool.key.hooks, approval0);
-      await this.ensureHookAllowance(plan.pool.token1, plan.pool.key.hooks, approval1);
+      if (!this.config.atomicDepositEnabled) {
+        await this.ensureHookAllowance(plan.pool.token0, plan.pool.key.hooks, approval0);
+        await this.ensureHookAllowance(plan.pool.token1, plan.pool.key.hooks, approval1);
+      }
       journal = this.patchJournal(journal, { phase: 'approvals_ready' });
 
       // Approvals can consume blocks; re-check OOR only after all non-capital-moving
@@ -431,6 +437,14 @@ export class RebalanceExecutor {
         balanceMismatchBps: fitted.capacityMismatchBps,
         swapPlan: serializeSwapPlan(swapPlan)
       });
+
+      if (this.config.atomicDepositEnabled) {
+        return await executeAtomicDeposit.call(this, { pool: plan.pool,
+          target: fitted.target, funding: fundingScope.funding, balances: postWithdrawBalances,
+          journal, oldPosition: plan.position, allocationScope, retarget: true,
+          maxPriceImpactBps: rebalanceMaxImpactBps,
+          onJournal: value => { journal = value; phase = value.phase; } });
+      }
 
       let postSwapBalances = postWithdrawBalances;
       if (swapPlan.direction !== 'none') {
@@ -677,6 +691,7 @@ export class RebalanceExecutor {
         target: finalTarget
       };
     } catch (error) {
+      if (error.atomicHandled) throw error;
       try {
         if (await this.reconcileConfirmedNoOp({ pool: plan.pool, journal, error, phase,
           baseline: journal.preBalancesRaw, position: plan.position })) {
@@ -987,6 +1002,24 @@ export class RebalanceExecutor {
     await this.assertGasGuard();
     const reserveWei = BigInt(minGasReserveWei || 0n);
     if (reserveWei <= 0n) throw new Error('A positive top-up native gas reserve is required');
+
+    if (this.config.atomicDepositEnabled) {
+      if (!swapEnabledForPool && swapPlan.direction !== 'none') {
+        throw new Error('Atomic top-up requires the saved pool swap policy');
+      }
+      this.assertNoUnfinishedExecution();
+      const atomicJournal = { id: `top-up:${Date.now()}:${pool.id}:${position.id}`,
+        kind: 'liquidity_top_up', phase: 'prepared', startedAt: Date.now(), poolId: pool.id,
+        pair: `${pool.token0.symbol}/${pool.token1.symbol}`, position: {
+          id: position.id, tickLower: Number(position.tickLower), tickUpper: Number(position.tickUpper),
+          sharesBefore: String(validation.shares) }, tx: {},
+        allocationFundingScope: allocationFundingScope ? jsonSafe(allocationFundingScope) : null };
+      this.saveJournal(atomicJournal);
+      return executeAtomicDeposit.call(this, { pool, position,
+        target: { tickLower: Number(position.tickLower), tickUpper: Number(position.tickUpper) },
+        funding, balances: initialBalances, journal: atomicJournal, allocationScope: allocationFundingScope,
+        maxPriceImpactBps: topUpMaxPriceImpactBps, eventType: 'rebalance.top_up_completed' });
+    }
 
     let executableSwapPlan = null;
     if (swapEnabledForPool
@@ -1400,10 +1433,11 @@ export class RebalanceExecutor {
   }
 
   async prepareRangeBalancedSwap({ pool, funding, state, target, stableIndex,
-    maxPriceImpactBps, chooseTarget = null, prefixCalls = [] }) {
+    maxPriceImpactBps, chooseTarget = null, prefixCalls = [], expectedOutput = false }) {
     return buildRangeBalancedSwapPlan({
       pool, quoter: this.quoter, rawAmount0: funding.raw0, rawAmount1: funding.raw1,
-      state, target, chooseTarget, maxPriceImpactBps,
+      state, target, chooseTarget, maxPriceImpactBps, expectedOutput,
+      maxRefinements: expectedOutput ? 4 : 2,
       slippageBps: this.config.swapSlippageBps,
       preferRemainderTokenIndex: stableIndex,
       preferredRemainderBps: stableIndex === null ? 0 : Math.min(this.config.autoTopupDustBps ?? 25, 50),
@@ -1560,6 +1594,7 @@ export class RebalanceExecutor {
     const fitted = await this.prepareRangeBalancedSwap({
       pool, funding: fundingScope.funding, state: poolState, target,
       stableIndex: fundingScope.stableIndex, maxPriceImpactBps,
+      expectedOutput: this.config.atomicDepositEnabled === true,
       prefixCalls: [withdrawCall],
       chooseTarget: tick => buildTargetRange(tick, pool.key.tickSpacing,
         this.config.tightWidthBps, this.config.rangePreset)
@@ -1597,7 +1632,8 @@ export class RebalanceExecutor {
         tickToleranceTicks: this.config.depositTickTolerance ?? -1
     }, allocationScope);
     this.assertValidDeposit(depositPlan, 'Sequential preflight deposit plan is invalid');
-    const fullApprovals = await this.buildTopUpApprovalRequests(pool, swapPlan, depositPlan);
+    const fullApprovals = await this.buildTopUpApprovalRequests(pool, swapPlan,
+      this.config.atomicDepositEnabled ? { amount0Max: 0n, amount1Max: 0n } : depositPlan);
     const depositData = this.fables.encodeDeposit(
       pool, finalTarget, depositPlan.liquidity,
       depositPlan.amount0Max, depositPlan.amount1Max, deadline
@@ -1613,6 +1649,16 @@ export class RebalanceExecutor {
       { to: pool.key.hooks, data: depositData, value: 0n,
         gasLimit: Number(TOP_UP_DEPOSIT_GAS_LIMIT) }
     ];
+    if (this.config.atomicDepositEnabled) {
+      const minLiquidity = getLiquidityForAmounts(finalSqrtPriceX96,
+        getSqrtPriceAtTick(finalTarget.tickLower), getSqrtPriceAtTick(finalTarget.tickUpper),
+        projected.raw0, projected.raw1) * BigInt(10_000 - this.config.depositSlippageBps) / 10_000n;
+      const atomic = buildAtomicDepositRequest({ pool, walletAddress: this.config.walletAddress,
+        target: finalTarget, balances: postWithdraw, funding: fundingScope.funding,
+        swapPlan, routerRequest: swapRequest, minLiquidity, deadline });
+      fullCalls.splice(fullApprovals.length + 1, fullCalls.length,
+        { to: atomic.to, data: atomic.data, value: 0n, gasLimit: 4_000_000 });
+    }
     const simulated = await simulateSequentialCalls(this.writeProvider, {
       ...simulationArgs, calls: fullCalls
     });
@@ -2555,15 +2601,38 @@ export class RebalanceExecutor {
         await this.ensureSwapAllowances(swap.tokenIn, swap.rawAmountIn);
       }
       let executedBalanceSwapPoolId = null;
+      if (this.config.atomicDepositEnabled) {
+        const physical = await this.readRawPairBalances(destinationPool);
+        const dust = new Map(preflight.funding.map(entry => [entry.address.toLowerCase(), BigInt(entry.dustRaw)]));
+        const funding = {
+          raw0: plan.allocationBootstrap === true
+            ? BigInt(allocationInventory[destinationPool.token0.address.toLowerCase()] || 0n)
+            : physical.raw0 - (dust.get(destinationPool.token0.address.toLowerCase()) || 0n),
+          raw1: plan.allocationBootstrap === true
+            ? BigInt(allocationInventory[destinationPool.token1.address.toLowerCase()] || 0n)
+            : physical.raw1 - (dust.get(destinationPool.token1.address.toLowerCase()) || 0n) };
+        const state = await this.fables.readPoolState(destinationPool);
+        const target = buildTargetRange(state.tick, destinationPool.key.tickSpacing,
+          this.config.tightWidthBps, this.config.rangePreset);
+        return await executeAtomicDeposit.call(this, { pool: destinationPool, target, funding,
+          balances: physical, journal, retarget: true,
+          allocationScope: plan.allocationBootstrap === true ? plan.allocationFundingScope : null,
+          maxPriceImpactBps: plan.manualImmediate === true ? Number(plan.manualMaxCostBps)
+            : plan.allocationBootstrap === true ? Number(plan.maxPriceImpactBps) : this.config.crossPoolMaxSwapPriceImpactBps,
+          eventType: 'rebalance.cross_pool_completed',
+          onJournal: value => { journal = value; phase = value.phase; } });
+      }
       if (preflight.balanceSwap) {
         const token = preflight.balanceSwap.plan.tokenIn === 0
           ? destinationPool.token0 : destinationPool.token1;
         await this.ensureSwapAllowances(token, preflight.balanceSwap.plan.rawAmountIn);
       }
-      await this.ensureHookAllowance(destinationPool.token0, destinationPool.key.hooks,
-        preflight.depositPlan.amount0Max);
-      await this.ensureHookAllowance(destinationPool.token1, destinationPool.key.hooks,
-        preflight.depositPlan.amount1Max);
+      if (!this.config.atomicDepositEnabled) {
+        await this.ensureHookAllowance(destinationPool.token0, destinationPool.key.hooks,
+          preflight.depositPlan.amount0Max);
+        await this.ensureHookAllowance(destinationPool.token1, destinationPool.key.hooks,
+          preflight.depositPlan.amount1Max);
+      }
       journal = this.patchJournal(journal, { phase: 'approvals_ready' });
 
       // Approvals may take blocks. Rebuild and simulate the entire transaction
@@ -2855,6 +2924,7 @@ export class RebalanceExecutor {
         routeSwapHashes: routeHashes, swapHash: journal.tx.swap || null,
         depositHash: journal.tx.deposit, newPositionId: depositEvent.rangeId, target };
     } catch (error) {
+      if (error.atomicHandled) throw error;
       if (plan.allocationBootstrap === true && phase === 'swap_sent') {
         try {
           const raw = journal.allocationPhysicalBaselineRaw;
@@ -3036,10 +3106,7 @@ export class RebalanceExecutor {
       data: versionData
     });
     const [version] = guardInterface.decodeFunctionResult('guardVersion', rawVersion);
-    const expectedVersion = id('Fables7702Guard/v1');
-    if (String(version).toLowerCase() !== expectedVersion.toLowerCase()) {
-      throw new Error(`Unexpected EIP-7702 guard version: expected ${expectedVersion}, got ${version}`);
-    }
+    assertGuardVersion(version, this.config);
     const implementationData = guardInterface.encodeFunctionData('IMPLEMENTATION', []);
     const rawImplementation = await this.readProvider.call({
       from: this.config.walletAddress,

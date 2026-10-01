@@ -47,7 +47,10 @@ export function registerSensitiveValues(values = []) {
 }
 
 function redactText(text) {
-  let output = text;
+  // Ethers broadcast errors can embed the complete signed transaction. Keep
+  // the public hash and error reason, but never log its reusable signature.
+  let output = text.replace(/\b(?:transaction|rawTransaction|signedTransaction)=(['"])0x[0-9a-fA-F]{128,}\1/g,
+    'transaction="[REDACTED_SIGNED_TRANSACTION]"');
   for (const value of redactionValues) {
     output = output.split(value).join('[REDACTED]');
     const encoded = encodeURIComponent(value);

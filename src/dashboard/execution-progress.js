@@ -8,8 +8,10 @@ const STAGES = {
   withdraw_sent: 1, withdraw_confirmed: 2, withdraw_not_required: 2,
   route_swap_sent: 2, route_swap_confirmed: 2, swap_preflighted: 2, swap_sent: 2,
   swap_confirmed: 3, swap_not_required: 3, deposit_preflighted: 3, deposit_sent: 3,
-  deposit_confirmed: 4, completed: 4
+  deposit_confirmed: 4, atomic_preflighted: 2, atomic_sent: 2, atomic_retry: 2,
+  atomic_confirmed: 4, completed: 4
 };
+const ATOMIC_PHASES = new Set(['atomic_preflighted', 'atomic_sent', 'atomic_retry', 'atomic_confirmed']);
 const cleanText = (value, max = 180) => typeof value === 'string'
   ? sanitize(value).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, max) : '';
 const hashValue = value => typeof value === 'string' && /^0x[0-9a-f]{64}$/i.test(value) ? value : null;
@@ -23,20 +25,27 @@ export function describeExecutionProgress(journal) {
     : phase === 'recovery_required' ? 'recovery' : 'running';
   const observedPhase = ['failed', 'recovery_required', 'tx_broadcast_pending'].includes(phase)
     ? journal.pendingTx?.previousPhase || journal.lastKnownPhase || 'prepared' : phase;
+  const atomicFlow = ATOMIC_PHASES.has(observedPhase) || Object.hasOwn(journal.tx || {}, 'atomicSwapDeposit')
+    || Array.isArray(journal.tx?.atomicReverts);
   const kind = journal.kind === 'stop_liquidation' ? 'stop'
     : journal.kind === 'liquidity_top_up' ? 'topup'
     : Object.hasOwn(journal, 'oldPosition') && !journal.oldPosition ? 'bootstrap'
     : journal.destinationPoolId ? 'rotation' : 'rebalance';
   const stopStage = String(journal.step || '').startsWith('withdraw:') ? 1
     : String(journal.step || '').startsWith('swap:') ? 2 : 0;
+  const atomicStepIndex = ['atomic_preflighted', 'atomic_sent', 'atomic_retry'].includes(observedPhase)
+    ? journal.atomicSwapRequired === true ? 2 : 3
+    : observedPhase === 'atomic_confirmed' ? 4 : null;
   const stepIndex = kind === 'stop'
-    ? status === 'completed' ? 4 : stopStage : STAGES[observedPhase] ?? 0;
+    ? status === 'completed' ? 4 : stopStage
+    : atomicStepIndex ?? STAGES[observedPhase] ?? 0;
   const completed = status === 'completed';
   const skippedWithdraw = kind === 'topup' || kind === 'bootstrap'
     || observedPhase === 'withdraw_not_required';
   const skippedSwap = observedPhase === 'swap_not_required'
-    || journal.swapPolicy === 'deposit-only'
-    || (stepIndex >= 3 && !journal.tx?.swap && !(journal.tx?.routeSwaps?.length));
+    || atomicFlow && journal.atomicSwapRequired !== true
+    || !atomicFlow && (journal.swapPolicy === 'deposit-only'
+      || (stepIndex >= 3 && !journal.tx?.swap && !(journal.tx?.routeSwaps?.length)));
   const steps = STEP_KEYS.map((key, index) => {
     const skipped = key === 'withdraw' && skippedWithdraw
       || key === 'swap' && skippedSwap || kind === 'stop' && key === 'deposit';
@@ -69,10 +78,20 @@ export function describeExecutionProgress(journal) {
     const routes = Array.isArray(journal.tx?.routeSwaps) ? journal.tx.routeSwaps : [];
     routes.forEach((hash, index) => addTransaction('swap', '跨池換幣', hash,
       receiptState(completed || index < routes.length - 1 || observedPhase !== 'route_swap_sent' && stepIndex >= 2)));
-    addTransaction('swap', '調整代幣比例', journal.tx?.swap,
-      receiptState(completed || stepIndex >= 3));
-    addTransaction('deposit', '存入 LP', journal.tx?.deposit,
-      receiptState(completed || stepIndex >= 4));
+    if (atomicFlow) {
+      const atomicStep = journal.atomicSwapRequired === true ? 'swap' : 'deposit';
+      const atomicLabel = journal.atomicSwapRequired === true ? '換幣＋一次存入 LP' : '一次存入 LP';
+      for (const hash of Array.isArray(journal.tx?.atomicReverts) ? journal.tx.atomicReverts : []) {
+        addTransaction(atomicStep, `${atomicLabel}（已回退）`, hash, 'reverted');
+      }
+      addTransaction(atomicStep, atomicLabel, journal.tx?.atomicSwapDeposit,
+        receiptState(completed || observedPhase === 'atomic_confirmed' || stepIndex >= 4));
+    } else {
+      addTransaction('swap', '調整代幣比例', journal.tx?.swap,
+        receiptState(completed || stepIndex >= 3));
+      addTransaction('deposit', '存入 LP', journal.tx?.deposit,
+        receiptState(completed || stepIndex >= 4));
+    }
   }
   if (journal.lastApprovalTx) addTransaction('preflight', '代幣授權', journal.lastApprovalTx.hash,
     journal.lastApprovalTx.status === 'reverted' ? 'reverted'
@@ -109,7 +128,13 @@ export function describeExecutionProgress(journal) {
     swap_not_required: '現有代幣比例可直接存入，無需換幣。',
     deposit_preflighted: '存入預檢通過，準備送出交易。',
     deposit_sent: '存入交易已送出，等待鏈上確認。',
-    deposit_confirmed: '存入已確認，正在核對 LP 份額與餘額。'
+    deposit_confirmed: '存入已確認，正在核對 LP 份額與餘額。',
+    atomic_preflighted: journal.atomicSwapRequired === true
+      ? '原子換幣與存入 LP 預檢通過，準備送出單筆交易。' : '原子存入 LP 預檢通過，準備送出單筆交易。',
+    atomic_sent: journal.atomicSwapRequired === true
+      ? '換幣＋一次存入 LP 已在同一筆交易送出，等待確認。' : '一次存入 LP 已送出，等待確認。',
+    atomic_retry: '上一筆原子交易已回退，正在重新預檢。',
+    atomic_confirmed: '原子交易已確認，正在核對 LP 份額與餘額。'
   };
   const message = completed ? '鏈上交易與部位核對已完成。'
     : status === 'failed' ? '流程未完成，請查看失敗原因。'

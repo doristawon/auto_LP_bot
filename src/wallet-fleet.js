@@ -3,6 +3,7 @@ import { AutoLpBot } from './bot.js';
 import { WalletVault, validateWalletRecord } from './wallet-vault.js';
 import { log, registerSensitiveValues } from './logger.js';
 import { isRpcRateLimitError, isRpcTimeoutError } from './rpc/errors.js';
+import { walletGuardConfig } from './execution/wallet-guard.js';
 
 const STARTUP_STAGGER_MS = 15_000;
 const STARTUP_RETRY_JITTER_MS = 30_000;
@@ -48,6 +49,7 @@ export class WalletFleet {
     registerSensitiveValues([record.privateKey]);
     const dataDir = path.join(this.baseConfig.dataDir, 'wallets', record.address.toLowerCase());
     return new this.Bot({ ...this.baseConfig, rpcUrls: [...this.primary.config.rpcUrls],
+      ...walletGuardConfig(this.baseConfig, record.address),
       walletAddress: record.address, privateKey: record.privateKey, dataDir,
       stateFile: path.join(dataDir, 'bot-state.json'),
       targetMode: 'wallet-active', targetPoolIds: [], targetSymbols: [],

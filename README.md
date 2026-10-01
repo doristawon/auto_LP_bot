@@ -56,7 +56,7 @@ Manual Rebalance 不提供 bypass：In-Range Hold、OOR hysteresis、topology re
 Executor 安全性改進：
 
 - 所有 ERC20→Permit2、Permit2→Universal Router、token→Fables hook approvals 優先在 withdraw 前完成；approval 失敗時 LP principal 尚未移動。
-- EIP-7702 delegation 除了 pointer，還驗證 `guardVersion == keccak256("Fables7702Guard/v1")` 與 `IMPLEMENTATION == EIP7702_GUARD_ADDRESS`。
+- EIP-7702 delegation 除了 pointer，還驗證 guard version 與 `IMPLEMENTATION == EIP7702_GUARD_ADDRESS`。Legacy 模式接受 v1/v2；啟用 atomic swap+deposit 時必須是 v2。
 - exact-input swap receipt 強制 `actual spent == requested amountIn`；under-spend / over-spend 都 fail closed。
 - deposit 前再次讀 current tick，以最新狀態重算 centered range / BigInt liquidity / amount caps。
 - deposit receipt 後再讀 `rangeKey(newRangeId)`，完整驗證 PoolKey + tickLower/tickUpper。
@@ -99,6 +99,7 @@ ENABLE_LIVE_WRITES=false
 ENABLE_AUTO_REDEPLOY=false
 EIP7702_GUARD_VERIFIED=false
 EIP7702_GUARD_VERIFIED_FOR=
+ATOMIC_DEPOSIT_ENABLED=false
 ```
 
 先在獨立 canary wallet 驗證，再碰主錢包。部署合約需設定專用 `GUARD_DEPLOYER_PRIVATE_KEY`，且不可與 LP signer 的 `PRIVATE_KEY` 相同：
@@ -146,6 +147,22 @@ npm run setup:guard -- --revoke
 ```
 
 > Guard 尚未部署/委派/驗證時，live auto-redeploy 會 fail closed；程式不會因為只有 private key 就自行改變 EOA code。
+
+### Atomic swap + deposit（選擇性 v2）
+
+預設維持 `ATOMIC_DEPOSIT_ENABLED=false`，沿用既有分開執行的 swap/deposit 路徑。要對指定錢包啟用 atomic swap+deposit，需部署含 `atomicSwapAndDeposit` 的 v2 guard，將該錢包重新委派到 v2 implementation，並完成 `verify:guard` 的既有 In-Range withdrawal canary。接著設定：
+
+```env
+ATOMIC_DEPOSIT_ENABLED=true
+ATOMIC_DEPOSIT_WALLETS=<wallet address>
+LEGACY_EIP7702_GUARD_ADDRESS=<previous guard address for wallets kept on v1>
+```
+
+`ATOMIC_DEPOSIT_WALLETS` 可用逗號分隔列出要採用 v2 atomic 路徑的錢包；未設定時使用目前設定的 `WALLET_ADDRESS`。Atomic mode 會拒絕 v1 guard。已委派 v1 的錢包不會自動升級，也可在 atomic mode 關閉時繼續走 legacy guard 路徑；切換到 v2 必須明確部署並重新委派。啟用前請先在獨立測試錢包完成部署、委派與 canary 驗證。
+
+新版會在同一筆交易中完成換幣、精確 hook 授權、讀取成交後價格與最大可投入 liquidity、一次存入 LP，以及清除剩餘授權。每個幣種的額外殘額上限是授權投入量的 0.5% 加兩個最小單位；USDG 零頭與 ETH Gas 保留額另計。比例失準時整筆回退，確認餘額、LP 與 nonce 未變後最多重擬合三次。交易結果不明時保留 journal，禁止重送。撤池交易仍獨立執行，保留 OOR 防護。
+
+Atomic route 支援 Uniswap V3、無 hook 的 Uniswap V4 與官方 registry 內的 Fables V4。Router 的 command、代幣、完整 V4 PoolKey、recipient、input、minOut 與 deadline 都受到限制。候選合約可先用 `node src/tools/preflight-atomic-deposit.js` 在鏈上暫存狀態預演；此工具不建立 signer、不廣播交易。
 
 ### Swap route 範圍
 
@@ -503,7 +520,7 @@ npm run setup:guard
 npm run verify:guard
 ```
 
-`verify:guard` 必須以目前 In-Range LP 證明 atomic withdraw canary 被 block，之後才設定 `EIP7702_GUARD_VERIFIED=true` 與相同 signer 的 `EIP7702_GUARD_VERIFIED_FOR`，再考慮小額 canary。GitHub/repo 不持有 private key，因此不會自動替主錢包做 delegation 或 live broadcast。
+`verify:guard` 檢查 delegation、版本與 implementation，並證明 In-Range withdrawal 會回退。若目前 LP 已 OOR，工具以目前 tick 建立臨時 In-Range 邊界做唯讀 canary，結果會標示 `syntheticInRange=true`，不冒充實際 LP 位於區間內。通過後才設定 `EIP7702_GUARD_VERIFIED=true` 與相同 signer 的 `EIP7702_GUARD_VERIFIED_FOR`。GitHub/repo 不持有 private key。
 
 ## Dashboard API
 

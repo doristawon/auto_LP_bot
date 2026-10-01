@@ -51,5 +51,7 @@ export const PERMIT2_ABI = [
 export const EIP7702_GUARD_ABI = [
   `function guardVersion() view returns(bytes32)`,
   `function IMPLEMENTATION() view returns(address)`,
-  `function guardedWithdrawAndClaim(${POOL_KEY_TUPLE} key,int24 tickLower,int24 tickUpper,uint128 liquidity,address recipient,uint128 amount0Min,uint128 amount1Min,uint256 deadline,uint16 walk)`
+  `function guardedWithdrawAndClaim(${POOL_KEY_TUPLE} key,int24 tickLower,int24 tickUpper,uint128 liquidity,address recipient,uint128 amount0Min,uint128 amount1Min,uint256 deadline,uint16 walk)`,
+  `function atomicSwapAndDeposit((${POOL_KEY_TUPLE} key,int24 tickLower,int24 tickUpper,uint256 expectedBalance0,uint256 expectedBalance1,uint128 funding0,uint128 funding1,uint8 tokenIn,bytes32 swapPoolId,uint128 amountIn,uint128 minOut,uint128 minLiquidity,uint16 maxResidualBps,uint256 deadline,bytes routerData) plan)`,
+  'event AtomicDeposited(bytes32 indexed poolId,uint128 liquidity,uint128 funding0,uint128 funding1,uint256 residual0,uint256 residual1)'
 ];
