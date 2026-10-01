@@ -26,6 +26,7 @@ import { buildExactBalancedSwapPlan, quotePriceImpactBps } from '../execution/ex
 import { buildPairFundingScope } from '../execution/pair-funding.js';
 import { addAllocationReceiptDeltas, allocationPairCaps,
   clipAllocationPairBalances } from '../execution/allocation-funding.js';
+import { resolveTopUpSwapPolicy } from '../execution/topup-swap-policy.js';
 import { usdGAssetPriceFromPool } from '../analytics/allocation.js';
 import { simulateSequentialCalls } from '../execution/sequential-simulation.js';
 import {
@@ -735,13 +736,6 @@ export class RebalanceExecutor {
     if (!allocationEnabled && allocationFundingScope) {
       throw new Error('Allocation scope was supplied while saved allocation mode is disabled');
     }
-    const usesConfiguredSwapLimit = String(pool?.id || '').toLowerCase()
-      === String(this.config.autoTopupSwapPoolId || '').toLowerCase();
-    const swapEnabledForPool = this.config.autoTopupSwapEnabled === true
-      && (allocationEnabled || usesConfiguredSwapLimit);
-    const topUpMaxPriceImpactBps = usesConfiguredSwapLimit
-      ? this.config.autoTopupMaxSwapPriceImpactBps
-      : this.config.maxSwapPriceImpactBps ?? 200;
     if (!Number.isInteger(Number(dustBps)) || Number(dustBps) < 0 || Number(dustBps) >= 10_000) {
       throw new Error('Top-up dustBps must be an integer from 0 through 9999');
     }
@@ -754,9 +748,34 @@ export class RebalanceExecutor {
     ) {
       throw new Error('Native-token top-up is not enabled');
     }
+    const selectedTargetPoolId = this.state?.getSetting('selectedExecutionTargetPoolId', '') || '';
+    const investmentTargetMode = this.state?.getSetting('investmentTargetMode', 'apr-highest') || 'apr-highest';
+    const investmentTargetPoolId = this.state?.getSetting('investmentTargetPoolId', selectedTargetPoolId)
+      || selectedTargetPoolId;
+    if (!allocationEnabled && investmentTargetMode === 'specific-pool') {
+      if (!investmentTargetPoolId) throw new Error('Saved specific investment target is missing a pool id');
+      if (String(pool.id).toLowerCase() !== String(investmentTargetPoolId).toLowerCase()) {
+        throw new Error('Top-up pool does not match the saved specific investment target');
+      }
+    }
     this.assertNoUnfinishedExecution();
 
     let validation = await this.validateTopUpPosition(pool, position, 'top-up-entry');
+    const topUpSwapPolicy = resolveTopUpSwapPolicy({
+      poolId: pool?.id,
+      autoTopupSwapEnabled: this.config.autoTopupSwapEnabled,
+      autoTopupSwapPoolId: this.config.autoTopupSwapPoolId,
+      autoTopupMaxSwapPriceImpactBps: this.config.autoTopupMaxSwapPriceImpactBps,
+      maxSwapPriceImpactBps: this.config.maxSwapPriceImpactBps,
+      crossPoolMaxSwapPriceImpactBps: this.config.crossPoolMaxSwapPriceImpactBps,
+      allocationEnabled,
+      investmentTargetMode,
+      investmentTargetPoolId,
+      verifiedExistingInRangePosition: Boolean(validation?.shares > 0n
+        && isLpInRange(validation.state.tick, Number(position.tickLower), Number(position.tickUpper)))
+    });
+    const { usesConfiguredSwapLimit, swapEnabledForPool } = topUpSwapPolicy;
+    const topUpMaxPriceImpactBps = topUpSwapPolicy.maxPriceImpactBps;
     this.assertTokenPrices(pool);
     if (allocationFundingScope) this.assertAllocationFundingScope(pool, allocationFundingScope, { requireFresh: true });
     const initialBalances = await this.readRawPairBalances(pool);
@@ -874,6 +893,7 @@ export class RebalanceExecutor {
       swapPolicy: swapEnabledForPool
         ? 'swap only after sequential approve + swap + deposit simulation'
         : 'deposit-only; optional swap is disabled',
+      maxPriceImpactBps: topUpMaxPriceImpactBps,
       swapPlan: serializeSwapPlan(swapPlan),
       swapQuoteError,
       projectedInventoryRaw: stringifyRawBalances(expectedInventory),

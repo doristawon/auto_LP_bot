@@ -154,13 +154,15 @@ test('failed deposit-only sequence simulation stops before any approval or capit
   assert.deepEqual(calls, []);
 });
 
-test('allocation top-up quotes each selected pool even when legacy swap pool is different', async () => {
+test('allocation-scoped top-up stays eligible despite a stale saved specific target', async () => {
   const { executor } = liveDepositFixture();
   executor.config.autoTopupSwapEnabled = true;
   executor.config.autoTopupSwapPoolId = 'a-different-legacy-pool';
   executor.config.maxSwapPriceImpactBps = 200;
   executor.config.swapSlippageBps = 50;
   executor.isAllocationModeEnabled = () => true;
+  executor.state.setSetting('investmentTargetMode', 'specific-pool');
+  executor.state.setSetting('investmentTargetPoolId', 'stale-saved-target');
   executor.assertAllocationFundingScope = () => {};
   executor.assertAllocationJobCurrent = () => {};
   executor.clipPairToAllocation = (_pool, balances) => balances;
@@ -172,6 +174,43 @@ test('allocation top-up quotes each selected pool even when legacy swap pool is 
   } });
   assert.equal(result.status, 'completed');
   assert.ok(quotes > 0, 'the configured allocation pool must be eligible for a balancing swap quote');
+});
+
+test('saved single-pool target quotes a swap even when legacy swap pool names another pool', async () => {
+  const { executor } = liveDepositFixture();
+  executor.config.dryRun = true;
+  executor.config.enableLiveWrites = false;
+  executor.config.autoTopupSwapEnabled = true;
+  executor.config.autoTopupSwapPoolId = 'legacy-moo-pool';
+  executor.config.autoTopupMaxSwapPriceImpactBps = 350;
+  executor.config.crossPoolMaxSwapPriceImpactBps = 350;
+  executor.config.maxSwapPriceImpactBps = 200;
+  executor.config.swapSlippageBps = 50;
+  executor.state.setSetting('investmentTargetMode', 'specific-pool');
+  executor.state.setSetting('investmentTargetPoolId', pool.id);
+  executor.fables.encodeDeposit = () => '0x5678';
+  let quotes = 0;
+  executor.quoter = {
+    async quoteExactInputSingleRaw() {
+      quotes++;
+      throw new Error('synthetic quote unavailable; keep deposit-only fallback');
+    }
+  };
+  const result = await executor.topUpPoolPosition({ pool, position, dustBps: 25 });
+  assert.equal(result.status, 'dry-run');
+  assert.ok(quotes > 0, 'the saved single-pool target must be eligible for a swap quote');
+  assert.equal(result.plan.swapPolicy,
+    'swap only after sequential approve + swap + deposit simulation');
+  assert.equal(result.plan.maxPriceImpactBps, 350);
+});
+
+test('top-up rejects a pool that mismatches the saved specific target before validation or writes', async () => {
+  const { executor, calls } = liveDepositFixture();
+  executor.state.setSetting('investmentTargetMode', 'specific-pool');
+  executor.state.setSetting('investmentTargetPoolId', 'another-pool');
+  executor.validateTopUpPosition = async () => { throw new Error('must not validate mismatched pool'); };
+  await assert.rejects(executor.topUpPoolPosition({ pool, position }), /does not match the saved specific/);
+  assert.deepEqual(calls, []);
 });
 
 test('deposit-only sequential simulator submits approvals and deposit without a router call', async () => {

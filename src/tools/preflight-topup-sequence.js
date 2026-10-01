@@ -2,7 +2,7 @@
 // ledger, signer, transaction broadcast, or persistent file mutation.
 import fs from 'node:fs';
 import path from 'node:path';
-import { formatUnits } from 'ethers';
+import { formatUnits, getAddress } from 'ethers';
 import { loadDotEnv } from '../env.js';
 import { loadConfig } from '../config.js';
 import { createProviders } from '../rpc/providers.js';
@@ -11,10 +11,15 @@ import { RebalanceExecutor } from '../adapters/executor.js';
 import { buildExactBalancedSwapPlan } from '../execution/exact-rebalance.js';
 import { buildPairFundingScope } from '../execution/pair-funding.js';
 import { buildExactDepositPlan } from '../math/v4-fixed.js';
+import { resolveTopUpSwapPolicy } from '../execution/topup-swap-policy.js';
 
 loadDotEnv();
 const config = loadConfig();
 const walletDir = path.join(config.dataDir, 'wallets', config.walletAddress.toLowerCase());
+const walletStateFile = path.join(walletDir, 'bot-state.json');
+const walletState = fs.existsSync(walletStateFile)
+  ? JSON.parse(fs.readFileSync(walletStateFile, 'utf8')) : null;
+const walletSettings = walletState?.settings || {};
 const snapshotFile = fs.existsSync(path.join(walletDir, 'latest-snapshot.json'))
   ? path.join(walletDir, 'latest-snapshot.json')
   : path.join(config.dataDir, 'latest-snapshot.json');
@@ -23,6 +28,7 @@ const active = (snapshot.pools || []).flatMap((pool) => (pool.positions || [])
   .filter((position) => BigInt(position.shares || 0) > 0n)
   .map((position) => ({ poolId: pool.id, position })));
 if (active.length !== 1) throw new Error('Preflight requires exactly one active LP range');
+const activePoolId = String(active[0].poolId || '').toLowerCase();
 
 // Discard the key before constructing any adapter. This command is observation only.
 config.privateKey = '';
@@ -30,17 +36,49 @@ config.dryRun = true;
 config.enableLiveWrites = false;
 const providers = createProviders(config);
 const fables = new FablesAdapter(providers.readProvider, config);
-const pool = (await fables.discoverAllPools()).find((candidate) => candidate.id === active[0].poolId);
-if (!pool) throw new Error('Active LP pool is no longer registered');
-if (!config.autoTopupSwapEnabled || pool.id !== config.autoTopupSwapPoolId) {
-  throw new Error('The active pool is not approved for an automatic top-up swap');
-}
+const registryEntry = (await fables.registry.activePools())
+  .find((entry) => entry.active && String(entry.id).toLowerCase() === activePoolId);
+if (!registryEntry) throw new Error('Active LP pool is no longer registered');
+const pool = {
+  id: activePoolId,
+  key: {
+    currency0: getAddress(registryEntry.key.currency0),
+    currency1: getAddress(registryEntry.key.currency1),
+    fee: Number(registryEntry.key.fee),
+    tickSpacing: Number(registryEntry.key.tickSpacing),
+    hooks: getAddress(registryEntry.key.hooks)
+  }
+};
+[pool.token0, pool.token1] = await Promise.all([
+  fables.getToken(pool.key.currency0), fables.getToken(pool.key.currency1)
+]);
 const position = active[0].position;
 const executor = new RebalanceExecutor(
   providers.readProvider, providers.writeProvider, config, fables,
-  { append: () => {} }, () => 1, null
+  { append: () => {} }, () => 1, {
+    getSetting(key, fallback = null) {
+      return Object.hasOwn(walletSettings, key) ? walletSettings[key] : fallback;
+    }
+  }
 );
 const validation = await executor.validateTopUpPosition(pool, position, 'read-only-preflight');
+const swapPolicy = resolveTopUpSwapPolicy({
+  poolId: activePoolId,
+  autoTopupSwapEnabled: config.autoTopupSwapEnabled,
+  autoTopupSwapPoolId: config.autoTopupSwapPoolId,
+  autoTopupMaxSwapPriceImpactBps: config.autoTopupMaxSwapPriceImpactBps,
+  maxSwapPriceImpactBps: config.maxSwapPriceImpactBps,
+  crossPoolMaxSwapPriceImpactBps: config.crossPoolMaxSwapPriceImpactBps,
+  investmentTargetMode: walletSettings.investmentTargetMode || 'apr-highest',
+  investmentTargetPoolId: walletSettings.investmentTargetPoolId
+    || walletSettings.selectedExecutionTargetPoolId,
+  verifiedExistingInRangePosition: Boolean(validation.shares > 0n
+    && validation.state.tick >= Number(position.tickLower)
+    && validation.state.tick < Number(position.tickUpper))
+});
+if (!swapPolicy.swapEnabledForPool) {
+  throw new Error('The active pool is not approved by the configured swap pool or saved wallet target');
+}
 const walletBalances = await executor.readRawPairBalances(pool);
 const { funding, dustRaw: dust, stableIndex } = buildPairFundingScope(
   pool, walletBalances, config.usdgAddress, config.autoTopupDustBps
@@ -54,7 +92,7 @@ const swapPlan = await buildExactBalancedSwapPlan({
   tickLower: Number(position.tickLower),
   tickUpper: Number(position.tickUpper),
   slippageBps: config.swapSlippageBps,
-  maxPriceImpactBps: config.autoTopupMaxSwapPriceImpactBps,
+  maxPriceImpactBps: swapPolicy.maxPriceImpactBps,
   preferRemainderTokenIndex: stableIndex,
   preferredRemainderBps: stableIndex === null ? 0 : Math.min(config.autoTopupDustBps, 50)
 });
@@ -126,7 +164,7 @@ console.log(JSON.stringify({
   currentTick: validation.state.tick,
   simulatedSwapTick: swapPreview.tick,
   range: [Number(position.tickLower), Number(position.tickUpper)],
-  maximumPriceImpactBps: config.autoTopupMaxSwapPriceImpactBps,
+  maximumPriceImpactBps: swapPolicy.maxPriceImpactBps,
   quotedPriceImpactBps: swapPlan.priceImpactBps,
   swapInput: { token: swapPlan.tokenIn === 0 ? pool.token0.symbol : pool.token1.symbol,
     amount: amount(swapPlan.rawAmountIn, swapPlan.tokenIn === 0 ? pool.token0 : pool.token1) },
