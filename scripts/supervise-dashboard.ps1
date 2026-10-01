@@ -51,6 +51,7 @@ $script:dataDir = $dataDir
 $script:stateFile = $stateFile
 $script:healthUri = "http://127.0.0.1:$dashboardPort/api/health"
 $script:nodeExe = (Get-Command node.exe -ErrorAction Stop).Source
+$script:pendingExecutionReader = Join-Path $PSScriptRoot 'read-pending-execution.js'
 
 function Write-SupervisorLog {
   param(
@@ -98,9 +99,14 @@ function Get-PendingExecution {
   foreach ($file in $paths | Select-Object -Unique) {
     if (-not (Test-Path -LiteralPath $file)) { continue }
     try {
-      $state = Get-Content -LiteralPath $file -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-      $phase = [string]$state.settings.activeRebalanceExecution.phase
-      if ($phase -and $phase -notin @('completed', 'failed')) {
+      $phaseOutput = @(& $script:nodeExe $script:pendingExecutionReader $file 2>$null)
+      if ($LASTEXITCODE -ne 0 -or $phaseOutput.Count -ne 1) {
+        return @{ phase = 'state-unreadable' }
+      }
+      $phase = [string]$phaseOutput[0]
+      if ($phase -notmatch '^[a-z][a-z0-9_-]{0,63}$') { return @{ phase = 'state-unreadable' } }
+      if ($phase -eq 'none') { continue }
+      if ($phase -notin @('completed', 'failed')) {
         return @{ phase = $phase }
       }
     } catch {
