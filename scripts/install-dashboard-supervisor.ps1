@@ -4,7 +4,15 @@ $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $supervisorScript = Join-Path $PSScriptRoot 'supervise-dashboard.ps1'
 $taskName = 'AutoLPBotDashboard'
 $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$powerShellExe = (Get-Command powershell.exe -ErrorAction Stop).Source
+$launcherSource = Join-Path $PSScriptRoot 'DashboardBackgroundLauncher.cs'
+$launcherDirectory = Join-Path $repoRoot 'state\launchers'
+$sourceHash = (Get-FileHash -LiteralPath $launcherSource -Algorithm SHA256).Hash.Substring(0, 16)
+$launcherExe = Join-Path $launcherDirectory ("DashboardBackgroundLauncher-$sourceHash.exe")
+$compilerExe = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+if (-not (Test-Path -LiteralPath $compilerExe)) {
+  $compilerExe = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
+}
+if (-not (Test-Path -LiteralPath $compilerExe)) { throw 'The Windows .NET Framework compiler is unavailable.' }
 
 $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 if ($existing) {
@@ -14,8 +22,16 @@ if ($existing) {
   }
 }
 
-$arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $supervisorScript
-$action = New-ScheduledTaskAction -Execute $powerShellExe -Argument $arguments -WorkingDirectory $repoRoot
+New-Item -ItemType Directory -Path $launcherDirectory -Force | Out-Null
+# Versioned files avoid overwriting a running launcher during upgrades.
+if (-not (Test-Path -LiteralPath $launcherExe)) {
+  $candidateExe = Join-Path $launcherDirectory ('candidate-{0}.exe' -f [Guid]::NewGuid().ToString('N'))
+  & $compilerExe /nologo /target:winexe "/out:$candidateExe" $launcherSource
+  if ($LASTEXITCODE -ne 0) { throw 'Background launcher compilation failed.' }
+  Move-Item -LiteralPath $candidateExe -Destination $launcherExe
+}
+$arguments = '"{0}"' -f $supervisorScript
+$action = New-ScheduledTaskAction -Execute $launcherExe -Argument $arguments -WorkingDirectory $repoRoot
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
 $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `
