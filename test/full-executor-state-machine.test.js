@@ -101,6 +101,16 @@ function createHarness({ failSwap = false, failPreflight = false, failWithdraw =
   };
   executor.readPositionShares = async (_pool, rangeId) => rangeId === position.id ? 0n : 5_000_000_000_000_000n;
   executor.ensureSwapAllowances = async () => {};
+  executor.buildTopUpApprovalRequests = async () => [];
+  executor.simulateTopUpSwapPreview = async ({ swapPlan }) => {
+    const before = balances.at(-1);
+    const input = BigInt(swapPlan.rawAmountIn);
+    const output = BigInt(swapPlan.quote.rawAmountOut);
+    return { tick: 1100, sqrtPriceX96: getSqrtPriceAtTick(1100),
+      balances: swapPlan.tokenIn === 0
+        ? { raw0: before.raw0 - input, raw1: before.raw1 + output }
+        : { raw0: before.raw0 + output, raw1: before.raw1 - input } };
+  };
   executor.ensureHookAllowance = async () => {};
   executor.assertExactHookAllowance = async () => {};
   executor.getPinnedFeeOverrides = async () => ({ gasPrice: 1n });

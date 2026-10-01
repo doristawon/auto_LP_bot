@@ -119,7 +119,19 @@ function liveDepositFixture() {
   executor.readProvider = { async call() { return '0x'; } };
   executor.fables = {
     encodeDeposit(_pool, _range, liquidity, amount0, amount1) {
-      assert.equal(liquidity, approvedPlan.liquidity);
+      if (executor.isAllocationModeEnabled()) {
+        assert.equal(liquidity, approvedPlan.liquidity, 'allocation keeps its scoped approved plan');
+        assert.equal(amount0, approvedPlan.amount0Max);
+        assert.equal(amount1, approvedPlan.amount1Max);
+        return '0x5678';
+      }
+      const refreshedPlan = executor.buildReinvestmentDepositPlan({
+        sqrtPriceX96: getSqrtPriceAtTick(50), tickLower: -200, tickUpper: 200,
+        rawAmount0: approvedPlan.amount0Max, rawAmount1: approvedPlan.amount1Max,
+        slippageBps: 50, liquidityReserveBps: 10
+      });
+      assert.equal(liquidity, refreshedPlan.liquidity, 'liquidity uses the final in-range price');
+      assert.ok(liquidity > 0n && liquidity < approvedPlan.liquidity);
       assert.equal(amount0, approvedPlan.amount0Max);
       assert.equal(amount1, approvedPlan.amount1Max);
       return '0x5678';
@@ -139,7 +151,7 @@ function liveDepositFixture() {
   return { executor, calls };
 }
 
-test('deposit-only live top-up pins exact approved caps through an in-range price change', async () => {
+test('deposit-only live top-up pins approved caps and refits liquidity after an in-range price change', async () => {
   const { executor, calls } = liveDepositFixture();
   const result = await executor.topUpPoolPosition({ pool, position, dustBps: 25 });
   assert.equal(result.status, 'completed');

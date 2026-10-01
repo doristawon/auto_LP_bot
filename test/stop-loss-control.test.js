@@ -77,3 +77,20 @@ test('readonly scan cannot liquidate, and paused monitoring does not initiate fi
  bot.executionPaused=true;bot.maybeTopUpIdleBalance=AutoLpBot.prototype.maybeTopUpIdleBalance;
  await bot.runOnce();assert.deepEqual(calls,[]);
 });
+
+test('a completed capital cycle schedules one readonly portfolio readback without another topup',async()=>{
+ const{bot,calls,settings}=cycleHarness();
+ settings.set('stopLossSettings',{enabled:false,lossPct:15});
+ bot.maybeTopUpIdleBalance=async()=>{calls.push('topup');bot.capitalReadbackPending=true};
+ bot.runOnce=async opts=>{
+  if(opts?.source==='capital-readback'){
+   assert.equal(opts.executeRebalances,false);calls.push('capital-readback');
+  }
+  return AutoLpBot.prototype.runOnce.call(bot,opts);
+ };
+ await bot.runOnce();
+ await new Promise(resolve=>setTimeout(resolve,20));
+ assert.deepEqual(calls,['topup','capital-readback']);
+ assert.equal(bot.capitalReadbackPending,false);
+ assert.equal(bot.cycleActive,false);
+});

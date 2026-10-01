@@ -1819,11 +1819,13 @@ export class AutoLpBot {
       return snapshot;
     } finally {
       this.cycleActive = false;
-      if (this.stopLiquidationReadbackPending) {
+      if (this.stopLiquidationReadbackPending || this.capitalReadbackPending) {
+        const readbackSource = this.stopLiquidationReadbackPending ? 'auto-stop-readback' : 'capital-readback';
         this.stopLiquidationReadbackPending = false;
+        this.capitalReadbackPending = false;
         const timer = setTimeout(() => {
-          void this.runOnce({ executeRebalances: false, source: 'auto-stop-readback' })
-            .catch(error => log('warn', 'stop_loss.readback_deferred', { error: error.message }));
+          void this.runOnce({ executeRebalances: false, source: readbackSource })
+            .catch(error => log('warn', 'portfolio.readback_deferred', { source: readbackSource, error: error.message }));
         }, 0);
         timer.unref?.();
       }
@@ -2387,6 +2389,7 @@ export class AutoLpBot {
         minGasReserveWei: this.config.topUpMinGasReserveWei
       });
       if (result?.status === 'completed') {
+        this.capitalReadbackPending = true;
         this.state.setSetting('lastAction', `top-up ${pool.token0.symbol}/${pool.token1.symbol}`);
       }
       return result;
@@ -2564,6 +2567,7 @@ export class AutoLpBot {
       }
 
       clearRebalanceFailure(this.state, pool, position);
+      this.capitalReadbackPending = true;
       const cooldownUntil = Date.now() + this.config.minRebalanceIntervalSec * 1000;
       this.state.setPosition(positionStateKey(pool, position), {
         cooldownUntil,

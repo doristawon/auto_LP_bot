@@ -27,6 +27,8 @@ import { buildPairFundingScope } from '../execution/pair-funding.js';
 import { addAllocationReceiptDeltas, allocationPairCaps,
   clipAllocationPairBalances } from '../execution/allocation-funding.js';
 import { resolveTopUpSwapPolicy } from '../execution/topup-swap-policy.js';
+import { buildInventoryDepositPlan } from '../execution/inventory-deposit.js';
+import { buildRangeBalancedSwapPlan } from '../execution/range-balanced-swap.js';
 import { usdGAssetPriceFromPool } from '../analytics/allocation.js';
 import { simulateSequentialCalls } from '../execution/sequential-simulation.js';
 import {
@@ -414,21 +416,18 @@ export class RebalanceExecutor {
         this.config.tightWidthBps,
         this.config.rangePreset
       );
-      const swapPlan = await buildExactBalancedSwapPlan({
-        pool: plan.pool,
-        quoter: this.quoter,
-        rawAmount0: fundingScope.funding.raw0,
-        rawAmount1: fundingScope.funding.raw1,
-        sqrtPriceX96: postWithdrawState.sqrtPriceX96,
-        tickLower: targetAfterWithdraw.tickLower,
-        tickUpper: targetAfterWithdraw.tickUpper,
-        slippageBps: this.config.swapSlippageBps,
+      const fitted = await this.prepareRangeBalancedSwap({
+        pool: plan.pool, funding: fundingScope.funding, state: postWithdrawState,
+        target: targetAfterWithdraw, stableIndex: fundingScope.stableIndex,
         maxPriceImpactBps: rebalanceMaxImpactBps,
-        preferRemainderTokenIndex: fundingScope.stableIndex,
-        preferredRemainderBps: fundingScope.stableIndex === null ? 0 : Math.min(this.config.autoTopupDustBps ?? 25, 50)
+        chooseTarget: tick => buildTargetRange(tick, plan.pool.key.tickSpacing,
+          this.config.tightWidthBps, this.config.rangePreset)
       });
+      const swapPlan = fitted.swapPlan;
       journal = this.patchJournal(journal, {
         targetAfterWithdraw,
+        plannedFinalTarget: fitted.target,
+        balanceMismatchBps: fitted.capacityMismatchBps,
         swapPlan: serializeSwapPlan(swapPlan)
       });
 
@@ -523,13 +522,11 @@ export class RebalanceExecutor {
       }
 
       let postSwapState = await this.fables.readPoolState(plan.pool);
-      let finalTarget = buildTargetRange(
-        postSwapState.tick,
-        plan.pool.key.tickSpacing,
-        this.config.tightWidthBps,
-        this.config.rangePreset
-      );
-      let exactDeposit = buildExactDepositPlan({
+      const finalTarget = fitted.target;
+      if (!isLpInRange(postSwapState.tick, finalTarget.tickLower, finalTarget.tickUpper)) {
+        throw new Error('The simulated reinvestment range moved out of range before deposit');
+      }
+      let exactDeposit = this.buildReinvestmentDepositPlan({
         rawAmount0: strategyInventory.raw0,
         rawAmount1: strategyInventory.raw1,
         sqrtPriceX96: postSwapState.sqrtPriceX96,
@@ -538,7 +535,7 @@ export class RebalanceExecutor {
         slippageBps: this.config.depositSlippageBps,
         liquidityReserveBps: this.getDepositLiquidityReserveBps(),
         tickToleranceTicks: this.config.depositTickTolerance ?? -1
-      });
+      }, allocationScope);
       if (exactDeposit.liquidity <= 0n || exactDeposit.liquidity > MAX_UINT128) {
         throw new Error('Exact deposit liquidity is invalid');
       }
@@ -549,13 +546,10 @@ export class RebalanceExecutor {
       // Any allowance transaction, mempool delay, or swap can move the market.
       // Re-read slot0 immediately before deposit and rebuild range/liquidity/caps.
       postSwapState = await this.fables.readPoolState(plan.pool);
-      finalTarget = buildTargetRange(
-        postSwapState.tick,
-        plan.pool.key.tickSpacing,
-        this.config.tightWidthBps,
-        this.config.rangePreset
-      );
-      exactDeposit = buildExactDepositPlan({
+      if (!isLpInRange(postSwapState.tick, finalTarget.tickLower, finalTarget.tickUpper)) {
+        throw new Error('The planned reinvestment range moved out of range during approvals');
+      }
+      exactDeposit = this.buildReinvestmentDepositPlan({
         rawAmount0: minBigIntLocal(strategyInventory.raw0, approvedDepositCaps.amount0Max),
         rawAmount1: minBigIntLocal(strategyInventory.raw1, approvedDepositCaps.amount1Max),
         sqrtPriceX96: postSwapState.sqrtPriceX96,
@@ -564,7 +558,7 @@ export class RebalanceExecutor {
         slippageBps: this.config.depositSlippageBps,
         liquidityReserveBps: this.getDepositLiquidityReserveBps(),
         tickToleranceTicks: this.config.depositTickTolerance ?? -1
-      });
+      }, allocationScope);
       if (exactDeposit.liquidity <= 0n || exactDeposit.liquidity > MAX_UINT128) {
         throw new Error('Recomputed exact deposit liquidity is invalid');
       }
@@ -791,8 +785,18 @@ export class RebalanceExecutor {
 
     let swapPlan = { direction: 'not-quoted', tokenIn: null, tokenOut: null, rawAmountIn: 0n, quote: null };
     let swapQuoteError = null;
+    let swapFitPreview = null;
     if (!liveWrites || swapEnabledForPool) {
       try {
+        if (swapEnabledForPool && !allocationFundingScope) {
+          const fitted = await this.prepareRangeBalancedSwap({
+            pool, funding, state: validation.state,
+            target: { tickLower: Number(position.tickLower), tickUpper: Number(position.tickUpper) },
+            stableIndex, maxPriceImpactBps: topUpMaxPriceImpactBps
+          });
+          swapPlan = fitted.swapPlan;
+          swapFitPreview = fitted.postState;
+        } else {
         swapPlan = await buildExactBalancedSwapPlan({
           pool,
           quoter: this.quoter,
@@ -806,6 +810,7 @@ export class RebalanceExecutor {
           preferRemainderTokenIndex: stableIndex,
           preferredRemainderBps: stableIndex === null ? 0 : Math.min(Number(dustBps), 50)
         });
+        }
       } catch (error) { swapQuoteError = error.message; }
     }
     // Build the live-safe fallback from the inventory that already exists in
@@ -829,9 +834,8 @@ export class RebalanceExecutor {
       const swapApprovals = await this.buildTopUpApprovalRequests(
         pool, swapPlan, { amount0Max: 0n, amount1Max: 0n }
       );
-      optionalSwapPreview = await this.simulateTopUpSwapPreview({
-        pool, approvalRequests: swapApprovals, swapPlan
-      });
+      optionalSwapPreview = swapFitPreview?.balances ? swapFitPreview
+        : await this.simulateTopUpSwapPreview({ pool, approvalRequests: swapApprovals, swapPlan });
       if (!isLpInRange(optionalSwapPreview.tick, Number(position.tickLower), Number(position.tickUpper))) {
         throw new Error('Simulated swap moves the original LP out of range');
       }
@@ -839,7 +843,7 @@ export class RebalanceExecutor {
         || optionalSwapPreview.balances.raw1 < swapProjectedInventory.raw1 + dustRaw.raw1) {
         throw new Error('Simulated swap balances are below the conservative minOut inventory');
       }
-      optionalSwapDepositPlan = buildExactDepositPlan({
+      optionalSwapDepositPlan = this.buildReinvestmentDepositPlan({
         rawAmount0: swapProjectedInventory.raw0,
         rawAmount1: swapProjectedInventory.raw1,
         sqrtPriceX96: optionalSwapPreview.sqrtPriceX96,
@@ -848,7 +852,7 @@ export class RebalanceExecutor {
         slippageBps: this.config.depositSlippageBps,
         liquidityReserveBps: this.getDepositLiquidityReserveBps(),
         tickToleranceTicks: this.config.depositTickTolerance ?? -1
-      });
+      }, allocationFundingScope);
       this.assertValidDeposit(optionalSwapDepositPlan, 'Projected top-up deposit liquidity is invalid');
     } catch (error) {
       optionalSwapDepositPlanError = error.message;
@@ -856,7 +860,7 @@ export class RebalanceExecutor {
     let depositPlan;
     let depositOnlyError = null;
     try {
-      depositPlan = buildExactDepositPlan({
+      depositPlan = this.buildReinvestmentDepositPlan({
         rawAmount0: funding.raw0,
         rawAmount1: funding.raw1,
         sqrtPriceX96: validation.state.sqrtPriceX96,
@@ -865,7 +869,7 @@ export class RebalanceExecutor {
         slippageBps: this.config.depositSlippageBps,
         liquidityReserveBps: this.getDepositLiquidityReserveBps(),
         tickToleranceTicks: this.config.depositTickTolerance ?? -1
-      });
+      }, allocationFundingScope);
     } catch (error) {
       depositOnlyError = error.message;
     }
@@ -1189,6 +1193,18 @@ export class RebalanceExecutor {
         || BigInt(depositPlan.amount1Max) > actualInventory.raw1) {
         throw new Error('Actual inventory is below the sequentially simulated deposit caps');
       }
+      const pinnedCaps = { amount0Max: depositPlan.amount0Max, amount1Max: depositPlan.amount1Max };
+      if (!allocationFundingScope) depositPlan = {
+        ...this.buildReinvestmentDepositPlan({
+          rawAmount0: minBigIntLocal(actualInventory.raw0, pinnedCaps.amount0Max),
+          rawAmount1: minBigIntLocal(actualInventory.raw1, pinnedCaps.amount1Max),
+          sqrtPriceX96: validation.state.sqrtPriceX96,
+          tickLower: Number(position.tickLower), tickUpper: Number(position.tickUpper),
+          slippageBps: this.config.depositSlippageBps,
+          liquidityReserveBps: this.getDepositLiquidityReserveBps(),
+          tickToleranceTicks: this.config.depositTickTolerance ?? -1
+        }), ...pinnedCaps
+      };
       this.assertValidDeposit(depositPlan, 'Recomputed top-up deposit liquidity is invalid');
       await this.assertExactHookAllowance(pool.token0, pool.key.hooks, depositPlan.amount0Max);
       await this.assertExactHookAllowance(pool.token1, pool.key.hooks, depositPlan.amount1Max);
@@ -1378,7 +1394,27 @@ export class RebalanceExecutor {
     ) throw new Error(message);
   }
 
-  async simulateTopUpSwapPreview({ pool, approvalRequests, swapPlan }) {
+  buildReinvestmentDepositPlan(options, allocationScope = null) {
+    return allocationScope ? buildExactDepositPlan(options) : buildInventoryDepositPlan(options);
+  }
+
+  async prepareRangeBalancedSwap({ pool, funding, state, target, stableIndex,
+    maxPriceImpactBps, chooseTarget = null, prefixCalls = [] }) {
+    return buildRangeBalancedSwapPlan({
+      pool, quoter: this.quoter, rawAmount0: funding.raw0, rawAmount1: funding.raw1,
+      state, target, chooseTarget, maxPriceImpactBps,
+      slippageBps: this.config.swapSlippageBps,
+      preferRemainderTokenIndex: stableIndex,
+      preferredRemainderBps: stableIndex === null ? 0 : Math.min(this.config.autoTopupDustBps ?? 25, 50),
+      previewSwap: async swapPlan => {
+        const approvalRequests = await this.buildTopUpApprovalRequests(pool, swapPlan,
+          { amount0Max: 0n, amount1Max: 0n });
+        return this.simulateTopUpSwapPreview({ pool, approvalRequests, swapPlan, prefixCalls });
+      }
+    });
+  }
+
+  async simulateTopUpSwapPreview({ pool, approvalRequests, swapPlan, prefixCalls = [] }) {
     if (!swapPlan?.quote || swapPlan.direction === 'none') {
       throw new Error('A priced swap is required for the post-swap pool preview');
     }
@@ -1390,6 +1426,7 @@ export class RebalanceExecutor {
         to: tx.to, data: tx.data, value: tx.value || 0n,
         gasLimit: Number(TOP_UP_APPROVAL_GAS_RESERVE)
       })),
+      ...prefixCalls,
       {
         to: swapRequest.router, data: swapRequest.data, value: swapRequest.value,
         gasLimit: Number(TOP_UP_SWAP_GAS_LIMIT)
@@ -1406,7 +1443,7 @@ export class RebalanceExecutor {
       chainId: this.config.chainId,
       calls
     });
-    const swapResult = results[approvalRequests.length];
+    const swapResult = results[approvalRequests.length + prefixCalls.length];
     let postSwapState = null;
     for (const entry of swapResult.logs || []) {
       try {
@@ -1517,94 +1554,38 @@ export class RebalanceExecutor {
       pool, scopedPostWithdraw, this.config.usdgAddress, this.config.autoTopupDustBps ?? 25
     );
 
-    const target = buildTargetRange(
-      poolState.tick, pool.key.tickSpacing,
-      this.config.tightWidthBps, this.config.rangePreset
-    );
-    const swapPlan = await buildExactBalancedSwapPlan({
-      pool, quoter: this.quoter,
-      rawAmount0: fundingScope.funding.raw0,
-      rawAmount1: fundingScope.funding.raw1,
-      sqrtPriceX96: poolState.sqrtPriceX96,
-      tickLower: target.tickLower,
-      tickUpper: target.tickUpper,
-      slippageBps: this.config.swapSlippageBps,
-      maxPriceImpactBps,
-      preferRemainderTokenIndex: fundingScope.stableIndex,
-      preferredRemainderBps: fundingScope.stableIndex === null ? 0 : Math.min(this.config.autoTopupDustBps ?? 25, 50)
+    const target = buildTargetRange(poolState.tick, pool.key.tickSpacing,
+      this.config.tightWidthBps, this.config.rangePreset);
+    const fitted = await this.prepareRangeBalancedSwap({
+      pool, funding: fundingScope.funding, state: poolState, target,
+      stableIndex: fundingScope.stableIndex, maxPriceImpactBps,
+      prefixCalls: [withdrawCall],
+      chooseTarget: tick => buildTargetRange(tick, pool.key.tickSpacing,
+        this.config.tightWidthBps, this.config.rangePreset)
     });
-    if (swapPlan.blockedReason) {
-      throw new Error(`Sequential preflight cannot swap within price-impact limit: ${swapPlan.blockedReason}`);
-    }
-
-    let projected = fundingScope.funding;
-    let finalTarget = target;
-    let finalSqrtPriceX96 = poolState.sqrtPriceX96;
-    let swapRequest = null;
-    if (swapPlan.direction !== 'none') {
-      swapRequest = this.router.buildV4ExactInputSingle({
-        pool: swapPlan.swapPool || pool, quote: swapPlan.quote, deadline
-      });
-      const swapApprovals = await this.buildTopUpApprovalRequests(pool, swapPlan, {
-        amount0Max: 0n, amount1Max: 0n
-      });
-      const preview = await simulateSequentialCalls(this.writeProvider, {
-        ...simulationArgs,
-        calls: [
-          ...swapApprovals.map(({ tx }) => ({
-            to: tx.to, data: tx.data, value: tx.value || 0n,
-            gasLimit: Number(TOP_UP_APPROVAL_GAS_RESERVE)
-          })),
-          withdrawCall,
-          { to: swapRequest.router, data: swapRequest.data,
-            value: swapRequest.value, gasLimit: Number(TOP_UP_SWAP_GAS_LIMIT) },
-          ...balanceCalls
-        ]
-      });
-      const swapReceipt = preview[swapApprovals.length + 1];
-      let swapPrice = null;
-      for (const entry of swapReceipt.logs || []) {
-        try {
-          const event = swapEventInterface.parseLog(entry);
-          if (String(event.args.id).toLowerCase() === (swapPlan.swapPool || pool).id.toLowerCase()) {
-            swapPrice = {
-              tick: Number(event.args.tick),
-              sqrtPriceX96: BigInt(event.args.sqrtPriceX96)
-            };
-          }
-        } catch {}
-      }
-      if ((swapPlan.swapPool || pool).protocol !== 'v3'
-        && (!swapPrice || swapPrice.sqrtPriceX96 <= 0n)) {
-        throw new Error('Sequential preflight swap did not emit the selected pool price');
-      }
-      if ((swapPlan.swapPool || pool).id.toLowerCase() !== pool.id.toLowerCase()) {
-        swapPrice = { tick: poolState.tick, sqrtPriceX96: poolState.sqrtPriceX96 };
-      }
-      projected = swapPlan.tokenIn === 0
-        ? { raw0: fundingScope.funding.raw0 - swapPlan.rawAmountIn,
-            raw1: fundingScope.funding.raw1 + BigInt(swapPlan.quote.minRawAmountOut) }
-        : { raw0: fundingScope.funding.raw0 + BigInt(swapPlan.quote.minRawAmountOut),
-            raw1: fundingScope.funding.raw1 - swapPlan.rawAmountIn };
-      const postSwap = {
-        raw0: BigInt(erc20Interface.decodeFunctionResult('balanceOf', preview.at(-2).returnData)[0]),
-        raw1: BigInt(erc20Interface.decodeFunctionResult('balanceOf', preview.at(-1).returnData)[0])
-      };
+    const swapPlan = fitted.swapPlan;
+    if (swapPlan.blockedReason) throw new Error('Sequential preflight cannot swap within price-impact limit: '+swapPlan.blockedReason);
+    const projected = swapPlan.direction === 'none' ? fundingScope.funding : swapPlan.tokenIn === 0
+      ? { raw0: fundingScope.funding.raw0 - swapPlan.rawAmountIn,
+          raw1: fundingScope.funding.raw1 + BigInt(swapPlan.quote.minRawAmountOut) }
+      : { raw0: fundingScope.funding.raw0 + BigInt(swapPlan.quote.minRawAmountOut),
+          raw1: fundingScope.funding.raw1 - swapPlan.rawAmountIn };
+    const finalTarget = fitted.target;
+    const finalSqrtPriceX96 = fitted.postState.sqrtPriceX96;
+    const swapRequest = swapPlan.direction === 'none' ? null : this.router.buildV4ExactInputSingle({
+      pool: swapPlan.swapPool || pool, quote: swapPlan.quote, deadline
+    });
+    if (swapRequest) {
+      const postSwap = fitted.postState.balances;
       const actualInventory = allocationScope
-        ? operationDelta(fundingScope.dustRaw, applyScopedSwap(scopedPostWithdraw,
-          postWithdraw, postSwap, pool))
+        ? operationDelta(fundingScope.dustRaw, applyScopedSwap(scopedPostWithdraw, postWithdraw, postSwap, pool))
         : operationDelta(fundingScope.dustRaw, postSwap);
       if (actualInventory.raw0 < projected.raw0 || actualInventory.raw1 < projected.raw1) {
         throw new Error('Sequential preflight swap returned less than conservative minOut inventory');
       }
-      finalTarget = buildTargetRange(
-        swapPrice.tick, pool.key.tickSpacing,
-        this.config.tightWidthBps, this.config.rangePreset
-      );
-      finalSqrtPriceX96 = swapPrice.sqrtPriceX96;
     }
 
-    const depositPlan = buildExactDepositPlan({
+    const depositPlan = this.buildReinvestmentDepositPlan({
       rawAmount0: projected.raw0,
       rawAmount1: projected.raw1,
       sqrtPriceX96: finalSqrtPriceX96,
@@ -1613,7 +1594,7 @@ export class RebalanceExecutor {
       slippageBps: this.config.depositSlippageBps,
       liquidityReserveBps: this.getDepositLiquidityReserveBps(),
         tickToleranceTicks: this.config.depositTickTolerance ?? -1
-    });
+    }, allocationScope);
     this.assertValidDeposit(depositPlan, 'Sequential preflight deposit plan is invalid');
     const fullApprovals = await this.buildTopUpApprovalRequests(pool, swapPlan, depositPlan);
     const depositData = this.fables.encodeDeposit(

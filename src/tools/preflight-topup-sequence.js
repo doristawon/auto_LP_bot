@@ -8,9 +8,7 @@ import { loadConfig } from '../config.js';
 import { createProviders } from '../rpc/providers.js';
 import { FablesAdapter } from '../adapters/fables.js';
 import { RebalanceExecutor } from '../adapters/executor.js';
-import { buildExactBalancedSwapPlan } from '../execution/exact-rebalance.js';
 import { buildPairFundingScope } from '../execution/pair-funding.js';
-import { buildExactDepositPlan } from '../math/v4-fixed.js';
 import { resolveTopUpSwapPolicy } from '../execution/topup-swap-policy.js';
 
 loadDotEnv();
@@ -83,19 +81,12 @@ const walletBalances = await executor.readRawPairBalances(pool);
 const { funding, dustRaw: dust, stableIndex } = buildPairFundingScope(
   pool, walletBalances, config.usdgAddress, config.autoTopupDustBps
 );
-const swapPlan = await buildExactBalancedSwapPlan({
-  pool,
-  quoter: executor.quoter,
-  rawAmount0: funding.raw0,
-  rawAmount1: funding.raw1,
-  sqrtPriceX96: validation.state.sqrtPriceX96,
-  tickLower: Number(position.tickLower),
-  tickUpper: Number(position.tickUpper),
-  slippageBps: config.swapSlippageBps,
-  maxPriceImpactBps: swapPolicy.maxPriceImpactBps,
-  preferRemainderTokenIndex: stableIndex,
-  preferredRemainderBps: stableIndex === null ? 0 : Math.min(config.autoTopupDustBps, 50)
+const fitted = await executor.prepareRangeBalancedSwap({
+  pool, funding, state: validation.state,
+  target: { tickLower: Number(position.tickLower), tickUpper: Number(position.tickUpper) },
+  stableIndex, maxPriceImpactBps: swapPolicy.maxPriceImpactBps
 });
+const swapPlan = fitted.swapPlan;
 if (swapPlan.direction === 'none') {
   console.log(JSON.stringify({ ok: false, reason: swapPlan.blockedReason || 'already balanced', pair: `${pool.token0.symbol}/${pool.token1.symbol}` }));
   process.exit(1);
@@ -103,12 +94,7 @@ if (swapPlan.direction === 'none') {
 const projected = swapPlan.tokenIn === 0
   ? { raw0: funding.raw0 - swapPlan.rawAmountIn, raw1: funding.raw1 + BigInt(swapPlan.quote.minRawAmountOut) }
   : { raw0: funding.raw0 + BigInt(swapPlan.quote.minRawAmountOut), raw1: funding.raw1 - swapPlan.rawAmountIn };
-const swapApprovals = await executor.buildTopUpApprovalRequests(
-  pool, swapPlan, { amount0Max: 0n, amount1Max: 0n }
-);
-const swapPreview = await executor.simulateTopUpSwapPreview({
-  pool, approvalRequests: swapApprovals, swapPlan
-});
+const swapPreview = fitted.postState;
 if (!(position.tickLower <= swapPreview.tick && swapPreview.tick < position.tickUpper)) {
   throw new Error('Simulated swap would move the original LP out of range');
 }
@@ -116,7 +102,7 @@ if (projected.raw0 + dust.raw0 > swapPreview.balances.raw0
   || projected.raw1 + dust.raw1 > swapPreview.balances.raw1) {
   throw new Error('Simulated post-swap balances are below the conservative minOut inventory');
 }
-const depositPlan = buildExactDepositPlan({
+const depositPlan = executor.buildReinvestmentDepositPlan({
   rawAmount0: projected.raw0,
   rawAmount1: projected.raw1,
   sqrtPriceX96: swapPreview.sqrtPriceX96,
@@ -165,6 +151,10 @@ console.log(JSON.stringify({
   simulatedSwapTick: swapPreview.tick,
   range: [Number(position.tickLower), Number(position.tickUpper)],
   maximumPriceImpactBps: swapPolicy.maxPriceImpactBps,
+  capacityMismatchBps: fitted.capacityMismatchBps,
+  quoteRefinements: fitted.refinements,
+  expectedRemaining: { [pool.token0.symbol]: amount(projected.raw0 - depositPlan.required0 + dust.raw0, pool.token0),
+    [pool.token1.symbol]: amount(projected.raw1 - depositPlan.required1 + dust.raw1, pool.token1) },
   quotedPriceImpactBps: swapPlan.priceImpactBps,
   swapInput: { token: swapPlan.tokenIn === 0 ? pool.token0.symbol : pool.token1.symbol,
     amount: amount(swapPlan.rawAmountIn, swapPlan.tokenIn === 0 ? pool.token0 : pool.token1) },

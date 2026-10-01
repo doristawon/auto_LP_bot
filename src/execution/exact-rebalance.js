@@ -12,6 +12,7 @@ export async function buildExactBalancedSwapPlan({
   rawAmount0,
   rawAmount1,
   sqrtPriceX96,
+  balanceSqrtPriceX96 = sqrtPriceX96,
   tickLower,
   tickUpper,
   slippageBps = 50,
@@ -23,6 +24,7 @@ export async function buildExactBalancedSwapPlan({
   rawAmount0 = BigInt(rawAmount0);
   rawAmount1 = BigInt(rawAmount1);
   const sqrtX = BigInt(sqrtPriceX96);
+  const balanceSqrtX = BigInt(balanceSqrtPriceX96);
   if (rawAmount0 < 0n || rawAmount1 < 0n) throw new Error('Inventory amounts must be non-negative');
   if (!Number.isInteger(Number(maxPriceImpactBps)) || Number(maxPriceImpactBps) < 0 || Number(maxPriceImpactBps) >= 10_000) {
     throw new Error('maxPriceImpactBps must be an integer from 0 through 9999');
@@ -38,11 +40,11 @@ export async function buildExactBalancedSwapPlan({
   }
   const sqrtA = getSqrtPriceAtTick(tickLower);
   const sqrtB = getSqrtPriceAtTick(tickUpper);
-  if (!(sqrtA < sqrtX && sqrtX < sqrtB)) {
-    throw new Error('Target range must contain the current price before balancing inventory');
+  if (!(sqrtA < balanceSqrtX && balanceSqrtX < sqrtB)) {
+    throw new Error('Target range must contain the balancing price before balancing inventory');
   }
 
-  const initial = capacities(rawAmount0, rawAmount1, sqrtX, sqrtA, sqrtB);
+  const initial = capacities(rawAmount0, rawAmount1, balanceSqrtX, sqrtA, sqrtB);
   if (balancedEnough(initial.l0, initial.l1)) {
     return { direction: 'none', tokenIn: null, tokenOut: null, rawAmountIn: 0n, quote: null };
   }
@@ -85,7 +87,7 @@ export async function buildExactBalancedSwapPlan({
     }
     const post0 = tokenIn === 0 ? rawAmount0 - mid : rawAmount0 + out;
     const post1 = tokenIn === 1 ? rawAmount1 - mid : rawAmount1 + out;
-    const cap = capacities(post0, post1, sqrtX, sqrtA, sqrtB);
+    const cap = capacities(post0, post1, balanceSqrtX, sqrtA, sqrtB);
     const difference = targetDifference(cap);
     const score = abs(difference);
     if (!best || score < best.score) best = { score, mid, quote, post0, post1, cap, impactBps };
