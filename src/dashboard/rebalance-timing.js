@@ -19,7 +19,8 @@ export function rebalanceTiming(status, snapshot, nowMs = Date.now()) {
   const selectedId = String(status?.selectedExecutionTargetPoolId || '').toLowerCase();
   const position = active.find((item) => item.outside && String(item.poolId).toLowerCase() === selectedId)
     || active.find((item) => item.outside) || active[0];
-  if (!position.outside) return { ...base, phase: 'in-range', pair: position.pair || null };
+  if (!position.outside) return { ...base, phase: 'in-range', pair: position.pair || null,
+    targetAt: Number(status?.nextMonitorAt) > 0 ? Number(status.nextMonitorAt) : null };
 
   const outSince = Number(position.outOfRangeSince || 0);
   if (!(outSince > 0)) return { ...base, phase: 'awaiting-observation', pair: position.pair || null };

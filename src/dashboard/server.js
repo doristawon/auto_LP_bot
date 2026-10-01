@@ -59,6 +59,9 @@ export class DashboardServer {
     const ledger = bot.ledger || this.ledger;
     const pointsTracker = bot.points || this.pointsTracker;
     const rpcBot = this.fleet?.primary || bot;
+    if (req.method === 'GET' && url.pathname === '/api/execution/status') {
+      return sendJson(res, 200, bot.getExecutionStatus());
+    }
     if (req.method === 'POST' && url.pathname === '/api/wallet/live') {
       if (!this.fleet) return sendJson(res, 409, { error: '多錢包管理尚未啟用。' });
       const body = await readJsonBody(req);

@@ -39,6 +39,7 @@ test('paused, executing, stale, and in-range states do not promise a transaction
   assert.equal(rebalanceTiming(executing, snapshot(), NOW).phase, 'executing');
   assert.equal(rebalanceTiming(status(), { ...snapshot(), generatedAt: NOW - 20 * 60_000 }, NOW).phase, 'stale');
   assert.equal(rebalanceTiming(status(), snapshot({ outside: false }), NOW).phase, 'in-range');
+  assert.equal(rebalanceTiming(status(), snapshot({ outside: false }), NOW).targetAt, status().nextMonitorAt);
 });
 
 test('dashboard countdown script parses and updates once per second without polling RPC each tick', () => {

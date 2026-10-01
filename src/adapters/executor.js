@@ -44,6 +44,7 @@ import {
   assertCrossPoolWeightedQuoteCost
 } from '../execution/investment-target.js';
 import { log } from '../logger.js';
+import { describeExecutionProgress } from '../dashboard/execution-progress.js';
 
 const erc20Interface = new Interface(ERC20_ABI);
 const permit2Interface = new Interface(PERMIT2_ABI);
@@ -3525,11 +3526,20 @@ export class RebalanceExecutor {
   }
 
   saveJournal(journal) {
-    if (this.state) this.state.setSetting('activeRebalanceExecution', jsonSafe(journal));
+    if (!this.state) return;
+    const observed = !['completed', 'failed', 'recovery_required', 'tx_broadcast_pending'].includes(journal.phase)
+      ? { ...journal, lastKnownPhase: journal.phase } : journal;
+    this.state.setSetting('activeRebalanceExecution', jsonSafe(observed));
+    if (['completed', 'failed'].includes(observed.phase)) {
+      this.state.setSetting('lastExecutionProgress', describeExecutionProgress(observed));
+    }
   }
 
   patchJournal(journal, patch) {
-    const next = { ...journal, ...patch, updatedAt: Date.now() };
+    const previousPhase = journal.pendingTx?.previousPhase
+      || (['recovery_required', 'failed', 'tx_broadcast_pending'].includes(journal.phase)
+        ? journal.lastKnownPhase : journal.phase);
+    const next = { ...journal, ...patch, lastKnownPhase: previousPhase, updatedAt: Date.now() };
     this.saveJournal(next);
     return next;
   }

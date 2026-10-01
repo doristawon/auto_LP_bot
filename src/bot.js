@@ -14,6 +14,7 @@ import { PortfolioAnalytics } from './analytics/portfolio.js';
 import { evaluateStopLoss, normalizeStopLoss } from './analytics/stop-loss.js';
 import { executeStopLiquidation, reconcileStopLiquidation } from './execution/stop-liquidation.js';
 import { rebalanceTiming } from './dashboard/rebalance-timing.js';
+import { describeExecutionProgress } from './dashboard/execution-progress.js';
 import { PointsTracker } from './analytics/points-tracker.js';
 import { POINTS_DAY_MS, pointsCampaignDayStartMs } from './analytics/points.js';
 import { valueSwapFeeInUsd } from './analytics/points-accounting.js';
@@ -387,6 +388,36 @@ export class AutoLpBot {
         rangePreset: this.config.rangePreset,
         ...rangePolicySnapshot(this.config)
       }
+    };
+    status.rebalanceTiming = rebalanceTiming(status, this.snapshot, status.generatedAt);
+    status.executionProgress = this.getExecutionProgress();
+    return status;
+  }
+
+  getExecutionProgress() {
+    const active = this.state.getSetting('activeRebalanceExecution', null);
+    if (active) return describeExecutionProgress(active);
+    return this.state.getSetting('lastExecutionProgress', null);
+  }
+
+  // The two-second dashboard feed reads only in-memory state. In particular it
+  // must not call controlStatus(), guard probes, providers, or explorer APIs.
+  getExecutionStatus() {
+    const journal = this.state.getSetting('activeRebalanceExecution', null);
+    const executionBusy = Boolean(journal?.phase && !['completed', 'failed'].includes(journal.phase));
+    const updatedAt = Number(journal?.updatedAt || journal?.startedAt || 0);
+    const status = {
+      generatedAt: Date.now(), walletAddress: this.config.walletAddress,
+      executionPaused: this.executionPaused, cycleActive: this.cycleActive,
+      executionBusy, recoveryRequired: journal?.phase === 'recovery_required',
+      staleExecution: executionBusy && updatedAt > 0
+        && Date.now() - updatedAt > Math.max(5 * 60_000, (this.config.rpcRequestTimeoutMs || 30_000) * 2),
+      nextMonitorAt: this.nextMonitorAt || null,
+      selectedExecutionTargetPoolId: this.getSelectedExecutionTargetPoolId(),
+      rebalanceBackoffs: Object.values(rebalanceFailureMap(this.state))
+        .filter(entry => Date.now() < Number(entry?.nextRetryAt || 0)),
+      strategy: { ...rangePolicySnapshot(this.config) },
+      executionProgress: this.getExecutionProgress()
     };
     status.rebalanceTiming = rebalanceTiming(status, this.snapshot, status.generatedAt);
     return status;
