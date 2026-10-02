@@ -11,7 +11,7 @@ import { fetchWalletCashflowCandidates, fetchEthUsdCloseAt, fetchNativeBalanceAt
 import { buildUsdPriceMap } from './analytics/prices.js';
 import { computeAllocationFunding, normalizeInvestmentAllocation, valuePoolPositionsUsdG } from './analytics/allocation.js';
 import { PortfolioAnalytics } from './analytics/portfolio.js';
-import { evaluateStopLoss, normalizeStopLoss } from './analytics/stop-loss.js';
+import { captureLpSessionReference, evaluateStopLoss, normalizeStopLoss } from './analytics/stop-loss.js';
 import { executeStopLiquidation, reconcileStopLiquidation } from './execution/stop-liquidation.js';
 import { rebalanceTiming } from './dashboard/rebalance-timing.js';
 import { describeExecutionProgress } from './dashboard/execution-progress.js';
@@ -1163,13 +1163,15 @@ export class AutoLpBot {
   }
 
   setStopLossSettings(value) {
-    const settings = normalizeStopLoss(value);
+    const settings = normalizeStopLoss({ ...value, basisMode: value?.basisMode
+      ?? this.state.getSetting('stopLossSettings', null)?.basisMode ?? 'armed-equity' });
     if (this.stopLiquidationPromise || this.initializing || this.rpcManagementActive
       || (this.cycleActive && this.state.getSetting('stopLossLatched', false))) throw new Error('停止清倉或初始化正在執行，請稍後修改。');
     const journal = this.state.getSetting('activeRebalanceExecution', null);
     if (journal?.phase && !['completed', 'failed'].includes(journal.phase)) throw new Error('有待確認交易，無法重設停損。');
     const previous = this.state.getSetting('stopLossSettings', { enabled: false });
     const capture = settings.enabled && (!previous.enabled || value.rebase === true
+      || settings.basisMode !== (previous.basisMode || 'armed-equity')
       || !this.state.getSetting('stopLossReference', null));
     if (capture) {
       const portfolio = this.snapshot?.portfolio;
@@ -1178,15 +1180,32 @@ export class AutoLpBot {
       if (this.cycleActive || !Number.isFinite(equity) || !(equity > 0) || !Number.isFinite(age)
         || !(Number(this.snapshot?.generatedAt) > 0) || age < -30_000 || age > 15 * 60_000) throw new Error('請先完成最新且所有追蹤資產都有價格的錢包掃描，再設定啟用估值基準。');
       if (this.snapshot?.bot?.wallet && this.snapshot.bot.wallet.toLowerCase() !== this.config.walletAddress.toLowerCase()) throw new Error('停損基準的快照錢包不符，請重新掃描。');
-      this.state.setSetting('stopLossReference', { equityUsd: equity, at: this.snapshot.generatedAt,
-        asOfBlock: this.snapshot.blockNumber, netCashflowUsd: portfolio.netCashflowUsd,
-        flowAccountingComplete: portfolio.accountingComplete === true,
-        wallet: this.config.walletAddress.toLowerCase() });
+      const reference = settings.basisMode === 'lp-session'
+        ? captureLpSessionReference(this.snapshot, this.config.walletAddress)
+          || { basisMode: 'lp-session', pending: true, armedAt: Date.now(), wallet: this.config.walletAddress.toLowerCase() }
+        : { equityUsd: equity, at: this.snapshot.generatedAt,
+          asOfBlock: this.snapshot.blockNumber, netCashflowUsd: portfolio.netCashflowUsd,
+          flowAccountingComplete: portfolio.accountingComplete === true,
+          wallet: this.config.walletAddress.toLowerCase() };
+      this.state.setSetting('stopLossReference', reference);
       this.state.setSetting('stopLossLatched', false);
     }
     this.state.setSetting('stopLossSettings', settings);
     this.ledger.append('stop_loss.settings', { ...settings, rebased: capture });
     return this.getStopLossSnapshot();
+  }
+
+  capturePendingLpStopLossReference(snapshot) {
+    const settings = this.state.getSetting('stopLossSettings', null);
+    const pending = this.state.getSetting('stopLossReference', null);
+    if (settings?.enabled !== true || settings.basisMode !== 'lp-session'
+      || pending?.pending !== true || this.state.getSetting('stopLossLatched', false)) return false;
+    const reference = captureLpSessionReference(snapshot, this.config.walletAddress, { minimumAt: pending.armedAt });
+    if (!reference) return false;
+    this.state.setSetting('stopLossReference', reference);
+    this.ledger.append('stop_loss.lp_session_started', { basisAt: reference.at,
+      equityUsd: reference.equityUsd, asOfBlock: reference.asOfBlock, initialPositions: reference.initialPositions });
+    return true;
   }
 
   requestStopLiquidation({ confirm, maxCostBps = 500 } = {}) {
@@ -1805,6 +1824,7 @@ export class AutoLpBot {
         pools: targetPools.map(snapshotPool)
       };
       this.snapshot = snapshot;
+      this.capturePendingLpStopLossReference(snapshot);
       this.ledger.writeSnapshot(snapshot);
       this.recordPortfolioSnapshot(snapshot);
 

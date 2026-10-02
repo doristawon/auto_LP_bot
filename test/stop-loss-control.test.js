@@ -72,6 +72,17 @@ test('automatic stop precedes every rebalance/topup and does not automatically r
  const{bot,calls}=cycleHarness();await bot.runOnce();assert.deepEqual(calls,['exit']);assert.equal(bot.executionPaused,true);
  await bot.runOnce();assert.deepEqual(calls,['exit']);
 });
+
+test('LP-session loss across rebalancing reaches threshold and exits before another capital action',async()=>{
+ const{bot,calls,settings}=cycleHarness();
+ settings.set('stopLossSettings',{enabled:true,lossPct:15,basisMode:'lp-session'});
+ const reference={equityUsd:1000,at:Date.now(),wallet:bot.config.walletAddress,basisMode:'lp-session',initialPositions:[{rangeId:'first-range'}]};
+ settings.set('stopLossReference',reference);
+ bot.analytics.build=()=>({currentValueUsd:840,netCashflowUsd:0,accountingComplete:false,positions:[{id:'third-range',shares:'500',principalUsd:800}]});
+ await bot.runOnce();assert.deepEqual(calls,['exit']);
+ assert.equal(settings.get('stopLossReference'),reference);
+ assert.equal(bot.executionPaused,true);assert.equal(settings.get('stopLossLatched'),true);
+});
 test('readonly scan cannot liquidate, and paused monitoring does not initiate financial operations',async()=>{
  const{bot,calls}=cycleHarness();await bot.runOnce({executeRebalances:false});assert.deepEqual(calls,[]);
  bot.executionPaused=true;bot.maybeTopUpIdleBalance=AutoLpBot.prototype.maybeTopUpIdleBalance;

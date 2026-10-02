@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AbiCoder, Interface } from 'ethers';
-import { evaluateStopLoss, normalizeStopLoss } from '../src/analytics/stop-loss.js';
+import { captureLpSessionReference, evaluateStopLoss, normalizeStopLoss } from '../src/analytics/stop-loss.js';
 import { executeStopLiquidation, reconcileStopLiquidation } from '../src/execution/stop-liquidation.js';
 import { AutoLpBot } from '../src/bot.js';
 import { UniversalRouterAdapter } from '../src/adapters/universal-router.js';
@@ -40,6 +40,35 @@ test('risk settings reject malformed ranges and keep the chosen reference mode',
   for(const lossPct of [0,100,NaN])assert.throws(()=>normalizeStopLoss({enabled:true,lossPct}));
   assert.throws(()=>normalizeStopLoss({enabled:'true',lossPct:15}));
   assert.equal(normalizeStopLoss({enabled:true,lossPct:15}).basisMode,'armed-equity');
+  assert.equal(normalizeStopLoss({enabled:true,lossPct:15,basisMode:'lp-session'}).version,2);
+  assert.throws(()=>normalizeStopLoss({enabled:true,lossPct:15,basisMode:'per-rebalance'}));
+});
+
+function withLp(s, id='range-one'){
+  return {...s,portfolio:{...s.portfolio,positions:[{id,poolId:'pool-one',shares:'100',principalUsd:950}]}};
+}
+test('LP session starts only with a fresh, positive confirmed LP and full portfolio valuation',()=>{
+  const s=withLp(snapshot(1000));
+  const reference=captureLpSessionReference(s,W,{now});
+  assert.equal(reference.equityUsd,1000);assert.equal(reference.basisMode,'lp-session');
+  assert.equal(reference.initialPositions[0].rangeId,'range-one');
+  assert.equal(captureLpSessionReference(snapshot(1000),W,{now}),null);
+  assert.equal(captureLpSessionReference(s,W,{now,minimumAt:now+1}),null);
+  assert.equal(captureLpSessionReference({...s,generatedAt:now-901000},W,{now}),null);
+  assert.equal(captureLpSessionReference(s,A,{now}),null);
+  assert.equal(captureLpSessionReference(withLp(snapshot(null)),W,{now}),null);
+  const invalid=withLp(snapshot(1000));invalid.portfolio.positions[0].shares='invalid';
+  assert.equal(captureLpSessionReference(invalid,W,{now}),null);
+});
+test('LP session tracks total capital through new ranges, idle balances, fees and transaction losses',()=>{
+  const reference=captureLpSessionReference(withLp(snapshot(1000)),W,{now});
+  const risk={enabled:true,lossPct:15,basisMode:'lp-session'};
+  const next=withLp(snapshot(850),'range-after-rebalance');
+  assert.equal(evaluateStopLoss(risk,reference,next,now).triggered,true);
+  assert.equal(evaluateStopLoss(risk,reference,withLp(snapshot(850.1),'range-three'),now).triggered,false);
+  assert.equal(evaluateStopLoss(risk,{pending:true},snapshot(1000),now).status,'waiting-lp');
+  assert.equal(evaluateStopLoss(risk,{pending:true},next,now).status,'unavailable');
+  assert.equal(evaluateStopLoss(risk,ref,next,now).status,'unavailable');
 });
 function botFixture(){
   const store=new Map(),bot=Object.create(AutoLpBot.prototype);
@@ -49,6 +78,31 @@ function botFixture(){
   bot.executor={assertNoUnfinishedExecution(){}};
   return{bot,store};
 }
+test('pending LP baseline captures exactly once and survives rebalance, threshold edits and resumed workers',()=>{
+  const{bot,store}=botFixture();
+  bot.setStopLossSettings({enabled:true,lossPct:15,basisMode:'lp-session',rebase:true});
+  const pending=store.get('stopLossReference');assert.equal(pending.pending,true);
+  assert.equal(bot.getStopLossSnapshot().status,'waiting-lp');
+  const current=withLp({...bot.snapshot,generatedAt:pending.armedAt+1});
+  assert.equal(bot.capturePendingLpStopLossReference(current),true);
+  const reference=store.get('stopLossReference');assert.equal(reference.equityUsd,1000);
+  bot.snapshot=withLp({...current,portfolio:{...current.portfolio,currentValueUsd:910}},'next-range');
+  assert.equal(bot.capturePendingLpStopLossReference(bot.snapshot),false);
+  bot.setStopLossSettings({enabled:true,lossPct:10});
+  assert.equal(store.get('stopLossSettings').basisMode,'lp-session');
+  assert.equal(store.get('stopLossReference'),reference);
+  const resumed=Object.create(AutoLpBot.prototype);Object.assign(resumed,{state:bot.state,config:bot.config,snapshot:bot.snapshot});
+  assert.equal(resumed.getStopLossSnapshot().principalUsd,1000);
+  assert.equal(resumed.capturePendingLpStopLossReference(bot.snapshot),false);
+});
+test('switching an existing LP to session mode resets the old stop latch only on explicit rearming',()=>{
+  const{bot,store}=botFixture();bot.setStopLossSettings({enabled:true,lossPct:15});
+  store.set('stopLossLatched',true);bot.snapshot=withLp(bot.snapshot);
+  bot.setStopLossSettings({enabled:true,lossPct:15,basisMode:'lp-session',rebase:true});
+  assert.equal(store.get('stopLossLatched'),false);
+  assert.equal(store.get('stopLossReference').basisMode,'lp-session');
+  assert.equal(store.get('stopLossReference').pending,undefined);
+});
 test('arming persists a wallet reference; changing threshold preserves it and disabled does not erase latch',()=>{
   const{bot,store}=botFixture();bot.setStopLossSettings({enabled:true,lossPct:15});
   const reference=store.get('stopLossReference');assert.equal(reference.equityUsd,1000);assert.equal(reference.wallet,W);
