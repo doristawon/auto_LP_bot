@@ -14,6 +14,15 @@ test('atomic deposit mode requires guard v2', () => {
     /requires Fables7702Guard\/v2/);
 });
 
+test('official reposition requires v3 while legacy and atomic modes retain their supported versions', () => {
+  assert.equal(assertGuardVersion(GUARD_VERSION_IDS.v3, { officialRepositionEnabled: true }), 'v3');
+  assert.throws(() => assertGuardVersion(GUARD_VERSION_IDS.v2, { officialRepositionEnabled: true }),
+    /requires Fables7702Guard\/v3/);
+  assert.equal(assertGuardVersion(GUARD_VERSION_IDS.v3, { atomicDepositEnabled: true }), 'v3');
+  assert.equal(assertGuardVersion(GUARD_VERSION_IDS.v2, { atomicDepositEnabled: true }), 'v2');
+  assert.equal(assertGuardVersion(GUARD_VERSION_IDS.v1, { atomicDepositEnabled: false }), 'v1');
+});
+
 test('unknown or malformed guard versions fail closed', () => {
   assert.throws(() => assertGuardVersion('0x1234'), /Unexpected EIP-7702 guard version/);
   assert.throws(() => assertGuardVersion(null), /Unexpected EIP-7702 guard version/);

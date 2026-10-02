@@ -51,7 +51,10 @@ export const PERMIT2_ABI = [
 export const EIP7702_GUARD_ABI = [
   `function guardVersion() view returns(bytes32)`,
   `function IMPLEMENTATION() view returns(address)`,
+  'function isValidSignature(bytes32 digest,bytes signature) view returns(bytes4)',
   `function guardedWithdrawAndClaim(${POOL_KEY_TUPLE} key,int24 tickLower,int24 tickUpper,uint128 liquidity,address recipient,uint128 amount0Min,uint128 amount1Min,uint256 deadline,uint16 walk)`,
   `function atomicSwapAndDeposit((${POOL_KEY_TUPLE} key,int24 tickLower,int24 tickUpper,uint256 expectedBalance0,uint256 expectedBalance1,uint128 funding0,uint128 funding1,uint8 tokenIn,bytes32 swapPoolId,uint128 amountIn,uint128 minOut,uint128 minLiquidity,uint16 maxResidualBps,uint256 deadline,bytes routerData) plan)`,
+  'function guardedRepositionAndClaim((uint256 expectedBalance0,uint256 expectedBalance1,uint256 funding0,uint256 funding1,int24[] claimLower,int24[] claimUpper,uint16 walk,uint16 maxResidualBps,bytes routerData) plan)',
+  'event OfficialRepositioned(bytes32 indexed poolId,uint256 indexed oldRangeId,uint256 indexed newRangeId,uint128 liquidity,uint256 claimed0,uint256 claimed1,uint256 residual0,uint256 residual1)',
   'event AtomicDeposited(bytes32 indexed poolId,uint128 liquidity,uint128 funding0,uint128 funding1,uint256 residual0,uint256 residual1)'
 ];

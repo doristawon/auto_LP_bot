@@ -126,6 +126,32 @@ test('atomic deposit-only mode labels its single receipt without showing swap as
   assert.equal(progress.transactions[0].label, '一次存入 LP');
 });
 
+test('official reposition progress deduplicates its one hash and keeps uncertain sends unknown', () => {
+  const officialHash = hash('7');
+  const sent = describeExecutionProgress({ ...journal('official_sent'),
+    tx: { officialReposition: officialHash }, pendingTx: { hash: officialHash,
+      label: 'guardedRepositionAndClaim', previousPhase: 'official_preflighted' } });
+  assert.equal(sent.label, '再平衡');
+  assert.deepEqual(sent.steps.map(item => item.key), ['preflight', 'officialReposition', 'verify']);
+  assert.equal(sent.steps[1].label, '領取手續費＋官方一次再平衡');
+  assert.equal(sent.transactions.length, 1);
+  assert.equal(sent.transactions[0].hash, officialHash);
+  assert.equal(sent.transactions[0].status, 'pending');
+
+  const uncertain = describeExecutionProgress({ ...journal('recovery_required'),
+    lastKnownPhase: 'official_sent', tx: { officialReposition: officialHash } });
+  assert.equal(uncertain.status, 'recovery');
+  assert.equal(uncertain.transactions.length, 1);
+  assert.equal(uncertain.transactions[0].status, 'unknown');
+  assert.notEqual(uncertain.status, 'completed');
+
+  const confirmed = describeExecutionProgress({ ...journal('official_confirmed'),
+    tx: { officialReposition: officialHash } });
+  assert.equal(confirmed.transactions.length, 1);
+  assert.equal(confirmed.transactions[0].status, 'confirmed');
+  assert.equal(confirmed.steps[2].status, 'active');
+});
+
 function botFixture(active = null) {
   const settings = new Map([['activeRebalanceExecution', active]]);
   const bot = Object.create(AutoLpBot.prototype);

@@ -10,7 +10,7 @@ const BASE = {
 };
 
 function withEnv(extra, fn) {
-  const keys = new Set([...Object.keys(BASE), ...Object.keys(extra), 'TARGET_POOL_IDS', 'TARGET_SYMBOLS', 'TARGET_MODE', 'SWAP_SLIPPAGE_BPS', 'MAX_SWAP_PRICE_IMPACT_BPS', 'OOR_REBALANCE_SWAP_POOL_ID', 'OOR_REBALANCE_MAX_SWAP_PRICE_IMPACT_BPS', 'OOR_CONFIRM_DELAY_MIN', 'OOR_MAX_WAIT_MIN', 'AUTO_TOPUP_SWAP_ENABLED', 'AUTO_TOPUP_SWAP_POOL_ID', 'AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS', 'PRIVATE_KEY', 'EIP7702_GUARD_ADDRESS', 'EIP7702_GUARD_VERIFIED', 'EIP7702_GUARD_VERIFIED_FOR', 'DASHBOARD_MANUAL_CONTROL_ENABLED', 'POINTS_GLOBAL_SWAP_SCAN_ENABLED', 'RPC_REQUEST_TIMEOUT_MS']);
+  const keys = new Set([...Object.keys(BASE), ...Object.keys(extra), 'TARGET_POOL_IDS', 'TARGET_SYMBOLS', 'TARGET_MODE', 'SWAP_SLIPPAGE_BPS', 'MAX_SWAP_PRICE_IMPACT_BPS', 'OOR_REBALANCE_SWAP_POOL_ID', 'OOR_REBALANCE_MAX_SWAP_PRICE_IMPACT_BPS', 'OOR_CONFIRM_DELAY_MIN', 'OOR_MAX_WAIT_MIN', 'AUTO_TOPUP_SWAP_ENABLED', 'AUTO_TOPUP_SWAP_POOL_ID', 'AUTO_TOPUP_MAX_SWAP_PRICE_IMPACT_BPS', 'PRIVATE_KEY', 'EIP7702_GUARD_ADDRESS', 'EIP7702_GUARD_VERIFIED', 'EIP7702_GUARD_VERIFIED_FOR', 'OFFICIAL_REPOSITION_ENABLED', 'OFFICIAL_REPOSITION_WALLETS', 'OFFICIAL_EIP7702_GUARD_ADDRESS', 'DASHBOARD_MANUAL_CONTROL_ENABLED', 'POINTS_GLOBAL_SWAP_SCAN_ENABLED', 'RPC_REQUEST_TIMEOUT_MS']);
   const previous = Object.fromEntries([...keys].map((k) => [k, process.env[k]]));
   try {
     for (const key of keys) delete process.env[key];
@@ -65,6 +65,25 @@ test('OOR confirmation defaults to 15 minutes and ignores legacy max wait', () =
   assert.equal(config.oorConfirmDelayMin, 15);
   assert.equal(config.oorConfirmDelayMs, 15 * 60_000);
   assert.throws(() => withEnv({ OOR_CONFIRM_DELAY_MIN: '0' }, loadConfig), /OOR_CONFIRM_DELAY_MIN/);
+});
+
+test('official reposition defaults off and requires its v3 guard pin for the selected wallet', () => {
+  const config = withEnv({ TARGET_MODE: 'wallet-active' }, loadConfig);
+  assert.equal(config.officialRepositionFeatureEnabled, false);
+  assert.equal(config.officialRepositionEnabled, false);
+  assert.equal(config.officialEip7702GuardAddress, '');
+  assert.throws(() => withEnv({ OFFICIAL_REPOSITION_ENABLED: 'true' }, loadConfig),
+    /requires OFFICIAL_EIP7702_GUARD_ADDRESS/);
+});
+
+test('official guard pin is wallet scoped when the feature allowlist selects another wallet', () => {
+  const secondary = '0x0000000000000000000000000000000000000005';
+  const config = withEnv({ OFFICIAL_REPOSITION_ENABLED: 'true',
+    OFFICIAL_REPOSITION_WALLETS: secondary,
+    OFFICIAL_EIP7702_GUARD_ADDRESS: '0x0000000000000000000000000000000000000099' }, loadConfig);
+  assert.equal(config.officialRepositionFeatureEnabled, true);
+  assert.equal(config.officialRepositionEnabled, false);
+  assert.equal(config.eip7702GuardAddress, '');
 });
 
 test('invalid swap slippage fails closed', () => {

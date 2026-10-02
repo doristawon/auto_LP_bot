@@ -58,6 +58,11 @@ export function loadConfig() {
   const legacyEip7702GuardAddress = optionalAddress('LEGACY_EIP7702_GUARD_ADDRESS');
   const atomicDepositEnabled = atomicDepositFeatureEnabled
     && atomicDepositWallets.some(address => address.toLowerCase() === walletAddress.toLowerCase());
+  const officialRepositionFeatureEnabled = envBool('OFFICIAL_REPOSITION_ENABLED', false);
+  const officialRepositionWallets = envList('OFFICIAL_REPOSITION_WALLETS', [walletAddress]).map(getAddress);
+  const officialEip7702GuardAddress = optionalAddress('OFFICIAL_EIP7702_GUARD_ADDRESS');
+  const officialRepositionEnabled = officialRepositionFeatureEnabled
+    && officialRepositionWallets.some(address => address.toLowerCase() === walletAddress.toLowerCase());
   const eip7702GuardVerifiedFor = optionalAddress('EIP7702_GUARD_VERIFIED_FOR');
   const eip7702GuardVerificationEnabled = envBool('EIP7702_GUARD_VERIFIED', false);
   const eip7702GuardVerified = eip7702GuardVerificationEnabled
@@ -138,6 +143,9 @@ export function loadConfig() {
   if (!dryRun && enableAutoRedeploy && (!eip7702GuardAddress || !eip7702GuardVerified)) {
     throw new Error('Live auto-redeploy requires a deployed and canary-verified EIP-7702 atomic OOR guard');
   }
+  if (officialRepositionEnabled && !officialEip7702GuardAddress) {
+    throw new Error('OFFICIAL_REPOSITION_ENABLED for this wallet requires OFFICIAL_EIP7702_GUARD_ADDRESS');
+  }
 
   return {
     chainId: CHAIN_ID,
@@ -196,13 +204,18 @@ export function loadConfig() {
     depositTickTolerance,
     fablesWalk: envInt('FABLES_WALK', 1000),
     permit2ExpirationSec: envInt('PERMIT2_EXPIRATION_SEC', 30 * 24 * 60 * 60),
-    eip7702GuardAddress: atomicDepositFeatureEnabled && !atomicDepositEnabled && legacyEip7702GuardAddress
-      ? legacyEip7702GuardAddress : eip7702GuardAddress,
+    eip7702GuardAddress: officialRepositionEnabled ? officialEip7702GuardAddress
+      : atomicDepositFeatureEnabled && !atomicDepositEnabled && legacyEip7702GuardAddress
+        ? legacyEip7702GuardAddress : eip7702GuardAddress,
     atomicEip7702GuardAddress: eip7702GuardAddress,
     atomicDepositEnabled,
     atomicDepositFeatureEnabled,
     atomicDepositWallets,
     legacyEip7702GuardAddress,
+    officialRepositionEnabled,
+    officialRepositionFeatureEnabled,
+    officialRepositionWallets,
+    officialEip7702GuardAddress,
     eip7702GuardVerified,
     eip7702GuardVerificationEnabled,
     eip7702GuardVerifiedFor,

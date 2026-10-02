@@ -115,6 +115,27 @@ test('progress renders backend steps, elapsed time and localized pending transac
   assert.doesNotMatch(elements.get('executionProgressMeta').textContent, /oor-rebalance/);
 });
 
+test('official reposition progress renders its combined step and a single pending transaction', () => {
+  const { ctx, elements } = harness();
+  const officialHash = '0x' + '7'.repeat(64);
+  ctx.executionStatusWallet = ctx.selectedWalletAddress.toLowerCase();
+  ctx.executionStatus = { walletAddress: ctx.selectedWalletAddress, generatedAt: 6000,
+    executionProgress: { label: '再平衡', kind: 'rebalance', status: 'running',
+      currentStepLabel: '領取手續費＋官方一次再平衡', message: '交易已送出，等待確認。',
+      steps: [{ key: 'preflight', label: '預檢', status: 'completed' },
+        { key: 'officialReposition', label: '領取手續費＋官方一次再平衡', status: 'active' },
+        { key: 'verify', label: '核對', status: 'pending' }],
+      transactions: [{ step: 'officialReposition', label: '領取手續費＋官方一次再平衡',
+        hash: officialHash, status: 'pending' }] } };
+  vm.runInContext('renderExecutionProgress()', ctx);
+  assert.equal(elements.get('executionProgressTitle').textContent, '再平衡');
+  assert.equal(elements.get('executionCurrentStep').textContent,
+    '目前步驟：領取手續費＋官方一次再平衡');
+  assert.match(elements.get('executionSteps').innerHTML, /領取手續費＋官方一次再平衡/);
+  assert.equal((elements.get('executionTransactions').innerHTML.match(/execution-tx/g) || []).length, 1);
+  assert.match(elements.get('executionTransactions').innerHTML, /等待確認/);
+});
+
 test('a fresh scan does not present the previous completed execution as currently running', () => {
   const { ctx, elements } = harness();
   const wallet = ctx.selectedWalletAddress;

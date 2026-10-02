@@ -26,6 +26,7 @@ const abiCoder = AbiCoder.defaultAbiCoder();
 const hookInterface = new Interface(HOOK_ABI);
 const depositedTopic = eventId(DEPOSITED_EVENT);
 const withdrawnTopic = eventId(WITHDRAWN_EVENT);
+const rangeTransferTopic = eventId('Transfer(address,address,address,uint256,uint256)');
 const feesTopic = eventId(FEES_COLLECTED_EVENT);
 const swapInterface = new Interface([
   'event Swap(bytes32 indexed id,address indexed sender,int128 amount0,int128 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint24 fee)'
@@ -98,15 +99,26 @@ export class FablesAdapter {
       }
     }
 
-    if (fromBlock <= latestBlock) {
+    if (fromBlock <= latestBlock && hookAddresses.size) {
       const walletTopic = zeroPadValue(this.config.walletAddress, 32).toLowerCase();
-      const logs = await this.getLogsAdaptive({
-        address: [...hookAddresses.values()],
-        topics: [[depositedTopic, withdrawnTopic], walletTopic]
-      }, fromBlock, latestBlock);
+      const hooks = [...hookAddresses.values()];
+      const [logs, transferLogs] = await Promise.all([
+        this.getLogsAdaptive({
+          address: hooks,
+          topics: [[depositedTopic, withdrawnTopic], walletTopic]
+        }, fromBlock, latestBlock),
+        this.getWalletRangeTransferLogs(hooks, walletTopic, fromBlock, latestBlock)
+      ]);
       for (const item of logs) {
         const hookAddress = hookAddresses.get(String(item.address || '').toLowerCase());
         const rangeId = item.topics?.[2]?.toLowerCase();
+        if (!hookAddress || !rangeId) continue;
+        const key = rangeCandidateKey(hookAddress, rangeId);
+        candidates.set(key, { hook: hookAddress, rangeId });
+      }
+      for (const item of transferLogs) {
+        const hookAddress = hookAddresses.get(String(item.address || '').toLowerCase());
+        const rangeId = item.topics?.[3]?.toLowerCase();
         if (!hookAddress || !rangeId) continue;
         const key = rangeCandidateKey(hookAddress, rangeId);
         candidates.set(key, { hook: hookAddress, rangeId });
@@ -251,11 +263,15 @@ export class FablesAdapter {
       this.positionCandidates.set(key, candidates);
     }
     const walletTopic = zeroPadValue(this.config.walletAddress, 32).toLowerCase();
-    const logs = await this.getLogsAdaptive({
-      address: pool.key.hooks,
-      topics: [[depositedTopic, withdrawnTopic], walletTopic]
-    }, fromBlock, latestBlock);
+    const [logs, transferLogs] = await Promise.all([
+      this.getLogsAdaptive({
+        address: pool.key.hooks,
+        topics: [[depositedTopic, withdrawnTopic], walletTopic]
+      }, fromBlock, latestBlock),
+      this.getWalletRangeTransferLogs([pool.key.hooks], walletTopic, fromBlock, latestBlock)
+    ]);
     for (const item of logs) if (item.topics[2]) candidates.add(item.topics[2].toLowerCase());
+    for (const item of transferLogs) if (item.topics?.[3]) candidates.add(item.topics[3].toLowerCase());
 
     const hook = new Contract(pool.key.hooks, HOOK_ABI, this.provider);
     const positions = [];
@@ -282,6 +298,32 @@ export class FablesAdapter {
       item.topics?.[2] && matchingRangeIds.has(item.topics[2].toLowerCase())
     );
     return { positions, lifecycleLogs };
+  }
+
+  async getWalletRangeTransferLogs(hooks, walletTopic, fromBlock, toBlock) {
+    if (!hooks?.length || fromBlock > toBlock) return [];
+    const [outgoing, incoming] = await Promise.all([
+      this.getLogsAdaptive({
+        address: hooks,
+        topics: [rangeTransferTopic, walletTopic]
+      }, fromBlock, toBlock),
+      this.getLogsAdaptive({
+        address: hooks,
+        topics: [rangeTransferTopic, null, walletTopic]
+      }, fromBlock, toBlock)
+    ]);
+    const unique = new Map();
+    for (const entry of [...outgoing, ...incoming]) {
+      const key = [
+        String(entry.address || '').toLowerCase(),
+        String(entry.blockHash || '').toLowerCase(),
+        String(entry.transactionHash || '').toLowerCase(),
+        String(entry.index ?? entry.logIndex ?? ''),
+        String(entry.topics?.[3] || '').toLowerCase()
+      ].join(':');
+      unique.set(key, entry);
+    }
+    return [...unique.values()];
   }
 
   async scanGlobalSwaps(pools, fromBlock, toBlock) {

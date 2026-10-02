@@ -593,3 +593,9 @@ npm test
 換幣已成功而存入有確認失敗紀錄時，若現有兩種代幣皆能組成 LP，恢復會先直接存入原有代幣，再由後續加倉處理剩餘額度，避免恢復時重複換幣。完成存入後會清除這個恢復偏好。
 
 The dashboard can store a per-wallet allocation across up to two supported USDG-denominated Fables ERC20 pools. Weights are integer basis points totaling 10,000. Saving a configuration changes strategy settings only; it does not submit a transaction. Fresh capital estimates come from the existing scan cycle and may remain pending until the next valuation refresh. Allocation mode handles OOR reconstruction within each pool and does not withdraw healthy LP solely to restore target weights. The single-pool APR and immediate-rotation controls are disabled while allocation mode is active.
+
+## 官方同池 Reposition 與自動 Claim
+
+啟用 v3 guard 的錢包，可在既有 OOR 確認完成後比較原流程、官方 Fables 原生路徑及 Kyber 路徑。完整模擬以同區塊狀態核對新 LP、錢包餘額與 Gas，扣除額外領取的歷史費用後，只有淨結果較好才採用官方方法；否則沿用既有流程。
+
+官方方法把同池費用 Claim、撤池、換幣與一次加池放在同一筆交易。中控台以「領取手續費＋官方一次再平衡」顯示實際 hash 與確認進度。手動暫停、ETH 保留額、停損及 15 分鐘 OOR 確認維持原設定。預設關閉；設定與成本比較詳見 [官方 Reposition 成本與整合](docs/OFFICIAL_REPOSITION_COST_AND_INTEGRATION.md)。

@@ -1,0 +1,1774 @@
+[
+  {
+    "inputs": [],
+    "name": "AggregatorFailed",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "name": "target",
+        "type": "address"
+      }
+    ],
+    "name": "AggregatorNotAllowed",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "AlreadyProposed",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "name": "amount",
+        "type": "uint256"
+      },
+      {
+        "name": "held",
+        "type": "uint256"
+      }
+    ],
+    "name": "AmountAboveBalance",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "BadConfig",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "BadRecipient",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "BadShare",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "BadSolverParams",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "DepositPriceMoved",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "DestinationMoved",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "EmptyRoute",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "Expired",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "name": "rate",
+        "type": "uint16"
+      },
+      {
+        "name": "max",
+        "type": "uint16"
+      }
+    ],
+    "name": "FeeAboveCallerMax",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "FeeRecipientZero",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "FeeTooHigh",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "name": "hook",
+        "type": "address"
+      }
+    ],
+    "name": "HookNotAllowed",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "name": "spent",
+        "type": "uint256"
+      },
+      {
+        "name": "offered",
+        "type": "uint256"
+      }
+    ],
+    "name": "HopDidNotFill",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvalidTicks",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "LandedTheOtherLeg",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "LandingTradesDestination",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NativeSendFailed",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NotFeeSetter",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NotPermitDoor",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NotPoolManager",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NotProposed",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NotSelf",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NothingToDeposit",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "name": "owner",
+        "type": "address"
+      }
+    ],
+    "name": "OwnableInvalidOwner",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "name": "account",
+        "type": "address"
+      }
+    ],
+    "name": "OwnableUnauthorizedAccount",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "OwnershipNotRenounceable",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "name": "left",
+        "type": "uint256"
+      }
+    ],
+    "name": "PermitUnspent",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "name": "sqrtPriceX96",
+        "type": "uint160"
+      },
+      {
+        "name": "sqrtPriceMinX96",
+        "type": "uint160"
+      },
+      {
+        "name": "sqrtPriceMaxX96",
+        "type": "uint160"
+      }
+    ],
+    "name": "PriceOutOfBand",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "name": "expiredAt",
+        "type": "uint256"
+      }
+    ],
+    "name": "ProposalExpired",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ReceiptNotDelivered",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ReentrancyGuardReentrantCall",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256"
+      }
+    ],
+    "name": "RemainderUnrouted",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "RouteDoesNotChain",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "RouteTooLong",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address"
+      }
+    ],
+    "name": "SafeERC20FailedOperation",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "TokenNotInPool",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "name": "readyAt",
+        "type": "uint256"
+      }
+    ],
+    "name": "TooEarly",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "name": "got",
+        "type": "uint128"
+      },
+      {
+        "name": "min",
+        "type": "uint128"
+      }
+    ],
+    "name": "TooLittleLiquidity",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "name": "got",
+        "type": "uint256"
+      },
+      {
+        "name": "min",
+        "type": "uint256"
+      }
+    ],
+    "name": "TooLittleOut",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "TooManyLegs",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "UseReposition",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "UseZapIn",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "UseZapOut",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "WrongDirection",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "WrongValue",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ZeroFloor",
+    "type": "error"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "currency",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "amount",
+        "type": "uint256"
+      }
+    ],
+    "name": "FeeTaken",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "fromRangeId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "toRangeId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "liquidity",
+        "type": "uint128"
+      },
+      {
+        "indexed": false,
+        "name": "add0",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "add1",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "leftover0",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "leftover1",
+        "type": "uint256"
+      }
+    ],
+    "name": "Repositioned",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "sell",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "buy",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "venue",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "amountIn",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "amountOut",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "fee",
+        "type": "uint256"
+      }
+    ],
+    "name": "Routed",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "rangeId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "liquidity",
+        "type": "uint128"
+      },
+      {
+        "indexed": false,
+        "name": "amount0",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "amount1",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "leftover0",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "leftover1",
+        "type": "uint256"
+      }
+    ],
+    "name": "ZappedIn",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "rangeId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "tokenIn",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "amountIn",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "liquidity",
+        "type": "uint128"
+      },
+      {
+        "indexed": false,
+        "name": "fee",
+        "type": "uint256"
+      }
+    ],
+    "name": "ZappedInFrom",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "rangeId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "tokenOut",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "amountOut",
+        "type": "uint256"
+      }
+    ],
+    "name": "ZappedOut",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "rangeId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "tokenOut",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "amountOut",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "fee",
+        "type": "uint256"
+      }
+    ],
+    "name": "ZappedOutTo",
+    "type": "event"
+  },
+  {
+    "inputs": [
+      {
+        "name": "target",
+        "type": "address"
+      },
+      {
+        "name": "selector",
+        "type": "bytes4"
+      }
+    ],
+    "name": "aggregatorSpender",
+    "outputs": [
+      {
+        "name": "spender",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "components": [
+          {
+            "components": [
+              {
+                "name": "currency0",
+                "type": "address"
+              },
+              {
+                "name": "currency1",
+                "type": "address"
+              },
+              {
+                "name": "fee",
+                "type": "uint24"
+              },
+              {
+                "name": "tickSpacing",
+                "type": "int24"
+              },
+              {
+                "name": "hooks",
+                "type": "address"
+              }
+            ],
+            "name": "key",
+            "type": "tuple"
+          },
+          {
+            "name": "tickLower",
+            "type": "int24"
+          },
+          {
+            "name": "tickUpper",
+            "type": "int24"
+          },
+          {
+            "name": "amount0",
+            "type": "uint256"
+          },
+          {
+            "name": "amount1",
+            "type": "uint256"
+          },
+          {
+            "name": "minLiquidity",
+            "type": "uint128"
+          },
+          {
+            "name": "deadline",
+            "type": "uint256"
+          },
+          {
+            "name": "recipient",
+            "type": "address"
+          },
+          {
+            "name": "sqrtPriceMinX96",
+            "type": "uint160"
+          },
+          {
+            "name": "sqrtPriceMaxX96",
+            "type": "uint160"
+          }
+        ],
+        "name": "p",
+        "type": "tuple"
+      }
+    ],
+    "name": "depositBoth",
+    "outputs": [
+      {
+        "name": "liquidity",
+        "type": "uint128"
+      }
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "components": [
+          {
+            "name": "currency0",
+            "type": "address"
+          },
+          {
+            "name": "currency1",
+            "type": "address"
+          },
+          {
+            "name": "fee",
+            "type": "uint24"
+          },
+          {
+            "name": "tickSpacing",
+            "type": "int24"
+          },
+          {
+            "name": "hooks",
+            "type": "address"
+          }
+        ],
+        "name": "key",
+        "type": "tuple"
+      },
+      {
+        "name": "tickLower",
+        "type": "int24"
+      },
+      {
+        "name": "tickUpper",
+        "type": "int24"
+      },
+      {
+        "name": "shares",
+        "type": "uint128"
+      }
+    ],
+    "name": "depthShare",
+    "outputs": [
+      {
+        "name": "callerLiquidity",
+        "type": "uint128"
+      },
+      {
+        "name": "poolLiquidity",
+        "type": "uint128"
+      },
+      {
+        "name": "shareBps",
+        "type": "uint16"
+      },
+      {
+        "name": "inRange",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "fees",
+    "outputs": [
+      {
+        "name": "feeBps",
+        "type": "uint16"
+      },
+      {
+        "name": "recipient",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "name": "hook",
+        "type": "address"
+      }
+    ],
+    "name": "isFablesHook",
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "components": [
+          {
+            "components": [
+              {
+                "name": "currency0",
+                "type": "address"
+              },
+              {
+                "name": "currency1",
+                "type": "address"
+              },
+              {
+                "name": "fee",
+                "type": "uint24"
+              },
+              {
+                "name": "tickSpacing",
+                "type": "int24"
+              },
+              {
+                "name": "hooks",
+                "type": "address"
+              }
+            ],
+            "name": "key",
+            "type": "tuple"
+          },
+          {
+            "name": "oldLower",
+            "type": "int24"
+          },
+          {
+            "name": "oldUpper",
+            "type": "int24"
+          },
+          {
+            "name": "shares",
+            "type": "uint128"
+          },
+          {
+            "name": "newLower",
+            "type": "int24"
+          },
+          {
+            "name": "newUpper",
+            "type": "int24"
+          },
+          {
+            "name": "minLiquidity",
+            "type": "uint128"
+          },
+          {
+            "name": "deadline",
+            "type": "uint256"
+          },
+          {
+            "name": "recipient",
+            "type": "address"
+          },
+          {
+            "name": "add0",
+            "type": "uint256"
+          },
+          {
+            "name": "add1",
+            "type": "uint256"
+          }
+        ],
+        "name": "p",
+        "type": "tuple"
+      },
+      {
+        "components": [
+          {
+            "components": [
+              {
+                "components": [
+                  {
+                    "components": [
+                      {
+                        "name": "currency0",
+                        "type": "address"
+                      },
+                      {
+                        "name": "currency1",
+                        "type": "address"
+                      },
+                      {
+                        "name": "fee",
+                        "type": "uint24"
+                      },
+                      {
+                        "name": "tickSpacing",
+                        "type": "int24"
+                      },
+                      {
+                        "name": "hooks",
+                        "type": "address"
+                      }
+                    ],
+                    "name": "key",
+                    "type": "tuple"
+                  },
+                  {
+                    "name": "zeroForOne",
+                    "type": "bool"
+                  }
+                ],
+                "name": "route",
+                "type": "tuple[]"
+              },
+              {
+                "name": "target",
+                "type": "address"
+              },
+              {
+                "name": "zeroForOne",
+                "type": "bool"
+              },
+              {
+                "name": "amountIn",
+                "type": "uint256"
+              },
+              {
+                "name": "shareBps",
+                "type": "uint16"
+              },
+              {
+                "name": "data",
+                "type": "bytes"
+              }
+            ],
+            "name": "legs",
+            "type": "tuple[]"
+          },
+          {
+            "name": "maxFeeBps",
+            "type": "uint16"
+          }
+        ],
+        "name": "r",
+        "type": "tuple"
+      }
+    ],
+    "name": "reposition",
+    "outputs": [
+      {
+        "name": "liquidity",
+        "type": "uint128"
+      }
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "components": [
+          {
+            "components": [
+              {
+                "name": "token",
+                "type": "address"
+              },
+              {
+                "name": "amount",
+                "type": "uint256"
+              }
+            ],
+            "name": "permitted",
+            "type": "tuple[]"
+          },
+          {
+            "name": "nonce",
+            "type": "uint256"
+          },
+          {
+            "name": "deadline",
+            "type": "uint256"
+          }
+        ],
+        "name": "permit",
+        "type": "tuple"
+      },
+      {
+        "name": "signature",
+        "type": "bytes"
+      },
+      {
+        "name": "call",
+        "type": "bytes"
+      }
+    ],
+    "name": "withPermit2",
+    "outputs": [
+      {
+        "name": "result",
+        "type": "bytes"
+      }
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "components": [
+          {
+            "components": [
+              {
+                "name": "currency0",
+                "type": "address"
+              },
+              {
+                "name": "currency1",
+                "type": "address"
+              },
+              {
+                "name": "fee",
+                "type": "uint24"
+              },
+              {
+                "name": "tickSpacing",
+                "type": "int24"
+              },
+              {
+                "name": "hooks",
+                "type": "address"
+              }
+            ],
+            "name": "key",
+            "type": "tuple"
+          },
+          {
+            "name": "tickLower",
+            "type": "int24"
+          },
+          {
+            "name": "tickUpper",
+            "type": "int24"
+          },
+          {
+            "name": "amount0",
+            "type": "uint256"
+          },
+          {
+            "name": "amount1",
+            "type": "uint256"
+          },
+          {
+            "name": "minLiquidity",
+            "type": "uint128"
+          },
+          {
+            "name": "deadline",
+            "type": "uint256"
+          },
+          {
+            "name": "recipient",
+            "type": "address"
+          },
+          {
+            "name": "sqrtPriceMinX96",
+            "type": "uint160"
+          },
+          {
+            "name": "sqrtPriceMaxX96",
+            "type": "uint160"
+          }
+        ],
+        "name": "p",
+        "type": "tuple"
+      },
+      {
+        "components": [
+          {
+            "components": [
+              {
+                "components": [
+                  {
+                    "components": [
+                      {
+                        "name": "currency0",
+                        "type": "address"
+                      },
+                      {
+                        "name": "currency1",
+                        "type": "address"
+                      },
+                      {
+                        "name": "fee",
+                        "type": "uint24"
+                      },
+                      {
+                        "name": "tickSpacing",
+                        "type": "int24"
+                      },
+                      {
+                        "name": "hooks",
+                        "type": "address"
+                      }
+                    ],
+                    "name": "key",
+                    "type": "tuple"
+                  },
+                  {
+                    "name": "zeroForOne",
+                    "type": "bool"
+                  }
+                ],
+                "name": "route",
+                "type": "tuple[]"
+              },
+              {
+                "name": "target",
+                "type": "address"
+              },
+              {
+                "name": "zeroForOne",
+                "type": "bool"
+              },
+              {
+                "name": "amountIn",
+                "type": "uint256"
+              },
+              {
+                "name": "shareBps",
+                "type": "uint16"
+              },
+              {
+                "name": "data",
+                "type": "bytes"
+              }
+            ],
+            "name": "legs",
+            "type": "tuple[]"
+          },
+          {
+            "name": "maxFeeBps",
+            "type": "uint16"
+          }
+        ],
+        "name": "r",
+        "type": "tuple"
+      }
+    ],
+    "name": "zapIn",
+    "outputs": [
+      {
+        "name": "liquidity",
+        "type": "uint128"
+      }
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "components": [
+          {
+            "name": "tokenIn",
+            "type": "address"
+          },
+          {
+            "name": "amountIn",
+            "type": "uint256"
+          },
+          {
+            "name": "maxFeeBps",
+            "type": "uint16"
+          },
+          {
+            "components": [
+              {
+                "name": "legOut",
+                "type": "address"
+              },
+              {
+                "name": "amountIn",
+                "type": "uint256"
+              },
+              {
+                "name": "minLegOut",
+                "type": "uint256"
+              },
+              {
+                "components": [
+                  {
+                    "components": [
+                      {
+                        "name": "currency0",
+                        "type": "address"
+                      },
+                      {
+                        "name": "currency1",
+                        "type": "address"
+                      },
+                      {
+                        "name": "fee",
+                        "type": "uint24"
+                      },
+                      {
+                        "name": "tickSpacing",
+                        "type": "int24"
+                      },
+                      {
+                        "name": "hooks",
+                        "type": "address"
+                      }
+                    ],
+                    "name": "key",
+                    "type": "tuple"
+                  },
+                  {
+                    "name": "zeroForOne",
+                    "type": "bool"
+                  }
+                ],
+                "name": "route",
+                "type": "tuple[]"
+              },
+              {
+                "name": "target",
+                "type": "address"
+              },
+              {
+                "name": "data",
+                "type": "bytes"
+              }
+            ],
+            "name": "landings",
+            "type": "tuple[]"
+          }
+        ],
+        "name": "f",
+        "type": "tuple"
+      },
+      {
+        "components": [
+          {
+            "components": [
+              {
+                "name": "currency0",
+                "type": "address"
+              },
+              {
+                "name": "currency1",
+                "type": "address"
+              },
+              {
+                "name": "fee",
+                "type": "uint24"
+              },
+              {
+                "name": "tickSpacing",
+                "type": "int24"
+              },
+              {
+                "name": "hooks",
+                "type": "address"
+              }
+            ],
+            "name": "key",
+            "type": "tuple"
+          },
+          {
+            "name": "tickLower",
+            "type": "int24"
+          },
+          {
+            "name": "tickUpper",
+            "type": "int24"
+          },
+          {
+            "name": "amount0",
+            "type": "uint256"
+          },
+          {
+            "name": "amount1",
+            "type": "uint256"
+          },
+          {
+            "name": "minLiquidity",
+            "type": "uint128"
+          },
+          {
+            "name": "deadline",
+            "type": "uint256"
+          },
+          {
+            "name": "recipient",
+            "type": "address"
+          },
+          {
+            "name": "sqrtPriceMinX96",
+            "type": "uint160"
+          },
+          {
+            "name": "sqrtPriceMaxX96",
+            "type": "uint160"
+          }
+        ],
+        "name": "p",
+        "type": "tuple"
+      },
+      {
+        "components": [
+          {
+            "components": [
+              {
+                "components": [
+                  {
+                    "components": [
+                      {
+                        "name": "currency0",
+                        "type": "address"
+                      },
+                      {
+                        "name": "currency1",
+                        "type": "address"
+                      },
+                      {
+                        "name": "fee",
+                        "type": "uint24"
+                      },
+                      {
+                        "name": "tickSpacing",
+                        "type": "int24"
+                      },
+                      {
+                        "name": "hooks",
+                        "type": "address"
+                      }
+                    ],
+                    "name": "key",
+                    "type": "tuple"
+                  },
+                  {
+                    "name": "zeroForOne",
+                    "type": "bool"
+                  }
+                ],
+                "name": "route",
+                "type": "tuple[]"
+              },
+              {
+                "name": "target",
+                "type": "address"
+              },
+              {
+                "name": "zeroForOne",
+                "type": "bool"
+              },
+              {
+                "name": "amountIn",
+                "type": "uint256"
+              },
+              {
+                "name": "shareBps",
+                "type": "uint16"
+              },
+              {
+                "name": "data",
+                "type": "bytes"
+              }
+            ],
+            "name": "legs",
+            "type": "tuple[]"
+          },
+          {
+            "name": "maxFeeBps",
+            "type": "uint16"
+          }
+        ],
+        "name": "r",
+        "type": "tuple"
+      }
+    ],
+    "name": "zapInFrom",
+    "outputs": [
+      {
+        "name": "liquidity",
+        "type": "uint128"
+      }
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "components": [
+          {
+            "components": [
+              {
+                "name": "currency0",
+                "type": "address"
+              },
+              {
+                "name": "currency1",
+                "type": "address"
+              },
+              {
+                "name": "fee",
+                "type": "uint24"
+              },
+              {
+                "name": "tickSpacing",
+                "type": "int24"
+              },
+              {
+                "name": "hooks",
+                "type": "address"
+              }
+            ],
+            "name": "key",
+            "type": "tuple"
+          },
+          {
+            "name": "tickLower",
+            "type": "int24"
+          },
+          {
+            "name": "tickUpper",
+            "type": "int24"
+          },
+          {
+            "name": "shares",
+            "type": "uint128"
+          },
+          {
+            "name": "tokenOut",
+            "type": "address"
+          },
+          {
+            "name": "minOut",
+            "type": "uint256"
+          },
+          {
+            "name": "deadline",
+            "type": "uint256"
+          },
+          {
+            "name": "recipient",
+            "type": "address"
+          }
+        ],
+        "name": "p",
+        "type": "tuple"
+      },
+      {
+        "components": [
+          {
+            "components": [
+              {
+                "components": [
+                  {
+                    "components": [
+                      {
+                        "name": "currency0",
+                        "type": "address"
+                      },
+                      {
+                        "name": "currency1",
+                        "type": "address"
+                      },
+                      {
+                        "name": "fee",
+                        "type": "uint24"
+                      },
+                      {
+                        "name": "tickSpacing",
+                        "type": "int24"
+                      },
+                      {
+                        "name": "hooks",
+                        "type": "address"
+                      }
+                    ],
+                    "name": "key",
+                    "type": "tuple"
+                  },
+                  {
+                    "name": "zeroForOne",
+                    "type": "bool"
+                  }
+                ],
+                "name": "route",
+                "type": "tuple[]"
+              },
+              {
+                "name": "target",
+                "type": "address"
+              },
+              {
+                "name": "zeroForOne",
+                "type": "bool"
+              },
+              {
+                "name": "amountIn",
+                "type": "uint256"
+              },
+              {
+                "name": "shareBps",
+                "type": "uint16"
+              },
+              {
+                "name": "data",
+                "type": "bytes"
+              }
+            ],
+            "name": "legs",
+            "type": "tuple[]"
+          },
+          {
+            "name": "maxFeeBps",
+            "type": "uint16"
+          }
+        ],
+        "name": "r",
+        "type": "tuple"
+      }
+    ],
+    "name": "zapOut",
+    "outputs": [
+      {
+        "name": "amountOut",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "components": [
+          {
+            "components": [
+              {
+                "name": "currency0",
+                "type": "address"
+              },
+              {
+                "name": "currency1",
+                "type": "address"
+              },
+              {
+                "name": "fee",
+                "type": "uint24"
+              },
+              {
+                "name": "tickSpacing",
+                "type": "int24"
+              },
+              {
+                "name": "hooks",
+                "type": "address"
+              }
+            ],
+            "name": "key",
+            "type": "tuple"
+          },
+          {
+            "name": "tickLower",
+            "type": "int24"
+          },
+          {
+            "name": "tickUpper",
+            "type": "int24"
+          },
+          {
+            "name": "shares",
+            "type": "uint128"
+          },
+          {
+            "name": "tokenOut",
+            "type": "address"
+          },
+          {
+            "name": "minOut",
+            "type": "uint256"
+          },
+          {
+            "name": "deadline",
+            "type": "uint256"
+          },
+          {
+            "name": "recipient",
+            "type": "address"
+          }
+        ],
+        "name": "p",
+        "type": "tuple"
+      },
+      {
+        "components": [
+          {
+            "name": "legIn",
+            "type": "address"
+          },
+          {
+            "name": "maxFeeBps",
+            "type": "uint16"
+          },
+          {
+            "components": [
+              {
+                "components": [
+                  {
+                    "name": "currency0",
+                    "type": "address"
+                  },
+                  {
+                    "name": "currency1",
+                    "type": "address"
+                  },
+                  {
+                    "name": "fee",
+                    "type": "uint24"
+                  },
+                  {
+                    "name": "tickSpacing",
+                    "type": "int24"
+                  },
+                  {
+                    "name": "hooks",
+                    "type": "address"
+                  }
+                ],
+                "name": "key",
+                "type": "tuple"
+              },
+              {
+                "name": "zeroForOne",
+                "type": "bool"
+              }
+            ],
+            "name": "route",
+            "type": "tuple[]"
+          },
+          {
+            "name": "target",
+            "type": "address"
+          },
+          {
+            "name": "amountIn",
+            "type": "uint256"
+          },
+          {
+            "name": "data",
+            "type": "bytes"
+          }
+        ],
+        "name": "f",
+        "type": "tuple"
+      },
+      {
+        "components": [
+          {
+            "components": [
+              {
+                "components": [
+                  {
+                    "components": [
+                      {
+                        "name": "currency0",
+                        "type": "address"
+                      },
+                      {
+                        "name": "currency1",
+                        "type": "address"
+                      },
+                      {
+                        "name": "fee",
+                        "type": "uint24"
+                      },
+                      {
+                        "name": "tickSpacing",
+                        "type": "int24"
+                      },
+                      {
+                        "name": "hooks",
+                        "type": "address"
+                      }
+                    ],
+                    "name": "key",
+                    "type": "tuple"
+                  },
+                  {
+                    "name": "zeroForOne",
+                    "type": "bool"
+                  }
+                ],
+                "name": "route",
+                "type": "tuple[]"
+              },
+              {
+                "name": "target",
+                "type": "address"
+              },
+              {
+                "name": "zeroForOne",
+                "type": "bool"
+              },
+              {
+                "name": "amountIn",
+                "type": "uint256"
+              },
+              {
+                "name": "shareBps",
+                "type": "uint16"
+              },
+              {
+                "name": "data",
+                "type": "bytes"
+              }
+            ],
+            "name": "legs",
+            "type": "tuple[]"
+          },
+          {
+            "name": "maxFeeBps",
+            "type": "uint16"
+          }
+        ],
+        "name": "r",
+        "type": "tuple"
+      }
+    ],
+    "name": "zapOutTo",
+    "outputs": [
+      {
+        "name": "amountOut",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+]

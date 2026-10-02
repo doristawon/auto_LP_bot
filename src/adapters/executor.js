@@ -21,6 +21,8 @@ import {
   ZERO_ADDRESS
 } from '../constants.js';
 import { UniversalRouterAdapter } from './universal-router.js';
+import { FablesAdapter } from './fables.js';
+import { pinnedSimulationProvider } from '../execution/pinned-simulation.js';
 import { V4QuoterAdapter } from './quoter.js';
 import { buildExactBalancedSwapPlan, quotePriceImpactBps } from '../execution/exact-rebalance.js';
 import { buildPairFundingScope } from '../execution/pair-funding.js';
@@ -36,6 +38,7 @@ import {
   buildExactDepositPlan,
   buildExactWithdrawBounds,
   getLiquidityForAmounts,
+  getAmountsForLiquidity,
   getSqrtPriceAtTick
 } from '../math/v4-fixed.js';
 import { buildTargetRange, isLpInRange, isLpOutOfRange } from '../math/ticks.js';
@@ -248,6 +251,41 @@ export class RebalanceExecutor {
         allocationScopedBaselineRaw: allocationScope ? stringifyRawBalances(scopedPreBalances) : null,
         allocationRemainingRaw: allocationScope ? stringifyRawBalances(scopedPreBalances) : null
       });
+      if (this.config.officialRepositionEnabled === true && !allocationScope) {
+        let candidate = null;
+        try {
+          const blockTag = await this.writeProvider.send('eth_blockNumber', []);
+          const provider = pinnedSimulationProvider(this.writeProvider, blockTag);
+          const comparison = Object.create(this);
+          comparison.readProvider = provider;
+          comparison.writeProvider = provider;
+          comparison.fables = new FablesAdapter(provider, this.config);
+          comparison.quoter = new V4QuoterAdapter(provider, undefined, this.config.externalSwapRoutesEnabled,
+          { getUsdPrice: this.getUsdPrice, maxGasGwei: this.config.maxGasGwei });
+          comparison.router = new UniversalRouterAdapter(provider, this.config);
+          const latest = await comparison.assertPlanStillOutOfRange(plan, 'official-comparison');
+          const bounds = buildExactWithdrawBounds({ sqrtPriceX96: latest.sqrtPriceX96,
+          tickLower: plan.position.tickLower, tickUpper: plan.position.tickUpper,
+          liquidity: plan.position.shares, slippageBps: this.config.withdrawSlippageBps });
+          const deadline = this.deadline();
+          const call = buildCrossPoolWithdrawCall({ pool: plan.pool, position: plan.position,
+          bounds, deadline, walletAddress: this.config.walletAddress, fablesWalk: this.config.fablesWalk });
+          const baseline = await comparison.preflightSamePoolSequence({ pool: plan.pool,
+            position: plan.position, guardedData: call.data, preBalances,
+            poolState: latest, deadline, maxPriceImpactBps: rebalanceMaxImpactBps, includeCost: true });
+          const { previewOfficialReposition } = await import('../execution/official-reposition.js');
+          candidate = await previewOfficialReposition.call(comparison, { plan, preBalances, baseline });
+        } catch (error) {
+          // A comparison failure occurs before any capital broadcast. Do not
+          // retain RPC errors that may embed a one-time Permit2 signature.
+          this.ledger.append('rebalance.official_unavailable', {
+            poolId: plan.pool.id, reason: 'Complete cost comparison or official preflight unavailable' });
+        }
+        if (candidate) {
+          const { executeOfficialReposition } = await import('../execution/official-reposition-execution.js');
+          return await executeOfficialReposition.call(this, { plan, candidate, journal });
+        }
+      }
       const approvalState = await this.fables.readPoolState(plan.pool);
       const approvalBounds = buildExactWithdrawBounds({
         sqrtPriceX96: approvalState.sqrtPriceX96,
@@ -691,7 +729,7 @@ export class RebalanceExecutor {
         target: finalTarget
       };
     } catch (error) {
-      if (error.atomicHandled) throw error;
+      if (error.atomicHandled || error.officialHandled) throw error;
       try {
         if (await this.reconcileConfirmedNoOp({ pool: plan.pool, journal, error, phase,
           baseline: journal.preBalancesRaw, position: plan.position })) {
@@ -1562,7 +1600,7 @@ export class RebalanceExecutor {
 
   async preflightSamePoolSequence({
     pool, position, guardedData, preBalances, scopedPreBalances = preBalances,
-    allocationScope = null, poolState, deadline, maxPriceImpactBps
+    allocationScope = null, poolState, deadline, maxPriceImpactBps, includeCost = false
   }) {
     const balanceCalls = [pool.token0, pool.token1].map((token) => ({
       to: token.address,
@@ -1671,23 +1709,47 @@ export class RebalanceExecutor {
       fullCalls.splice(fullApprovals.length + 1, fullCalls.length,
         { to: atomic.to, data: atomic.data, value: 0n, gasLimit: 4_000_000 });
     }
+    const stateInterface = new Interface(['function getSlot0(bytes32) view returns(uint160,int24,uint24,uint24)']);
+    const readbacks = includeCost ? [...balanceCalls, {
+      to: '0xF3334192D15450CdD385c8B70e03f9A6bD9E673b',
+      data: stateInterface.encodeFunctionData('getSlot0', [pool.id]),
+      value: 0n, gasLimit: 100_000
+    }] : [];
     const simulated = await simulateSequentialCalls(this.writeProvider, {
-      ...simulationArgs, calls: fullCalls
+      ...simulationArgs, calls: [...fullCalls, ...readbacks]
     });
-    const deposited = this.findWalletDepositEvent(pool, simulated.at(-1));
+    const deposited = this.findWalletDepositEvent(pool, simulated[fullCalls.length - 1]);
     if (!deposited || deposited.liquidity <= 0n) {
       throw new Error('Sequential preflight did not mint a wallet LP position');
     }
+    let cost = {};
+    if (includeCost) {
+      const raw0 = BigInt(erc20Interface.decodeFunctionResult('balanceOf', simulated[fullCalls.length].returnData)[0]);
+      const raw1 = BigInt(erc20Interface.decodeFunctionResult('balanceOf', simulated[fullCalls.length + 1].returnData)[0]);
+      const [sqrt] = stateInterface.decodeFunctionResult('getSlot0', simulated[fullCalls.length + 2].returnData);
+      const amounts = getAmountsForLiquidity(sqrt, getSqrtPriceAtTick(finalTarget.tickLower),
+        getSqrtPriceAtTick(finalTarget.tickUpper), deposited.liquidity, false);
+      const spotSquared = BigInt(poolState.sqrtPriceX96) ** 2n;
+      const value = (a0, a1) => a0 * spotSquared / (1n << 192n) + a1;
+      cost = {
+        projectedValueRaw1: value(amounts.amount0 + raw0, amounts.amount1 + raw1).toString(),
+        inputValueRaw1: value(preBalances.raw0 + withdrawn.raw0, preBalances.raw1 + withdrawn.raw1).toString(),
+        valuationSqrtPriceX96: poolState.sqrtPriceX96.toString(),
+        fundingRaw: stringifyRawBalances(fundingScope.funding),
+        dustRetainedRaw: stringifyRawBalances(fundingScope.dustRaw)
+      };
+    }
     return {
       status: 'full-sequence-simulated',
-      callCount: simulated.length,
-      simulatedGasUsed: simulated.reduce(
+      callCount: fullCalls.length,
+      simulatedGasUsed: simulated.slice(0, fullCalls.length).reduce(
         (total, receipt) => total + BigInt(receipt.gasUsed || 0), 0n
       ).toString(),
       swapPriceImpactBps: swapPlan.priceImpactBps ?? null,
       finalTarget,
       withdrawnRaw: { raw0: withdrawn.raw0.toString(), raw1: withdrawn.raw1.toString() },
-      mintedLiquidity: deposited.liquidity.toString()
+      mintedLiquidity: deposited.liquidity.toString(),
+      ...cost
     };
   }
 

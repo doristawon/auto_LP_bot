@@ -2,9 +2,12 @@ import { sanitize } from '../logger.js';
 
 const STEP_LABELS = ['預檢', '撤出 LP', '換幣', '存入 LP', '核對'];
 const STEP_KEYS = ['preflight', 'withdraw', 'swap', 'deposit', 'verify'];
+const OFFICIAL_REPOSITION_LABEL = '領取手續費＋官方一次再平衡';
+const OFFICIAL_PHASES = new Set(['official_preflighted', 'official_sent', 'official_confirmed']);
 const STAGES = {
   prepared: 0, approvals_ready: 0, withdraw_preflighted: 0,
   sequence_preflighted: 0, cross_pool_preflighted: 0,
+  official_preflighted: 0, official_sent: 1, official_confirmed: 2,
   withdraw_sent: 1, withdraw_confirmed: 2, withdraw_not_required: 2,
   route_swap_sent: 2, route_swap_confirmed: 2, swap_preflighted: 2, swap_sent: 2,
   swap_confirmed: 3, swap_not_required: 3, deposit_preflighted: 3, deposit_sent: 3,
@@ -25,6 +28,8 @@ export function describeExecutionProgress(journal) {
     : phase === 'recovery_required' ? 'recovery' : 'running';
   const observedPhase = ['failed', 'recovery_required', 'tx_broadcast_pending'].includes(phase)
     ? journal.pendingTx?.previousPhase || journal.lastKnownPhase || 'prepared' : phase;
+  const officialFlow = OFFICIAL_PHASES.has(observedPhase)
+    || Object.hasOwn(journal.tx || {}, 'officialReposition');
   const atomicFlow = ATOMIC_PHASES.has(observedPhase) || Object.hasOwn(journal.tx || {}, 'atomicSwapDeposit')
     || Array.isArray(journal.tx?.atomicReverts);
   const kind = journal.kind === 'stop_liquidation' ? 'stop'
@@ -33,12 +38,17 @@ export function describeExecutionProgress(journal) {
     : journal.destinationPoolId ? 'rotation' : 'rebalance';
   const stopStage = String(journal.step || '').startsWith('withdraw:') ? 1
     : String(journal.step || '').startsWith('swap:') ? 2 : 0;
+  const officialStepIndex = officialFlow
+    ? status === 'completed' || observedPhase === 'official_confirmed' ? 2
+      : observedPhase === 'official_preflighted' && !journal.tx?.officialReposition ? 0
+        : journal.tx?.officialReposition || observedPhase === 'official_sent' ? 1 : 0
+    : null;
   const atomicStepIndex = ['atomic_preflighted', 'atomic_sent', 'atomic_retry'].includes(observedPhase)
     ? journal.atomicSwapRequired === true ? 2 : 3
     : observedPhase === 'atomic_confirmed' ? 4 : null;
-  const stepIndex = kind === 'stop'
+  const stepIndex = officialStepIndex ?? (kind === 'stop'
     ? status === 'completed' ? 4 : stopStage
-    : atomicStepIndex ?? STAGES[observedPhase] ?? 0;
+    : atomicStepIndex ?? STAGES[observedPhase] ?? 0);
   const completed = status === 'completed';
   const skippedWithdraw = kind === 'topup' || kind === 'bootstrap'
     || observedPhase === 'withdraw_not_required';
@@ -46,14 +56,21 @@ export function describeExecutionProgress(journal) {
     || atomicFlow && journal.atomicSwapRequired !== true
     || !atomicFlow && (journal.swapPolicy === 'deposit-only'
       || (stepIndex >= 3 && !journal.tx?.swap && !(journal.tx?.routeSwaps?.length)));
-  const steps = STEP_KEYS.map((key, index) => {
-    const skipped = key === 'withdraw' && skippedWithdraw
-      || key === 'swap' && skippedSwap || kind === 'stop' && key === 'deposit';
+  const stepStatus = (index, skipped = false) => {
     let state = skipped ? 'skipped' : completed || index < stepIndex ? 'completed'
       : index === stepIndex ? 'active' : 'pending';
     if (!skipped && index === stepIndex && status === 'failed') state = 'failed';
     if (!skipped && index === stepIndex && status === 'recovery') state = 'attention';
-    return { key, label: STEP_LABELS[index], status: state };
+    return state;
+  };
+  const steps = officialFlow ? [
+    { key: 'preflight', label: '預檢', status: stepStatus(0) },
+    { key: 'officialReposition', label: OFFICIAL_REPOSITION_LABEL, status: stepStatus(1) },
+    { key: 'verify', label: '核對', status: stepStatus(2) }
+  ] : STEP_KEYS.map((key, index) => {
+    const skipped = key === 'withdraw' && skippedWithdraw
+      || key === 'swap' && skippedSwap || kind === 'stop' && key === 'deposit';
+    return { key, label: STEP_LABELS[index], status: stepStatus(index, skipped) };
   });
   const transactions = [];
   const addTransaction = (step, label, hash, receiptState) => {
@@ -65,7 +82,10 @@ export function describeExecutionProgress(journal) {
   };
   const receiptState = confirmed => confirmed ? 'confirmed'
     : status === 'recovery' || status === 'failed' ? 'unknown' : 'pending';
-  if (kind === 'stop') {
+  if (officialFlow && kind !== 'stop') {
+    addTransaction('officialReposition', OFFICIAL_REPOSITION_LABEL, journal.tx?.officialReposition,
+      receiptState(completed || observedPhase === 'official_confirmed'));
+  } else if (kind === 'stop') {
     const confirmedHashes = new Set((journal.completedSteps || []).map(item => String(item.hash).toLowerCase()));
     for (const [key, hash] of Object.entries(journal.tx || {})) {
       const step = key.startsWith('withdraw:') ? 'withdraw' : 'swap';
@@ -100,7 +120,8 @@ export function describeExecutionProgress(journal) {
     const pendingHash = hashValue(journal.pendingTx.hash);
     if (pendingHash) {
       const existing = transactions.find(item => item.hash.toLowerCase() === pendingHash.toLowerCase());
-      const item = { step: STEP_KEYS[stepIndex], label: cleanText(journal.pendingTx.label, 70) || '交易送出',
+      const item = { step: officialFlow ? 'officialReposition' : STEP_KEYS[stepIndex],
+        label: officialFlow ? OFFICIAL_REPOSITION_LABEL : cleanText(journal.pendingTx.label, 70) || '交易送出',
         hash: pendingHash, status: status === 'recovery' ? 'unknown' : 'pending' };
       if (existing) Object.assign(existing, item);
       else transactions.push(item);
@@ -135,6 +156,9 @@ export function describeExecutionProgress(journal) {
       ? '換幣＋一次存入 LP 已在同一筆交易送出，等待確認。' : '一次存入 LP 已送出，等待確認。',
     atomic_retry: '上一筆原子交易已回退，正在重新預檢。',
     atomic_confirmed: '原子交易已確認，正在核對 LP 份額與餘額。'
+    ,official_preflighted: '舊區間手續費與官方再平衡已預檢，準備送出單筆交易。'
+    ,official_sent: '領取手續費與官方一次再平衡已在同一筆交易送出，等待確認。'
+    ,official_confirmed: '官方再平衡交易已確認，正在核對新舊區間與手續費。'
   };
   const message = completed ? '鏈上交易與部位核對已完成。'
     : status === 'failed' ? '流程未完成，請查看失敗原因。'
@@ -151,7 +175,8 @@ export function describeExecutionProgress(journal) {
     startedAt: Number(journal.startedAt) || null,
     updatedAt: Number(journal.updatedAt || journal.startedAt) || null,
     finishedAt: Number(journal.completedAt || journal.failedAt) || null,
-    stepIndex, currentStepLabel: completed ? '已完成' : STEP_LABELS[stepIndex],
+    stepIndex, currentStepLabel: completed ? '已完成' : officialFlow
+      ? ['預檢', OFFICIAL_REPOSITION_LABEL, '核對'][stepIndex] : STEP_LABELS[stepIndex],
     message, error: cleanText(journal.error), steps, transactions,
     lastTransaction
   };

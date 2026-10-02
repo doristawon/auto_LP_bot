@@ -2,8 +2,8 @@ import { Contract, formatUnits, getAddress } from 'ethers';
 
 // Fables' public read-only lens. Keep this ABI in sync with the official
 // userRanges ABI before changing the field layout.
-const LENS_ADDRESS = '0xE44c0BAb43BdD47e7Ab40236bC183dCc77A9ED6c';
-const LENS_ABI = [
+export const LENS_ADDRESS = '0xE44c0BAb43BdD47e7Ab40236bC183dCc77A9ED6c';
+export const LENS_ABI = [
   'function userRanges(address hook,address owner,uint256[] ids) view returns ((uint256 rangeId,bool keyVerified,(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks) key,int24 tickLower,int24 tickUpper,uint256 shares,uint128 staked,uint128 claimable0,uint128 claimable1,uint128 totalShares,uint128 totalStaked,uint16 effectiveClaimFeeBps,bool claimPaused,bool settling,uint160 sqrtPriceX96,int24 tick,bool inRange,int24 ticksToLower,int24 ticksToUpper,uint128 poolLiquidity,uint256 shareOfActiveLiquidityE18,uint256 amount0,uint256 amount1)[] rows,(uint256 arbBlockNumber,uint256 l1BlockNumber,uint64 timestamp,bool arbSysAnswered) stamp)'
 ];
 const ORIGIN = 'https://www.fables.fi';
@@ -125,7 +125,7 @@ export async function fetchWalletFeeEvidence({ address, provider, pools, prices,
   };
 }
 
-async function fetchOwnerLedger(address, fetchFn) {
+export async function fetchOwnerLedger(address, fetchFn = fetch) {
   const names = ['Position', 'LiquidityEvent', 'FeeClaim'];
   const combined = Object.fromEntries(names.map((name) => [name, []]));
   let chainMetadata = null;
