@@ -27,7 +27,7 @@ export async function claimRetiredRangeFees({ pool, range }) {
     // owner indexer entries and previous-cycle fee amounts are not authority.
     const rows = await collectOfficialClaimRanges({ pool, walletAddress: this.config.walletAddress,
       provider: this.readProvider, retiredOnly: true, ownerLedger: { Position: [] },
-      knownRangeIds: [range.rangeId], maxFeeBps: Math.min(1000, this.config.fablesWalk ?? 1000) });
+      knownRangeIds: [range.rangeId], maxFeeBps: 1000 });
     const verified = rows.find(item => item.rangeId.toLowerCase() === range.rangeId.toLowerCase());
     if (!verified) return { status: 'skipped', reason: 'no-eligible-retired-fees' };
     if ([pool.key.currency0, pool.key.currency1].some(token => token.toLowerCase() === ZERO_ADDRESS)) {
@@ -57,7 +57,11 @@ export async function claimRetiredRangeFees({ pool, range }) {
     this.saveJournal(journal);
     try {
       const receipt = await this.sendVerifiedTx({ label: 'claimRetiredFees', to: pool.key.hooks, data,
-        feeOverrides: fees, onSent: hash => update({ phase: 'claim_sent', tx: { claim: hash } }) });
+        feeOverrides: fees, beforeBroadcast: () => {
+          if (this.state.getSetting('executionPaused', false) || this.state.getSetting('stopLossLatched', false)) {
+            throw new Error('Fee claim was paused before broadcast');
+          }
+        }, onSent: hash => update({ phase: 'claim_sent', tx: { claim: hash } }) });
       update({ phase: 'claim_confirmed' });
       const amounts = [0n, 0n];
       for (const item of receipt.logs || []) {

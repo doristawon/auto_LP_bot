@@ -5,6 +5,17 @@ import { RebalanceExecutor } from '../src/adapters/executor.js';
 
 const WALLET = '0x00000000000000000000000000000000000000aa';
 
+test('final synchronous gate cancels before hash persistence and RPC broadcast after async preparation', async () => {
+  let broadcasts = 0, sent = 0;
+  const { executor, settings, events } = makeExecutor({ broadcast: async () => { broadcasts++; } });
+  executor.writeProvider.send = async () => { settings.set('executionPaused', true); return '0x2105'; };
+  await assert.rejects(executor.sendVerifiedTx({ label: 'claimRetiredFees', to: WALLET, data: '0x1234',
+    beforeBroadcast: () => { if (settings.get('executionPaused')) throw new Error('paused-before-broadcast'); },
+    onSent: () => { sent++; } }), /paused-before-broadcast/);
+  assert.equal(broadcasts, 0);assert.equal(sent, 0);
+  assert.equal(events.some(event => event.type === 'tx.broadcast_pending'), false);
+});
+
 function makeExecutor({ rpcChainId = '0x2105', broadcast = async () => { throw new Error('timeout after node accepted request'); } } = {}) {
   const settings = new Map([['activeRebalanceExecution', { id: 'test-execution', phase: 'approvals_ready' }]]);
   const events = [];

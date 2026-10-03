@@ -43,7 +43,8 @@ function fixture({ sendError = null, receiptMismatch = false } = {}) {
     saveJournal:j=>saved.set('activeRebalanceExecution',j),
     patchJournal:(j,p)=>{const next={...j,...p,lastKnownPhase:j.phase,updatedAt:Date.now()};saved.set('activeRebalanceExecution',next);return next;},
     clearJournal:()=>saved.set('activeRebalanceExecution',null),
-    sendVerifiedTx:async({to,data,onSent})=>{
+    sendVerifiedTx:async({to,data,onSent,beforeBroadcast})=>{
+      beforeBroadcast?.();
       sends++;
       const call=hookInterface.parseTransaction({data});
       assert.equal(to,hook); assert.equal(call.name,'claimFees'); assert.equal(call.args.recipient.toLowerCase(),wallet);
@@ -102,6 +103,13 @@ test('tiny fees cannot pay disproportionate gas costs',async()=>{
   const x=fixture();x.f.getPinnedFeeOverrides=async()=>({gasPrice:1000000000000000n});
   const result=await claimRetiredRangeFees.call(x.f,{pool,range:{rangeId}});
   assert.equal(result.status,'deferred');assert.equal(result.reason,'fees-below-gas-cost');assert.equal(x.sends(),0);
+});
+
+test('pause after initial preparation aborts at final broadcast gate without a pending hash',async()=>{
+  const x=fixture();const send=x.f.sendVerifiedTx;
+  x.f.sendVerifiedTx=async args=>{x.saved.set('executionPaused',true);return send(args);};
+  await assert.rejects(claimRetiredRangeFees.call(x.f,{pool,range:{rangeId}}));
+  assert.equal(x.sends(),0);assert.equal(x.saved.get('activeRebalanceExecution'),null);
 });
 
 test('fee claim progress shows only preflight, claim and verification',()=>{

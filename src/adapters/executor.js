@@ -3614,7 +3614,7 @@ export class RebalanceExecutor {
     return actual;
   }
 
-  async sendVerifiedTx({ label, to, data, value = 0n, onSent = null, feeOverrides = null }) {
+  async sendVerifiedTx({ label, to, data, value = 0n, onSent = null, feeOverrides = null, beforeBroadcast = null }) {
     const fees = await this.getPinnedFeeOverrides(feeOverrides);
     await this.assertGasGuard(fees);
     const chainId = BigInt(this.config.chainId || 0);
@@ -3635,6 +3635,9 @@ export class RebalanceExecutor {
     const rawTransaction = await this.signer.signTransaction(populated);
     const hash = keccak256(rawTransaction);
     await this.assertWriteChainId();
+    // Synchronous final gate: no awaited work may separate this check from
+    // persisting the expected hash and invoking the broadcast RPC.
+    if (beforeBroadcast) beforeBroadcast();
     this.ledger.append('tx.broadcast_pending', {
       label,
       hash,
