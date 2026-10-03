@@ -14,6 +14,7 @@ import { PortfolioAnalytics } from './analytics/portfolio.js';
 import { captureLpSessionReference, evaluateStopLoss, normalizeStopLoss } from './analytics/stop-loss.js';
 import { executeStopLiquidation, reconcileStopLiquidation } from './execution/stop-liquidation.js';
 import { sweepRetiredFees } from './execution/retired-fee-claims.js';
+import { reconcileManualReplacement } from './execution/manual-recovery.js';
 import { rebalanceTiming } from './dashboard/rebalance-timing.js';
 import { describeExecutionProgress } from './dashboard/execution-progress.js';
 import { PointsTracker } from './analytics/points-tracker.js';
@@ -25,7 +26,7 @@ import { probePoolSwapCosts } from './execution/pool-quote-probes.js';
 import { evaluatePosition } from './strategy.js';
 import { LedgerStore } from './ledger.js';
 import { StateStore } from './state.js';
-import { normalizeRuntimeIntervals } from './config.js';
+import { normalizeRuntimeIntervals, normalizeRangePolicy } from './config.js';
 import { persistRuntimeCredentials } from './runtime-credentials.js';
 import { DEFAULT_RPC_URL, ZERO_ADDRESS } from './constants.js';
 import { isRpcRateLimitError, isRpcTimeoutError } from './rpc/errors.js';
@@ -126,6 +127,9 @@ export class AutoLpBot {
     this.guardReadinessCache = new WeakMap();
     this.initializing = false;
     this.state = new StateStore(config.stateFile);
+    this.baseRangePolicy = { confirmDelayMin: config.oorConfirmDelayMin ?? 5,
+      minExcursionPct: config.oorMinExcursionPct ?? 0.25 };
+    this.applyStoredRangePolicy();
     this.applyStoredExecutionTarget();
     this.ledger = new LedgerStore(config.dataDir);
     this.fables = new FablesAdapter(this.providers.readProvider, config);
@@ -430,6 +434,32 @@ export class AutoLpBot {
       rangeCheckIntervalMs: this.config.rangeCheckIntervalMs,
       pointsSimulationIntervalMs: this.config.pointsSimulationIntervalMs
     };
+  }
+
+  setRangePolicy(values = {}) {
+    const policy = normalizeRangePolicy({ confirmDelayMin: this.config.oorConfirmDelayMin,
+      minExcursionPct: this.config.oorMinExcursionPct, ...values });
+    this.state.setSetting('rangePolicy', policy);
+    Object.assign(this.config, { oorConfirmDelayMin: policy.confirmDelayMin,
+      oorConfirmDelayMs: policy.confirmDelayMin * 60_000, oorMinExcursionPct: policy.minExcursionPct });
+    this.ledger.append('execution.range_policy_updated', policy);
+    return policy;
+  }
+
+  applyStoredRangePolicy() {
+    const policy = normalizeRangePolicy(this.state.getSetting('rangePolicy', this.baseRangePolicy));
+    Object.assign(this.config, { oorConfirmDelayMin: policy.confirmDelayMin,
+      oorConfirmDelayMs: policy.confirmDelayMin * 60_000, oorMinExcursionPct: policy.minExcursionPct });
+  }
+
+  async resolveManualRecovery() {
+    if (this.cycleActive || !this.executionPaused) throw new Error('請先暫停並等目前掃描完成。');
+    const journal = this.state.getSetting('activeRebalanceExecution', null);
+    const pool = this.market.pools.find(item => item.id.toLowerCase() === String(journal?.poolId).toLowerCase());
+    if (!pool) throw new Error('尚未載入待復原池子。');
+    this.cycleActive = true;
+    try { return await reconcileManualReplacement(this.executor, pool); }
+    finally { this.cycleActive = false; }
   }
 
   setRuntimeIntervals(values = {}) {
@@ -1312,6 +1342,7 @@ export class AutoLpBot {
       this.config.stateFile = path.join(walletDir, 'bot-state.json');
     }
     this.state = new StateStore(this.config.stateFile);
+    this.applyStoredRangePolicy();
     this.applyStoredExecutionTarget();
     this.ledger = new LedgerStore(this.config.dataDir);
     this.analytics = new PortfolioAnalytics(this.config, this.ledger, this.state);
@@ -2306,6 +2337,7 @@ export class AutoLpBot {
       outOfRangeSince: Number(stored.outOfRangeSince || 0),
       checkIntervalMs: this.config.rangeCheckIntervalMs,
       confirmDelayMs: this.config.oorConfirmDelayMs,
+      minExcursionPct: this.config.oorMinExcursionPct,
       cooldownUntil: stored.cooldownUntil || 0,
       nowMs
     });
@@ -3428,6 +3460,7 @@ function rangePolicySnapshot(config) {
     rangePreset: config.rangePreset,
     evaluationIntervalMs: config.rangeCheckIntervalMs,
     confirmDelayMin: config.oorConfirmDelayMin,
+    minExcursionPct: config.oorMinExcursionPct,
     monitorPollIntervalMs: config.pollIntervalMs
   };
 }

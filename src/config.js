@@ -29,7 +29,9 @@ export function loadConfig() {
   const pointsGlobalSwapScanEnabled = envBool('POINTS_GLOBAL_SWAP_SCAN_ENABLED', true);
   const targetMode = (process.env.TARGET_MODE?.trim() || 'wallet-active').toLowerCase();
   const logFromBlock = envInt('LOG_FROM_BLOCK', 44_000_000);
-  const oorConfirmDelayMin = envInt('OOR_CONFIRM_DELAY_MIN', 15);
+  const oorConfirmDelayMin = envNum('OOR_CONFIRM_DELAY_MIN', 5);
+  const oorMinExcursionPct = envNum('OOR_MIN_EXCURSION_PCT', 0.25);
+  normalizeRangePolicy({ confirmDelayMin: oorConfirmDelayMin, minExcursionPct: oorMinExcursionPct });
   const targetSymbols = envList('TARGET_SYMBOLS', []).map((x) => x.toUpperCase());
   const targetPoolIds = envList('TARGET_POOL_IDS', []).map((x) => x.toLowerCase());
   const rangePreset = (process.env.RANGE_PRESET?.trim() || 'custom-bps').toLowerCase();
@@ -190,6 +192,7 @@ export function loadConfig() {
     rangeCheckIntervalMs,
     aprPoolMinTvlUsd,
     oorConfirmDelayMin,
+    oorMinExcursionPct,
     oorConfirmDelayMs: oorConfirmDelayMin * 60 * 1000,
     minRebalanceIntervalSec: envInt('MIN_REBALANCE_INTERVAL_SEC', 300),
     maxRebalancesPerHour: envInt('MAX_REBALANCES_PER_HOUR', 3),
@@ -240,6 +243,18 @@ export function loadConfig() {
     blockscoutApiKey: process.env.BLOCKSCOUT_API_KEY?.trim() || '',
     blockscoutApiBase: process.env.BLOCKSCOUT_API_BASE?.trim() || 'https://api.blockscout.com/4663/api/v2'
   };
+}
+
+export function normalizeRangePolicy(values) {
+  const confirmDelayMin = Number(values?.confirmDelayMin);
+  const minExcursionPct = Number(values?.minExcursionPct);
+  if (!Number.isFinite(confirmDelayMin) || confirmDelayMin < 1 || confirmDelayMin > 1440) {
+    throw new Error('區間外等待時間須介於 1 至 1440 分鐘。');
+  }
+  if (!Number.isFinite(minExcursionPct) || minExcursionPct < 0 || minExcursionPct > 10) {
+    throw new Error('超出邊界門檻須介於 0 至 10%。');
+  }
+  return { confirmDelayMin, minExcursionPct };
 }
 
 function requiredAddress(name) {

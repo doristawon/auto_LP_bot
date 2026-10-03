@@ -11,6 +11,22 @@ const journal = phase => ({ id: 'synthetic-job', phase, startedAt: 1000,
   updatedAt: 2000, pair: 'TOKEN/USDG', oldPosition: { id: 'range' },
   tx: { withdraw: hash('1'), swap: hash('2'), deposit: hash('3') } });
 
+test('verified manual recovery stays distinct from original bot deposit success', () => {
+  const progress = describeExecutionProgress({ ...journal('failed'), lastKnownPhase: 'atomic_retry',
+    tx: { withdraw: hash('1') }, reconciliation: { withdrawHash: hash('1'), replacementHash: hash('4') } });
+  assert.equal(progress.reconciliationStatus, 'verified-manual-lp-replacement');
+  assert.equal(progress.status, 'failed');
+  assert.equal(progress.steps.find(s => s.key === 'deposit').status, 'failed');
+  assert.equal(describeExecutionProgress(journal('failed')).reconciliationStatus, undefined);
+});
+
+test('preflight retries do not imply a reverted live transaction', () => {
+  const progress = describeExecutionProgress({ ...journal('atomic_retry'), tx: {},
+    atomicRetryReason: 'preflight-price-changed' });
+  assert.match(progress.message, /尚未送出資金交易/);
+  assert.equal(progress.transactions.length, 0);
+});
+
 test('stepper follows receipt phases rather than a guessed completion percentage', () => {
   const pending = describeExecutionProgress({ ...journal('withdraw_sent'), tx: { withdraw: hash('1') } });
   assert.deepEqual(pending.steps.map(item => item.status), ['completed', 'active', 'pending', 'pending', 'pending']);

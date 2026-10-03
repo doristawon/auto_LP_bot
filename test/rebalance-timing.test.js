@@ -16,6 +16,16 @@ const snapshot = (position) => ({ generatedAt: NOW - 30_000,
   portfolio: { positions: [{ id: POSITION, poolId: POOL, pair: 'USDG/EARN', shares: '1',
     outside: true, shouldRebalance: false, outOfRangeSince: NOW - 5 * 60_000, ...position }] } });
 
+test('expired OOR countdown explains unmet excursion threshold', () => {
+  const control = status(); control.strategy.confirmDelayMin = 5;
+  control.strategy.minExcursionPct = 0.25;
+  const result = rebalanceTiming(control, snapshot({ excursionPct: 0.2 }), NOW);
+  assert.equal(result.phase, 'below-threshold');
+  assert.equal(result.minExcursionPct, 0.25);
+  assert.equal(result.targetAt, control.nextMonitorAt);
+  assert.equal(rebalanceTiming(control, snapshot({ excursionPct: 0.3, shouldRebalance: true }), NOW).phase, 'scheduled');
+});
+
 test('countdown points to the first scheduled scan after the OOR confirmation deadline', () => {
   const result = rebalanceTiming(status(), snapshot(), NOW);
   assert.equal(result.phase, 'confirming');

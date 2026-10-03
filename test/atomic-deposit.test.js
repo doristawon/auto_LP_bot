@@ -139,6 +139,34 @@ const swapFundingPlan = ({ pool, before = BASELINE, funding = FUNDING }) => ({
   minLiquidity: 1n, deadline: 1234
 });
 
+test('semantic sequential preflight reverts are refitted before any capital broadcast', async () => {
+  const h = makeHarness();
+  const original = h.executor.prepareRangeBalancedSwap;
+  let rounds = 0;
+  h.executor.preparePinnedRangeBalancedSwap = async function (options) {
+    if (++rounds === 1) throw Object.assign(new Error('stale preview'), { code: 'SEQUENTIAL_SIMULATION_REVERT' });
+    return original.call(this, options);
+  };
+  const result = await executeAtomicDeposit.call(h.executor, {
+    pool, target: TARGET, funding: FUNDING, balances: BASELINE, journal: h.txJournal
+  });
+  assert.equal(result.status, 'completed'); assert.equal(h.calls.sends, 1);
+  assert.equal(rounds, 3); // one rejected round; refit before and after allowance reads
+  assert.ok(h.journalHistory.some(j => j.atomicRetryReason === 'preflight-price-changed'));
+});
+
+test('semantic preflight retries are bounded and never broadcast a failing plan', async () => {
+  const h = makeHarness(); let rounds = 0;
+  h.executor.preparePinnedRangeBalancedSwap = async () => {
+    rounds++; throw Object.assign(new Error('always reverting'), { code: 'SEQUENTIAL_SIMULATION_REVERT' });
+  };
+  await assert.rejects(executeAtomicDeposit.call(h.executor, {
+    pool, target: TARGET, funding: FUNDING, balances: BASELINE, journal: h.txJournal
+  }), /always reverting/);
+  assert.equal(rounds, 3); assert.equal(h.calls.sends, 0);
+  assert.equal(h.settings.get('activeRebalanceExecution').phase, 'failed');
+});
+
 test('atomic request encodes a single swap-and-deposit call and enforces authorized funding', () => {
   const built = buildAtomicDepositRequest(swapFundingPlan({ pool }));
   const parsed = guardInterface.parseTransaction({ data: built.data });

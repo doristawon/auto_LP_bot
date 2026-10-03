@@ -32,7 +32,8 @@ Production policy：
 
 ```env
 RANGE_CHECK_INTERVAL_MS=300000
-OOR_CONFIRM_DELAY_MIN=15
+OOR_CONFIRM_DELAY_MIN=5
+OOR_MIN_EXCURSION_PCT=0.25
 ```
 
 絕對規則：
@@ -41,7 +42,7 @@ OOR_CONFIRM_DELAY_MIN=15
 
 Manual Rebalance 不得提供 bypass。
 
-首次鏈上觀測到 OOR 即計時；滿 15 分鐘後第一次成功的鏈上 Tick 讀取仍在原 LP 區間外，才具備自動撤池資格。期間任何一次讀到回到區間內都清除計時。冷卻、Gas、模擬與其他安全閘門仍須通過。
+首次鏈上觀測到 OOR 即計時；滿 5 分鐘後第一次成功的鏈上 Tick 讀取仍在原 LP 區間外，且超出邊界至少 0.25%，才具備自動撤池資格。期間任何一次讀到回到區間內都清除計時。冷卻、Gas、模擬與其他安全閘門仍須通過。
 
 ## 4. EIP-7702 guard
 

@@ -16,7 +16,8 @@ export function evaluatePosition({
   lastEvaluationAt = 0,
   outOfRangeSince = 0,
   checkIntervalMs = 5 * 60 * 1000,
-  confirmDelayMs = 15 * 60 * 1000,
+  confirmDelayMs = 5 * 60 * 1000,
+  minExcursionPct = 0.25,
   cooldownUntil = 0,
   nowMs = Date.now()
 }) {
@@ -35,7 +36,7 @@ export function evaluatePosition({
   const nextOutOfRangeSince = outside ? (outOfRangeSince || nowMs) : 0;
   const outOfRangeElapsedMs = outside ? Math.max(0, nowMs - nextOutOfRangeSince) : 0;
   const shouldRebalance = outside && outOfRangeSince > 0
-    && outOfRangeElapsedMs >= confirmDelayMs && !cooldownActive;
+    && outOfRangeElapsedMs >= confirmDelayMs && excursionPct >= minExcursionPct && !cooldownActive;
 
   return {
     outside,

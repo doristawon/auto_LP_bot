@@ -23,6 +23,8 @@ import {
 import { UniversalRouterAdapter } from './universal-router.js';
 import { FablesAdapter } from './fables.js';
 import { pinnedSimulationProvider } from '../execution/pinned-simulation.js';
+import { createPinnedPlanningContext } from '../execution/pinned-planning.js';
+import { outOfRangeExcursionPct } from '../strategy.js';
 import { V4QuoterAdapter } from './quoter.js';
 import { buildExactBalancedSwapPlan, quotePriceImpactBps } from '../execution/exact-rebalance.js';
 import { buildPairFundingScope } from '../execution/pair-funding.js';
@@ -1499,6 +1501,14 @@ export class RebalanceExecutor {
     });
   }
 
+  async preparePinnedRangeBalancedSwap(options) {
+    const context = await createPinnedPlanningContext(this);
+    const state = await context.fables.readPoolState(options.pool);
+    if (state.paused !== false) throw new Error('Pinned planning pool is paused');
+    const fitted = await context.prepareRangeBalancedSwap({ ...options, state });
+    return { ...fitted, planningBlockTag: context.planningBlockTag };
+  }
+
   async simulateTopUpSwapPreview({ pool, approvalRequests, swapPlan, prefixCalls = [] }) {
     if (!swapPlan?.quote || swapPlan.direction === 'none') {
       throw new Error('A priced swap is required for the post-swap pool preview');
@@ -1598,7 +1608,17 @@ export class RebalanceExecutor {
     return { swapRequest, depositData, depositEvent, callCount: results.length };
   }
 
-  async preflightSamePoolSequence({
+  async preflightSamePoolSequence(options) {
+    const context = await createPinnedPlanningContext(this);
+    const poolState = await context.fables.readPoolState(options.pool);
+    const balances = await context.readRawPairBalances(options.pool);
+    if (balances.raw0 !== options.preBalances.raw0 || balances.raw1 !== options.preBalances.raw1) {
+      throw new Error('Pair inventory changed before pinned withdrawal preflight');
+    }
+    return context.preflightSamePoolSequenceAtBlock({ ...options, poolState });
+  }
+
+  async preflightSamePoolSequenceAtBlock({
     pool, position, guardedData, preBalances, scopedPreBalances = preBalances,
     allocationScope = null, poolState, deadline, maxPriceImpactBps, includeCost = false
   }) {
@@ -3315,7 +3335,13 @@ export class RebalanceExecutor {
     plan.currentTick = latestState.tick;
     plan.pool.state = latestState;
 
-    if (outside) return latestState;
+    if (outside) {
+      const minExcursionPct = this.config.oorMinExcursionPct ?? 0;
+      if (outOfRangeExcursionPct(latestState.tick, plan.position.tickLower, plan.position.tickUpper) < minExcursionPct) {
+        throw new Error(`OOR excursion is below ${minExcursionPct}% before withdrawal`);
+      }
+      return latestState;
+    }
 
     const details = {
       positionId: plan.position.id,

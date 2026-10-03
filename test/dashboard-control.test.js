@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { DashboardServer } from '../src/dashboard/server.js';
 import { dashboardPage } from '../src/dashboard/page.js';
+import { normalizeRangePolicy } from '../src/config.js';
 
 function makeHarness() {
   const calls = { scans: [], manual: [], rotation: [], pause: [], investmentTarget: [], allocation: [], manualBaselines: [], quoteRefreshes: 0, evidenceRefreshes: 0 };
@@ -89,6 +90,20 @@ async function withServer(fn) {
     await h.server.stop();
   }
 }
+
+test('range policy endpoint applies validated settings and rejects invalid values', async () => {
+  await withServer(async ({ bot }, base) => {
+    let saved = null;
+    bot.setRangePolicy = values => { saved = normalizeRangePolicy(values); return saved; };
+    const send = values => fetch(base + '/api/settings/range-policy', { method: 'POST',
+      headers: { origin: base, 'content-type': 'application/json' }, body: JSON.stringify(values) });
+    const ok = await send({ confirmDelayMin: 5, minExcursionPct: 0.25 });
+    assert.equal(ok.status, 200);
+    assert.deepEqual((await ok.json()).policy, { confirmDelayMin: 5, minExcursionPct: 0.25 });
+    assert.equal((await send({ confirmDelayMin: 0, minExcursionPct: 0.25 })).status, 400);
+    assert.deepEqual(saved, { confirmDelayMin: 5, minExcursionPct: 0.25 });
+  });
+});
 
 test('single-pool switch queues behind observation and releases the flag after persistence', async () => {
   await withServer(async ({ bot, calls }, base) => {
@@ -252,6 +267,36 @@ test('dashboard provides a keyword-filtered specified-pool selector', () => {
   assert.match(html, /id="allocationPanel"/);
   assert.match(html, /id="allocationPoolSearch" type="search"/);
   assert.match(html, /兩池各自依本池 OOR 政策重建/);
+});
+
+test('dashboard exposes separately saved OOR wait and excursion thresholds', () => {
+  const html = dashboardPage();
+  const inlineScript = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  assert.ok(inlineScript);
+  assert.doesNotThrow(() => new Function(inlineScript));
+  assert.match(html, /id="confirmDelayMin" type="number" min="1" max="1440" step="any" value="5"/);
+  assert.match(html, /id="minExcursionPct" type="number" min="0" max="10" step="any" value="0\.25"/);
+  assert.match(html, /confirmDelayMin<1\|\|confirmDelayMin>1440/);
+  assert.match(html, /最小超出幅度須介於 0 至 10%/);
+  assert.match(html, /區間外等待時間（分鐘）/);
+  assert.match(html, /最小超出邊界幅度（%）/);
+  assert.match(html, /一般區間掃描週期（秒）/);
+  assert.match(html, /api\('\/api\/settings\/range-policy'/);
+  assert.match(html, /JSON\.stringify\(\{confirmDelayMin,minExcursionPct\}\)/);
+  assert.match(html, /等待超出邊界至少 /);
+  assert.match(html, /timing\.phase==='below-threshold'/);
+});
+
+test('dashboard suppresses empty position errors and resolves verified manual LP recovery', () => {
+  const html = dashboardPage();
+  assert.match(html, /const reasonNote=x\.rebalanceReason\?/);
+  assert.doesNotMatch(html, /translateError\(x\.rebalanceReason\|\|''\)/);
+  assert.match(html, /progress\.reconciliationStatus==='verified-manual-lp-replacement'/);
+  assert.match(html, /progress\.error==='Original redeposit failed; later manual LP replacement verified'/);
+  assert.match(html, /手動復原已核對/);
+  assert.match(html, /已解除待復原/);
+  assert.match(html, /原 Bot 再投入失敗；後續手動 LP 已核對，目前已解除待復原狀態。/);
+  assert.match(html, /歷史 Bot 步驟僅供參考；原再投入未成功。/);
 });
 
 test('dashboard manual rebalance is fail-closed until explicitly armed', async () => {

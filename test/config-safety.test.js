@@ -60,11 +60,13 @@ test('RPC request timeout defaults to 30 seconds and is bounded', () => {
   );
 });
 
-test('OOR confirmation defaults to 15 minutes and ignores legacy max wait', () => {
+test('OOR defaults to five minutes and 0.25 percent, ignoring legacy max wait', () => {
   const config = withEnv({ OOR_MAX_WAIT_MIN: '30' }, loadConfig);
-  assert.equal(config.oorConfirmDelayMin, 15);
-  assert.equal(config.oorConfirmDelayMs, 15 * 60_000);
-  assert.throws(() => withEnv({ OOR_CONFIRM_DELAY_MIN: '0' }, loadConfig), /OOR_CONFIRM_DELAY_MIN/);
+  assert.equal(config.oorConfirmDelayMin, 5);
+  assert.equal(config.oorConfirmDelayMs, 5 * 60_000);
+  assert.equal(config.oorMinExcursionPct, 0.25);
+  assert.throws(() => withEnv({ OOR_CONFIRM_DELAY_MIN: '0' }, loadConfig), /等待時間/);
+  assert.throws(() => withEnv({ OOR_MIN_EXCURSION_PCT: '-1' }, loadConfig), /門檻/);
 });
 
 test('official reposition defaults off and requires its v3 guard pin for the selected wallet', () => {

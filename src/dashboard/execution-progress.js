@@ -25,6 +25,8 @@ export function describeExecutionProgress(journal) {
   if (!journal?.id || !journal.phase) return null;
   if (journal.kind === 'fee_claim') return describeFeeClaim(journal);
   const phase = String(journal.phase);
+  const manualReconciled = phase === 'failed' && hashValue(journal.reconciliation?.replacementHash)
+    && hashValue(journal.reconciliation?.withdrawHash);
   const status = phase === 'completed' ? 'completed' : phase === 'failed' ? 'failed'
     : phase === 'recovery_required' ? 'recovery' : 'running';
   const observedPhase = ['failed', 'recovery_required', 'tx_broadcast_pending'].includes(phase)
@@ -155,7 +157,9 @@ export function describeExecutionProgress(journal) {
       ? '原子換幣與存入 LP 預檢通過，準備送出單筆交易。' : '原子存入 LP 預檢通過，準備送出單筆交易。',
     atomic_sent: journal.atomicSwapRequired === true
       ? '換幣＋一次存入 LP 已在同一筆交易送出，等待確認。' : '一次存入 LP 已送出，等待確認。',
-    atomic_retry: '上一筆原子交易已回退，正在重新預檢。',
+    atomic_retry: journal.atomicRetryReason === 'preflight-price-changed'
+      ? '尚未送出資金交易；預檢狀態變動，正在重新計算與模擬。'
+      : '上一筆原子交易已回退，正在重新預檢。',
     atomic_confirmed: '原子交易已確認，正在核對 LP 份額與餘額。'
     ,official_preflighted: '舊區間手續費與官方再平衡已預檢，準備送出單筆交易。'
     ,official_sent: '領取手續費與官方一次再平衡已在同一筆交易送出，等待確認。'
@@ -172,6 +176,7 @@ export function describeExecutionProgress(journal) {
     : transactions.filter(item => item.step !== 'preflight').at(-1) || transactions.at(-1) || null;
   return {
     id: cleanText(journal.id, 240), kind, label: labels[kind], phase, status,
+    ...(manualReconciled ? { reconciliationStatus: 'verified-manual-lp-replacement' } : {}),
     pair: cleanText(journal.pair || journal.destinationPair || journal.sourcePair, 80),
     startedAt: Number(journal.startedAt) || null,
     updatedAt: Number(journal.updatedAt || journal.startedAt) || null,

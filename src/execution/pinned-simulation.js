@@ -7,6 +7,7 @@ export function pinnedSimulationProvider(provider, blockTag) {
   return new Proxy(provider, {
     get(target, property) {
       if (property === 'send') return async (method, parameters) => {
+        if (method === 'eth_blockNumber') return blockTag;
         if (['eth_sendRawTransaction', 'eth_sendTransaction'].includes(method)) {
           throw new Error('Pinned simulation provider cannot broadcast');
         }

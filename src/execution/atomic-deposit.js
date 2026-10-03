@@ -67,7 +67,8 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
         this.config.tightWidthBps, this.config.rangePreset);
       const stableIndex = pool.token0.address.toLowerCase() === this.config.usdgAddress.toLowerCase() ? 0
         : pool.token1.address.toLowerCase() === this.config.usdgAddress.toLowerCase() ? 1 : null;
-      let fitted = await this.prepareRangeBalancedSwap({ pool, funding, state, target, stableIndex,
+      const prepareFit = this.preparePinnedRangeBalancedSwap || this.prepareRangeBalancedSwap;
+      let fitted = await prepareFit.call(this, { pool, funding, state, target, stableIndex,
         maxPriceImpactBps, expectedOutput: true, ...(retarget ? { chooseTarget: tick => buildTargetRange(tick,
           pool.key.tickSpacing, this.config.tightWidthBps, this.config.rangePreset) } : {}) });
       const swapPlan = fitted.swapPlan;
@@ -77,7 +78,7 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
         // Allowance transactions happen before final fitting, never between
         // the committed swap and deposit.
         const fresh = await this.fables.readPoolState(pool);
-        fitted = await this.prepareRangeBalancedSwap({ pool, funding, state: fresh,
+        fitted = await prepareFit.call(this, { pool, funding, state: fresh,
           target: fitted.target, stableIndex, maxPriceImpactBps, expectedOutput: true,
           ...(retarget ? { chooseTarget: tick => buildTargetRange(tick,
             pool.key.tickSpacing, this.config.tightWidthBps, this.config.rangePreset) } : {}) });
@@ -195,7 +196,7 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
       } catch (error) {
         // A semantic preflight revert before signing has moved no capital in
         // this call. Refit a stale market plan without sending a failed swap.
-        if (!capitalHash && !confirmed && error.code === 'CALL_EXCEPTION' && attempt < 2) {
+        if (!capitalHash && !confirmed && ['CALL_EXCEPTION', 'SEQUENTIAL_SIMULATION_REVERT'].includes(error.code) && attempt < 2) {
           update({ phase: 'atomic_retry', atomicAttempt: attempt + 1, atomicRetryReason: 'preflight-price-changed' });
           continue;
         }

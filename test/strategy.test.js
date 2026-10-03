@@ -10,8 +10,19 @@ const base = {
   position: { tickLower: 900, tickUpper: 1000 },
   widthBps: 120,
   checkIntervalMs: 5 * MIN,
-  confirmDelayMs: 15 * MIN
+  confirmDelayMs: 15 * MIN,
+  minExcursionPct: 0
 };
+
+test('five-minute OOR requires at least 0.25 percent excursion on the confirming read', () => {
+  const t0 = 2_000_000;
+  const policy = { ...base, minExcursionPct: 0.25, confirmDelayMs: 5 * MIN, outOfRangeSince: t0 };
+  assert.equal(evaluatePosition({ ...policy, currentTick: 1050, nowMs: t0 + 4 * MIN }).shouldRebalance, false);
+  assert.equal(evaluatePosition({ ...policy, currentTick: 1024, nowMs: t0 + 5 * MIN }).shouldRebalance, false);
+  assert.equal(evaluatePosition({ ...policy, currentTick: 1025, nowMs: t0 + 5 * MIN }).shouldRebalance, true);
+  assert.equal(evaluatePosition({ ...policy, currentTick: 875, nowMs: t0 + 5 * MIN }).shouldRebalance, true);
+  assert.equal(evaluatePosition({ ...policy, currentTick: 950, nowMs: t0 + 5 * MIN }).outOfRangeSince, 0);
+});
 
 test('Tight 120 bps is about 120 ticks before spacing snap', () => {
   const delta = priceWidthBpsToTickDelta(120);

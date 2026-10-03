@@ -29,10 +29,13 @@ export async function simulateSequentialCalls(provider, { walletAddress, chainId
   }
   for (let index = 0; index < results.length; index++) {
     if (results[index]?.status !== '0x1') {
-      const revertData = String(results[index]?.returnData || results[index]?.error?.data || '');
+      const revertData = [results[index]?.returnData, results[index]?.error?.data]
+        .find(value => typeof value === 'string' && /^0x[0-9a-fA-F]{8}/.test(value)) || '';
       const selector = /^0x[0-9a-fA-F]{8}/.test(revertData) ? ` (${revertData.slice(0, 10)})` : '';
       const error = new Error(`Sequential simulation call ${index + 1} failed: ${results[index]?.error?.message || 'reverted'}${selector}`);
       error.simulationResults = results;
+      error.revertSelector = revertData.slice(0, 10) || null;
+      if (results[index]?.error?.code === 3) error.code = 'SEQUENTIAL_SIMULATION_REVERT';
       throw error;
     }
   }

@@ -24,7 +24,7 @@ export function rebalanceTiming(status, snapshot, nowMs = Date.now()) {
 
   const outSince = Number(position.outOfRangeSince || 0);
   if (!(outSince > 0)) return { ...base, phase: 'awaiting-observation', pair: position.pair || null };
-  const confirmMs = Math.max(0, Number(status?.strategy?.confirmDelayMin || 15) * 60_000);
+  const confirmMs = Math.max(0, Number(status?.strategy?.confirmDelayMin ?? 5) * 60_000);
   const policyReadyAt = outSince + confirmMs;
   const backoff = (status?.rebalanceBackoffs || []).find((item) =>
     String(item.poolId || '').toLowerCase() === String(position.poolId || '').toLowerCase()
@@ -33,6 +33,10 @@ export function rebalanceTiming(status, snapshot, nowMs = Date.now()) {
   const nextMonitorAt = Number(status?.nextMonitorAt || 0);
   const common = { ...base, pair: position.pair || null, policyReadyAt,
     backoffUntil: backoffUntil > nowMs ? backoffUntil : null };
+  const minExcursionPct = Math.max(0, Number(status?.strategy?.minExcursionPct ?? 0));
+  if (nowMs >= policyReadyAt && Number(position.excursionPct || 0) < minExcursionPct) {
+    return { ...common, phase: 'below-threshold', targetAt: nextMonitorAt || null, minExcursionPct };
+  }
   if (!(nextMonitorAt > 0)) return { ...common, phase: 'awaiting-schedule' };
 
   const readyAt = Math.max(policyReadyAt, backoffUntil, nowMs);

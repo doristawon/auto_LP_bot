@@ -118,6 +118,15 @@ export class DashboardServer {
         return sendJson(res, 400, { error: sanitize(error.message || '更新週期設定失敗') });
       }
     }
+    if (req.method === 'POST' && url.pathname === '/api/settings/range-policy') {
+      const body = await readJsonBody(req);
+      try { return sendJson(res, 200, { ok: true, policy: bot.setRangePolicy(body) }); }
+      catch (error) { return sendJson(res, 400, { error: sanitize(error.message || '更新區間外規則失敗') }); }
+    }
+    if (req.method === 'POST' && url.pathname === '/api/control/reconcile-manual-lp') {
+      try { return sendJson(res, 200, { ok: true, recovery: await bot.resolveManualRecovery() }); }
+      catch (error) { return sendJson(res, 409, { error: sanitize(error.message) }); }
+    }
     if (req.method === 'GET' && url.pathname === '/api/risk/stop-loss') {
       return sendJson(res, 200, bot.getStopLossSnapshot());
     }

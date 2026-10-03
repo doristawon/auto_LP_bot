@@ -11,6 +11,15 @@ const args = {
   ]
 };
 
+test('empty returnData cannot hide the real guard revert selector', async () => {
+  const provider = { send: async method => method === 'eth_chainId' ? '0x1237'
+    : [{ calls: [{ status: '0x1' }, { status: '0x0', returnData: '0x',
+      error: { code: 3, message: 'execution reverted', data: '0xb6470697' } }] }] };
+  await assert.rejects(simulateSequentialCalls(provider, args), error => {
+    assert.equal(error.revertSelector, '0xb6470697');assert.equal(error.code, 'SEQUENTIAL_SIMULATION_REVERT');return true;
+  });
+});
+
 test('sequential simulation checks the chain and every call status', async () => {
   const methods = [];
   const provider = { send: async (method, params) => {
