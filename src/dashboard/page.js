@@ -189,6 +189,7 @@ let dashboardToken=sessionStorage.getItem('dashboardToken')||'';
 const validTabs=['overview','wallet','pools','positions','points','ledger'];
 const tabNames={overview:'總覽',wallet:'錢包與 RPC',pools:'池子監控與 APR',positions:'LP 部位與區間檢查',points:'分數即時模擬',ledger:'帳務與事件紀錄'};
 const eventNames={
+  'fee.claimed':'自動領取舊區間手續費','fee.claim_failed':'手續費領取未完成','fee.claim_scan_failed':'舊區間費用掃描未完成',
   'portfolio.snapshot':'資產組合快照','portfolio.baseline_created':'建立資產基準','points.actual_baseline':'更新實際分數基準',
   'execution.control':'執行暫停狀態','cashflow.adjustment':'手動帳務調整','cashflow.external_transfer':'外部資金轉入／轉出','reward.claimed':'已領獎勵','fee.accrual':'個人手續費累計','fee.owed_decrease':'未領手續費減少',
   'pool.fee':'池子手續費紀錄','pool.fee_unattributed':'未歸屬池子的手續費','lp.deposit':'LP 存入','lp.withdraw':'LP 提領',
@@ -393,6 +394,9 @@ function eventPhase(value){
   return names[text]||text;
 }
 function eventDetail(e){
+  if(e.type==='fee.claimed')return'舊區間已領 '+num(e.amount0)+' '+safeEventText(e.symbol0,12)+'＋'+num(e.amount1)+' '+safeEventText(e.symbol1,12)+' · 已計費用不重複列入收益';
+  if(e.type==='fee.claim_failed')return e.recoveryRequired?'手續費領取結果待核對，已暫停重送':'手續費領取未完成，下輪重新檢查';
+  if(e.type==='fee.claim_scan_failed')return'舊區間費用掃描未完成，下輪重新檢查';
   if(e.type==='cashflow.external_transfer')return(e.direction==='in'?'轉入 ':'轉出 ')+safeEventText(e.symbol||'',12)+' '+num(Math.abs(Number(e.amount||0)))+' · 計入本金 '+usd(e.usd);
   if(e.type==='reward.claimed')return'已領 '+safeEventText(e.symbol||'',12)+' '+num(e.amount)+' · 列為收益，不計入本金';
   if(e.type==='portfolio.snapshot')return e.accountingVersion===2

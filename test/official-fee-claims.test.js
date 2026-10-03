@@ -17,6 +17,27 @@ const poolId = keccak256(coder.encode([poolKeyAbi], [[
 ]]));
 const lensInterface = new Interface(LENS_ABI);
 
+test('retired sweep needs no current LP and only returns zero-share eligible fee ranges', async () => {
+  const retired = range(-240, -120, 3n, 10n, { shares: 0n });
+  const active = range(-120, 0, 3n, 20n);
+  const empty = range(0, 120, 0n, 0n, { shares: 0n });
+  const paused = range(120, 240, 1n, 30n, { shares: 0n, claimPaused: true });
+  const f = makeFixture([retired, active, empty, paused]);
+  const rows = await collectOfficialClaimRanges({ ...f, walletAddress: wallet, retiredOnly: true });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].rangeId, retired.id);
+  assert.equal(rows[0].claimable1, '10');
+});
+
+test('retired sweep merges known ranges when owner indexer has not indexed the last withdrawal', async () => {
+  const retired = range(-240, -120, 3n, 10n, { shares: 0n });
+  const f = makeFixture([retired], []);
+  const rows = await collectOfficialClaimRanges({ ...f, walletAddress: wallet, retiredOnly: true,
+    ownerLedger: { Position: [] }, knownRangeIds: [retired.id] });
+  assert.equal(rows[0].rangeId, retired.id);
+  assert.equal(f.ownerCalls.length, 0);
+});
+
 function range(lower, upper, claimable0 = 0n, claimable1 = 0n, overrides = {}) {
   const id = keccak256(coder.encode(['bytes32', 'int24', 'int24'], [poolId, lower, upper]));
   return { id, lower, upper, claimable0, claimable1, overrides };

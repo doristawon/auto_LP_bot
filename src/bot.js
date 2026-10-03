@@ -13,6 +13,7 @@ import { computeAllocationFunding, normalizeInvestmentAllocation, valuePoolPosit
 import { PortfolioAnalytics } from './analytics/portfolio.js';
 import { captureLpSessionReference, evaluateStopLoss, normalizeStopLoss } from './analytics/stop-loss.js';
 import { executeStopLiquidation, reconcileStopLiquidation } from './execution/stop-liquidation.js';
+import { sweepRetiredFees } from './execution/retired-fee-claims.js';
 import { rebalanceTiming } from './dashboard/rebalance-timing.js';
 import { describeExecutionProgress } from './dashboard/execution-progress.js';
 import { PointsTracker } from './analytics/points-tracker.js';
@@ -1801,6 +1802,7 @@ export class AutoLpBot {
           liveWrites: this.config.enableLiveWrites,
           autoRedeploy: this.config.enableAutoRedeploy,
           autoTopupEnabled: this.config.autoTopupEnabled,
+          autoClaimRetiredFees: this.config.autoClaimRetiredFees,
           executionPaused: this.executionPaused,
           lastAction: this.state.getSetting('lastAction', null),
           targetMode: this.config.targetMode,
@@ -1850,6 +1852,7 @@ export class AutoLpBot {
       }
       if (this.getInvestmentAllocationConfig?.()?.enabled === true) {
         await this.runAllocationExecutionCycle(targetPools, pendingRebalances);
+        await sweepRetiredFees.call(this, accountingPools, { force: this.capitalReadbackPending === true });
         if (this.snapshot) {
           this.snapshot = {
             ...this.snapshot,
@@ -1867,6 +1870,7 @@ export class AutoLpBot {
         await this.maybeRebalance(pool, position);
       }
       if (!pendingRebalances.length) await this.maybeTopUpIdleBalance(targetPools, walletBalances);
+      await sweepRetiredFees.call(this, accountingPools, { force: this.capitalReadbackPending === true });
       return snapshot;
     } finally {
       this.cycleActive = false;

@@ -23,6 +23,7 @@ const hashValue = value => typeof value === 'string' && /^0x[0-9a-f]{64}$/i.test
 // transaction submission, or guessed completion percentages.
 export function describeExecutionProgress(journal) {
   if (!journal?.id || !journal.phase) return null;
+  if (journal.kind === 'fee_claim') return describeFeeClaim(journal);
   const phase = String(journal.phase);
   const status = phase === 'completed' ? 'completed' : phase === 'failed' ? 'failed'
     : phase === 'recovery_required' ? 'recovery' : 'running';
@@ -180,4 +181,29 @@ export function describeExecutionProgress(journal) {
     message, error: cleanText(journal.error), steps, transactions,
     lastTransaction
   };
+}
+
+function describeFeeClaim(journal) {
+  const phase = String(journal.phase);
+  const status = phase === 'completed' ? 'completed' : phase === 'failed' ? 'failed'
+    : phase === 'recovery_required' ? 'recovery' : 'running';
+  const observed = ['failed', 'recovery_required'].includes(phase) ? journal.lastKnownPhase : phase;
+  const index = status === 'completed' || observed === 'claim_confirmed' ? 2
+    : journal.tx?.claim ? 1 : 0;
+  const labels = ['預檢', '領取舊區間手續費', '核對'];
+  const keys = ['preflight', 'claim', 'verify'];
+  const hash = hashValue(journal.tx?.claim);
+  const transactions = hash ? [{ step: 'claim', label: labels[1], hash,
+    status: status === 'completed' || observed === 'claim_confirmed' ? 'confirmed'
+      : status === 'recovery' || status === 'failed' ? 'unknown' : 'pending' }] : [];
+  return { id: cleanText(journal.id, 240), kind: 'claim', label: '自動領取手續費',
+    phase, status, pair: cleanText(journal.pair, 80), startedAt: Number(journal.startedAt) || null,
+    updatedAt: Number(journal.updatedAt) || null, finishedAt: Number(journal.completedAt || journal.failedAt) || null,
+    stepIndex: index, currentStepLabel: status === 'completed' ? '已完成' : labels[index],
+    message: status === 'recovery' ? '領取結果需要核對，已停止重送。'
+      : status === 'completed' ? '舊區間手續費已領回錢包。' : labels[index],
+    error: cleanText(journal.error), transactions, lastTransaction: transactions.at(-1) || null,
+    steps: keys.map((key, i) => ({ key, label: labels[i], status: status === 'completed' || i < index
+      ? 'completed' : i > index ? 'pending' : status === 'recovery' ? 'attention'
+        : status === 'failed' ? 'failed' : 'active' })) };
 }

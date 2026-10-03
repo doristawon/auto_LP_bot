@@ -220,6 +220,7 @@ export function loadConfig() {
     eip7702GuardVerificationEnabled,
     eip7702GuardVerifiedFor,
     claimBeforeWithdraw: envBool('CLAIM_BEFORE_WITHDRAW', true),
+    autoClaimRetiredFees: envBool('AUTO_CLAIM_RETIRED_FEES', true),
     allowZeroMinOut: envBool('ALLOW_ZERO_MIN_OUT', false),
     txDeadlineSec: envInt('TX_DEADLINE_SEC', 1200),
     confirmations: envInt('TX_CONFIRMATIONS', 1),

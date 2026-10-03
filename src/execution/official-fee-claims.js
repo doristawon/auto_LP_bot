@@ -22,23 +22,25 @@ export async function collectOfficialClaimRanges({
   provider,
   currentPosition,
   maxFeeBps = 1000,
-  fetchFn = fetch
+  fetchFn = fetch,
+  retiredOnly = false,
+  ownerLedger = null,
+  knownRangeIds = []
 }) {
   const context = validatePool(pool);
   const wallet = getAddress(walletAddress);
   if (!provider || typeof provider.call !== 'function') {
     throw new Error('official-claim-provider-invalid');
   }
-  if (!currentPosition || currentPosition.id == null) {
+  if (!retiredOnly && (!currentPosition || currentPosition.id == null)) {
     throw new Error('official-claim-current-position-required');
   }
   if (!Number.isInteger(maxFeeBps) || maxFeeBps < 0 || maxFeeBps > 10_000) {
     throw new Error('official-claim-fee-cap-invalid');
   }
 
-  const currentRangeId = normalizeUint256(currentPosition.id);
-  const currentIdHex = toBytes32(currentRangeId);
-  const owner = await fetchOwnerLedger(wallet, fetchFn);
+  const currentRangeId = retiredOnly ? null : normalizeUint256(currentPosition.id);
+  const owner = ownerLedger ?? await fetchOwnerLedger(wallet, fetchFn);
   if (!owner || !Array.isArray(owner.Position)) {
     throw new Error('official-claim-owner-positions-invalid');
   }
@@ -49,7 +51,11 @@ export async function collectOfficialClaimRanges({
     const id = normalizeUint256(item.range_id);
     ids.set(id.toString(), id);
   }
-  ids.set(currentRangeId.toString(), currentRangeId);
+  for (const rawId of knownRangeIds) {
+    const id = normalizeUint256(rawId);
+    ids.set(id.toString(), id);
+  }
+  if (currentRangeId !== null) ids.set(currentRangeId.toString(), currentRangeId);
   if (ids.size > MAX_LENS_RANGE_IDS) {
     throw new Error('official-claim-owner-range-bound-exceeded');
   }
@@ -102,6 +108,7 @@ export async function collectOfficialClaimRanges({
         throw new Error('official-claim-lens-fee-state-invalid');
       }
       const blocked = claimPaused || settling || effectiveFeeBps > maxFeeBps;
+      if (retiredOnly && (normalizeUint256(row.shares) !== 0n || !hasFees || blocked)) continue;
       if (isCurrent && blocked) {
         throw new Error('official-claim-range-not-eligible');
       }
@@ -119,8 +126,8 @@ export async function collectOfficialClaimRanges({
     }
   }
 
-  const current = rowsById.get(currentRangeId.toString());
-  if (!current?.current) throw new Error('official-claim-current-range-missing');
+  const current = currentRangeId === null ? null : rowsById.get(currentRangeId.toString());
+  if (!retiredOnly && !current?.current) throw new Error('official-claim-current-range-missing');
   const olderFeeRows = [...rowsById.values()].filter((row) => !row.current && row.hasFees);
   const usdIndex = context.key.currency0.toLowerCase() === USDG.toLowerCase() ? 0
     : context.key.currency1.toLowerCase() === USDG.toLowerCase() ? 1 : null;
@@ -135,6 +142,9 @@ export async function collectOfficialClaimRanges({
       return BigInt(a.rangeId) < BigInt(b.rangeId) ? -1 : BigInt(a.rangeId) > BigInt(b.rangeId) ? 1 : 0;
     });
   }
+  if (retiredOnly) return olderFeeRows.slice(0, MAX_CLAIM_RANGES).map(row => ({
+    ...row, claimable0: row.claimable0.toString(), claimable1: row.claimable1.toString()
+  }));
   const selected = [current, ...olderFeeRows.slice(0, MAX_CLAIM_RANGES - 1)];
   // Lens shares/balances are intentionally not returned; preview must retain
   // the caller's currentPosition snapshot and independently verify live shares.
