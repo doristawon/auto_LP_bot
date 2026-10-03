@@ -70,8 +70,12 @@ export async function buildExactBalancedSwapPlan({
   let lo = 1n;
   let hi = available < MAX_UINT128 ? available : MAX_UINT128;
   let best = null;
+  let previous = { amount: 0n, difference: targetDifference(initial) };
+  let nextAmount = null;
   for (let i = 0; i < iterations && lo <= hi; i++) {
-    const mid = (lo + hi) >> 1n;
+    const mid = nextAmount !== null && nextAmount >= lo && nextAmount <= hi
+      ? nextAmount : (lo + hi) >> 1n;
+    nextAmount = null;
     const quote = await quoter.quoteExactInputSingleRaw(swapPool, tokenIn, mid, slippageBps);
     if (BigInt(quote.rawAmountIn) !== mid) {
       throw new Error('Balancer quote input does not match the requested exact-input amount');
@@ -92,6 +96,11 @@ export async function buildExactBalancedSwapPlan({
     const difference = targetDifference(cap);
     const score = abs(difference);
     if (!best || score < best.score) best = { score, mid, quote, post0, post1, cap, impactBps };
+    // One basis point is far tighter than the atomic residual limit. Stop
+    // fetching indistinguishable quotes once the requested ratio is met.
+    const maxCapacity = cap.l0 > cap.l1 ? cap.l0 : cap.l1;
+    const differenceScale = preferRemainderTokenIndex === null ? 1n : 10_000n;
+    if (maxCapacity > 0n && score * 10_000n <= maxCapacity * differenceScale) break;
 
     if (tokenIn === 0) {
       if (difference > 0n) lo = mid + 1n;
@@ -100,6 +109,14 @@ export async function buildExactBalancedSwapPlan({
       if (difference < 0n) lo = mid + 1n;
       else hi = mid - 1n;
     }
+    // Interpolate the already quoted capacity difference, retaining the same
+    // bracket and iteration limit. Smooth AMM quotes usually converge in a
+    // few calls; discontinuities fall back to bisection.
+    if (difference !== previous.difference) {
+      const candidate = mid - difference * (mid - previous.amount) / (difference - previous.difference);
+      if (candidate >= lo && candidate <= hi) nextAmount = candidate;
+    }
+    previous = { amount: mid, difference };
   }
 
   if (!best || best.mid <= 0n) {

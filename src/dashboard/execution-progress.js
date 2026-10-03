@@ -56,7 +56,7 @@ export function describeExecutionProgress(journal) {
   const skippedWithdraw = kind === 'topup' || kind === 'bootstrap'
     || observedPhase === 'withdraw_not_required';
   const skippedSwap = observedPhase === 'swap_not_required'
-    || atomicFlow && journal.atomicSwapRequired !== true
+    || atomicFlow && journal.atomicSwapRequired === false
     || !atomicFlow && (journal.swapPolicy === 'deposit-only'
       || (stepIndex >= 3 && !journal.tx?.swap && !(journal.tx?.routeSwaps?.length)));
   const stepStatus = (index, skipped = false) => {

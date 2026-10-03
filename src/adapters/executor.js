@@ -463,6 +463,13 @@ export class RebalanceExecutor {
         this.config.tightWidthBps,
         this.config.rangePreset
       );
+      if (this.config.atomicDepositEnabled) {
+        return await executeAtomicDeposit.call(this, { pool: plan.pool,
+          target: targetAfterWithdraw, funding: fundingScope.funding, balances: postWithdrawBalances,
+          journal, oldPosition: plan.position, allocationScope, retarget: true,
+          maxPriceImpactBps: rebalanceMaxImpactBps,
+          onJournal: value => { journal = value; phase = value.phase; } });
+      }
       const fitted = await this.prepareRangeBalancedSwap({
         pool: plan.pool, funding: fundingScope.funding, state: postWithdrawState,
         target: targetAfterWithdraw, stableIndex: fundingScope.stableIndex,
@@ -477,14 +484,6 @@ export class RebalanceExecutor {
         balanceMismatchBps: fitted.capacityMismatchBps,
         swapPlan: serializeSwapPlan(swapPlan)
       });
-
-      if (this.config.atomicDepositEnabled) {
-        return await executeAtomicDeposit.call(this, { pool: plan.pool,
-          target: fitted.target, funding: fundingScope.funding, balances: postWithdrawBalances,
-          journal, oldPosition: plan.position, allocationScope, retarget: true,
-          maxPriceImpactBps: rebalanceMaxImpactBps,
-          onJournal: value => { journal = value; phase = value.phase; } });
-      }
 
       let postSwapBalances = postWithdrawBalances;
       if (swapPlan.direction !== 'none') {
@@ -1473,7 +1472,8 @@ export class RebalanceExecutor {
   }
 
   async prepareRangeBalancedSwap({ pool, funding, state, target, stableIndex,
-    maxPriceImpactBps, chooseTarget = null, prefixCalls = [], expectedOutput = false }) {
+    maxPriceImpactBps, chooseTarget = null, prefixCalls = [], expectedOutput = false,
+    swapAllowanceCaps = null }) {
     // Quote the same temporary state as the preview: withdrawal and route
     // conversions can change liquidity before the final balancing swap.
     const quoteProvider = prefixCalls.length ? { call: async ({ to, data }) => {
@@ -1495,7 +1495,7 @@ export class RebalanceExecutor {
       preferredRemainderBps: stableIndex === null ? 0 : Math.min(this.config.autoTopupDustBps ?? 25, 50),
       previewSwap: async swapPlan => {
         const approvalRequests = await this.buildTopUpApprovalRequests(pool, swapPlan,
-          { amount0Max: 0n, amount1Max: 0n });
+          { amount0Max: 0n, amount1Max: 0n }, { swapAllowanceCaps });
         return this.simulateTopUpSwapPreview({ pool, approvalRequests, swapPlan, prefixCalls });
       }
     });
@@ -1773,7 +1773,7 @@ export class RebalanceExecutor {
     };
   }
 
-  async buildTopUpApprovalRequests(pool, swapPlan, depositPlan) {
+  async buildTopUpApprovalRequests(pool, swapPlan, depositPlan, { swapAllowanceCaps = null } = {}) {
     const requests = [];
     const swapAmountByAddress = new Map();
     if (swapPlan.direction !== 'none') {
@@ -1788,7 +1788,13 @@ export class RebalanceExecutor {
 
     for (const [index, token] of [pool.token0, pool.token1].entries()) {
       const address = token.address.toLowerCase();
-      const swapAmount = swapAmountByAddress.get(address) || 0n;
+      let swapAmount = swapAmountByAddress.get(address) || 0n;
+      const bounded = swapAllowanceCaps !== null;
+      if (swapAmount > 0n && bounded) {
+        const cap = BigInt(index === 0 ? swapAllowanceCaps.raw0 : swapAllowanceCaps.raw1);
+        if (swapAmount > cap || cap <= 0n || cap > MAX_UINT128) throw new Error('Swap input exceeds finite authorization cap');
+        swapAmount = cap;
+      }
       if (swapAmount > 0n) {
         const tokenContract = new Contract(token.address, ERC20_ABI, this.readProvider);
         const erc20Allowance = BigInt(await tokenContract.allowance(this.config.walletAddress, PERMIT2));
@@ -3396,9 +3402,19 @@ export class RebalanceExecutor {
     return BigInt(await hook.balanceOf(this.config.walletAddress, rangeId));
   }
 
-  async ensureSwapAllowances(token, rawAmountIn) {
+  async ensureSwapAllowances(token, rawAmountIn, { allowanceCap = null, beforeBroadcast = null } = {}) {
     rawAmountIn = BigInt(rawAmountIn);
     if (rawAmountIn <= 0n) return;
+    if (allowanceCap !== null) {
+      const cap = BigInt(allowanceCap);
+      if (cap < rawAmountIn || cap <= 0n || cap > MAX_UINT128) throw new Error('Swap input exceeds finite authorization cap');
+      rawAmountIn = cap;
+    }
+    const assertBroadcastAllowed = () => {
+      if (this.state?.getSetting('executionPaused', false)) throw new Error('Execution is paused before swap approval');
+      beforeBroadcast?.();
+    };
+    assertBroadcastAllowed();
     if (token.address.toLowerCase() === ZERO_ADDRESS) throw new Error('Native input is not enabled');
     const tokenContract = new Contract(token.address, ERC20_ABI, this.readProvider);
     let erc20Allowance = BigInt(await tokenContract.allowance(this.config.walletAddress, PERMIT2));
@@ -3409,6 +3425,7 @@ export class RebalanceExecutor {
           label: `approve:${token.symbol}:permit2:reset`,
           to: token.address,
           data: erc20Interface.encodeFunctionData('approve', [PERMIT2, 0n]),
+          beforeBroadcast: assertBroadcastAllowed,
           value: 0n
         });
       }
@@ -3416,6 +3433,7 @@ export class RebalanceExecutor {
         label: `approve:${token.symbol}:permit2`,
         to: token.address,
         data: erc20Interface.encodeFunctionData('approve', [PERMIT2, rawAmountIn]),
+        beforeBroadcast: assertBroadcastAllowed,
         value: 0n
       });
       erc20Allowance = BigInt(await tokenContract.allowance(this.config.walletAddress, PERMIT2));
@@ -3436,11 +3454,13 @@ export class RebalanceExecutor {
           label: `permit2:${token.symbol}:router:reset`,
           to: PERMIT2,
           data: permit2Interface.encodeFunctionData('approve', [token.address, UNISWAP_UNIVERSAL_ROUTER_212, 0n, expiration]),
+          beforeBroadcast: assertBroadcastAllowed,
           value: 0n
         });
       }
       await this.sendVerifiedTx({
         label: `permit2:${token.symbol}:router`,
+        beforeBroadcast: assertBroadcastAllowed,
         to: PERMIT2,
         data: permit2Interface.encodeFunctionData('approve', [
           token.address,

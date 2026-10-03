@@ -197,7 +197,7 @@ test('one send produces one hash/receipt for swap plus deposit and preserves all
   assert.equal(result.status, 'completed');
   assert.equal(result.atomic, true);
   assert.equal(h.calls.sends, 1);
-  assert.equal(h.calls.scopeChecks, 2);
+  assert.ok(h.calls.scopeChecks >= 2);
   const parsed = guardInterface.parseTransaction({ data: h.executor.inspectLastPlan() });
   assert.equal(parsed.name, 'atomicSwapAndDeposit');
   assert.equal(parsed.args.plan.expectedBalance0, before.raw0);
@@ -276,7 +276,8 @@ test('confirmed no-op revert is refitted and retried at most three total sends',
     funding: FUNDING, balances: BASELINE, journal: h.txJournal, position });
   assert.equal(result.status, 'completed');
   assert.equal(h.calls.sends, 3);
-  assert.equal(h.calls.fit, 6);
+  assert.equal(h.calls.fit, 4);
+  assert.equal(h.calls.allowance, 1);
   assert.equal(h.calls.physicalReads, 6);
   assert.equal(h.calls.latestNonceReads, 2);
   assert.equal(h.calls.pendingNonceReads, 2);

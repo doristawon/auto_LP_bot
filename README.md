@@ -160,7 +160,9 @@ LEGACY_EIP7702_GUARD_ADDRESS=<previous guard address for wallets kept on v1>
 
 `ATOMIC_DEPOSIT_WALLETS` 可用逗號分隔列出要採用 v2 atomic 路徑的錢包；未設定時使用目前設定的 `WALLET_ADDRESS`。Atomic mode 會拒絕 v1 guard。已委派 v1 的錢包不會自動升級，也可在 atomic mode 關閉時繼續走 legacy guard 路徑；切換到 v2 必須明確部署並重新委派。啟用前請先在獨立測試錢包完成部署、委派與 canary 驗證。
 
-新版會在同一筆交易中完成換幣、精確 hook 授權、讀取成交後價格與最大可投入 liquidity、一次存入 LP，以及清除剩餘授權。每個幣種的額外殘額上限是授權投入量的 0.5% 加兩個最小單位；USDG 零頭與 ETH Gas 保留額另計。比例失準時整筆回退，確認餘額、LP 與 nonce 未變後最多重擬合三次。交易結果不明時保留 journal，禁止重送。撤池交易仍獨立執行，保留 OOR 防護。
+新版會在同一筆交易中完成換幣、精確 hook 授權、讀取成交後價格與最大可投入 liquidity、一次存入 LP，以及清除剩餘 hook 授權。每個幣種的額外殘額上限是授權投入量的 0.5% 加兩個最小單位；USDG 零頭與 ETH Gas 保留額另計。比例失準時整筆回退，確認餘額、LP 與 nonce 未變後最多重擬合三次。交易結果不明時保留 journal，禁止重送。撤池交易仍獨立執行，保留 OOR 防護。
+
+Atomic 規劃使用本次投入資金的有限 Permit2 額度，保持原有到期時間限制；報價重算會重用同一額度，不因換幣數量略變就反覆撤銷與授權。授權完成後才重新擬合，之後的價格重試不再重送授權。規劃最多三輪且每個階段檢查五分鐘上限；授權錯誤直接停止，暫停後的最終送單檢查也會阻止授權與資金交易。失敗後若資金已撤出，保留復原紀錄並阻止新的自動操作。
 
 Atomic route 支援 Uniswap V3、無 hook 的 Uniswap V4 與官方 registry 內的 Fables V4。Router 的 command、代幣、完整 V4 PoolKey、recipient、input、minOut 與 deadline 都受到限制。候選合約可先用 `node src/tools/preflight-atomic-deposit.js` 在鏈上暫存狀態預演；此工具不建立 signer、不廣播交易。
 

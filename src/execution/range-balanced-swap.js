@@ -80,6 +80,7 @@ export async function buildRangeBalancedSwapPlan({
   let refinements = 0;
 
   for (let index = 0; index < maxRefinements; index += 1) {
+    if (expectedOutput && best.capacityMismatchBps <= 10) break;
     const refined = await makePlan(balancePrice);
     refinements += 1;
     if (refined.blockedReason) break;
