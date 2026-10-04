@@ -69,6 +69,14 @@ const depositedTopic = id(DEPOSITED_EVENT).toLowerCase();
 const TOP_UP_DEPOSIT_GAS_LIMIT = 1_200_000n;
 const TOP_UP_APPROVAL_GAS_RESERVE = 300_000n;
 const TOP_UP_SWAP_GAS_LIMIT = 1_500_000n;
+// Opaque, request-bound, single-use proofs. Callers cannot manufacture one or
+// transfer a proof between wallets/executors. No signed transaction is cached.
+const verifiedPreflights = new WeakMap();
+const VERIFIED_PREFLIGHT_MAX_AGE_MS = 20_000;
+const semanticFingerprint = request => JSON.stringify([
+  String(request.from).toLowerCase(), String(request.to).toLowerCase(),
+  String(request.data).toLowerCase(), String(BigInt(request.value || 0))
+]);
 
 export function buildCrossPoolWithdrawCall({ pool, position, bounds, deadline, walletAddress,
   fablesWalk, manualImmediate = false }) {
@@ -3660,30 +3668,74 @@ export class RebalanceExecutor {
     return actual;
   }
 
-  async sendVerifiedTx({ label, to, data, value = 0n, onSent = null, feeOverrides = null, beforeBroadcast = null }) {
-    const fees = await this.getPinnedFeeOverrides(feeOverrides);
+  async preflightVerifiedTx({ to, data, value = 0n, feeOverrides = null }) {
+    const fees = Object.freeze({ ...await this.getPinnedFeeOverrides(feeOverrides) });
     await this.assertGasGuard(fees);
     const chainId = BigInt(this.config.chainId || 0);
     if (chainId <= 0n) throw new Error('Configured chainId is unavailable');
     const semanticRequest = { to, data, value: BigInt(value), from: this.config.walletAddress };
-    // eth_call/estimateGas with a pinned fee can fail on RPC fee drift or on
-    // the node's large default call gas limit even when the contract succeeds.
     await this.readProvider.call(semanticRequest);
     const gasEstimate = await this.signer.estimateGas(semanticRequest);
-    const request = { to, data, value: BigInt(value), chainId: Number(chainId), ...fees };
-    const populated = await this.signer.populateTransaction({
-      ...request,
-      // Delegated EOAs can incur execution overhead beyond a node's estimate.
-      // Gas is charged by actual usage; preserve the fee-price guard and add
-      // a fixed margin as well as proportional headroom.
-      gasLimit: gasEstimate * 150n / 100n + 25_000n
-    });
-    const rawTransaction = await this.signer.signTransaction(populated);
-    const hash = keccak256(rawTransaction);
-    await this.assertWriteChainId();
-    // Synchronous final gate: no awaited work may separate this check from
-    // persisting the expected hash and invoking the broadcast RPC.
-    if (beforeBroadcast) beforeBroadcast();
+    const proof = Object.freeze({ gasEstimate, feeOverrides: fees });
+    verifiedPreflights.set(proof, { executor: this, chainId,
+      fingerprint: semanticFingerprint(semanticRequest), at: Date.now() });
+    return proof;
+  }
+
+  async sendVerifiedTx({ label, to, data, value = 0n, onSent = null, feeOverrides = null,
+    beforeBroadcast = null, preflight = null }) {
+    let fees, gasEstimate, populated, rawTransaction, hash, chainId, proofRecord;
+    const assertFresh = () => {
+      if (proofRecord && Date.now() - proofRecord.at > VERIFIED_PREFLIGHT_MAX_AGE_MS) {
+        const error = new Error('Final transaction preflight expired; refit before sending');
+        error.code = 'PREFLIGHT_EXPIRED';
+        throw error;
+      }
+    };
+    try {
+      chainId = BigInt(this.config.chainId || 0);
+      const semanticRequest = { to, data, value: BigInt(value), from: this.config.walletAddress };
+      if (preflight) {
+        proofRecord = verifiedPreflights.get(preflight);
+        verifiedPreflights.delete(preflight); // consumed even when validation fails
+        if (!proofRecord || proofRecord.executor !== this || proofRecord.chainId !== chainId
+          || proofRecord.fingerprint !== semanticFingerprint(semanticRequest)) {
+          const error = new Error('Final transaction preflight does not match this request');
+          error.code = 'INVALID_PREFLIGHT';
+          throw error;
+        }
+        assertFresh();
+        fees = preflight.feeOverrides;
+        gasEstimate = preflight.gasEstimate;
+        await this.assertGasGuard(fees);
+      } else {
+        const prepared = await this.preflightVerifiedTx({ to, data, value, feeOverrides });
+        verifiedPreflights.delete(prepared);
+        fees = prepared.feeOverrides;
+        gasEstimate = prepared.gasEstimate;
+      }
+      const request = { to, data, value: BigInt(value), chainId: Number(chainId), ...fees };
+      populated = await this.signer.populateTransaction({
+        ...request,
+        // Delegated EOAs can incur execution overhead beyond a node's estimate.
+        // Gas is charged by actual usage; preserve the fee-price guard and add
+        // a fixed margin as well as proportional headroom.
+        gasLimit: gasEstimate * 150n / 100n + 25_000n
+      });
+      assertFresh();
+      rawTransaction = await this.signer.signTransaction(populated);
+      hash = keccak256(rawTransaction);
+      await this.assertWriteChainId();
+      assertFresh();
+      // Synchronous final gate: no awaited work may separate this check from
+      // persisting the expected hash and invoking the broadcast RPC.
+      if (beforeBroadcast) beforeBroadcast();
+    } catch (error) {
+      // This boundary ends BEFORE hash persistence, onSent and any broadcast.
+      // Only failures with this marker can be retried by a capital planner.
+      error.preBroadcastFailure = true;
+      throw error;
+    }
     this.ledger.append('tx.broadcast_pending', {
       label,
       hash,

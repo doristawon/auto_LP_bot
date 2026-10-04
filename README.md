@@ -164,6 +164,8 @@ LEGACY_EIP7702_GUARD_ADDRESS=<previous guard address for wallets kept on v1>
 
 Atomic 規劃使用本次投入資金的有限 Permit2 額度，保持原有到期時間限制；報價重算會重用同一額度，不因換幣數量略變就反覆撤銷與授權。授權完成後才重新擬合，之後的價格重試不再重送授權。規劃最多三輪且每個階段檢查五分鐘上限；授權錯誤直接停止，暫停後的最終送單檢查也會阻止授權與資金交易。失敗後若資金已撤出，保留復原紀錄並阻止新的自動操作。
 
+最後一次完整 `eth_call`／Gas 估算產生綁定錢包、鏈與交易內容的單次預檢憑證，有效期 20 秒；送單重用這次估算，減少重複 RPC 與價格變動時間窗。過期時重新擬合，不送出舊計畫。只有明確尚未保存交易 hash、尚未廣播的價格檢查失敗，才納入上述三輪重試；結果不明的廣播仍保留復原鎖。若使用者已手動存回 LP，可在暫停狀態核對撤池收據、舊份額為零、新存入收據與現有份額、nonce 和未完成交易，通過後解除舊鎖；原本失敗流程仍保留為失敗紀錄。
+
 Atomic route 支援 Uniswap V3、無 hook 的 Uniswap V4 與官方 registry 內的 Fables V4。Router 的 command、代幣、完整 V4 PoolKey、recipient、input、minOut 與 deadline 都受到限制。候選合約可先用 `node src/tools/preflight-atomic-deposit.js` 在鏈上暫存狀態預演；此工具不建立 signer、不廣播交易。
 
 ### Swap route 範圍

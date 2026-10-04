@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Interface } from 'ethers';
+import { Interface, keccak256 } from 'ethers';
 import { ERC20_ABI, PERMIT2_ABI } from '../src/abi.js';
 import { PERMIT2, UNISWAP_UNIVERSAL_ROUTER_212 } from '../src/constants.js';
 import { RebalanceExecutor } from '../src/adapters/executor.js';
@@ -93,6 +93,51 @@ function makeAllowanceHarness() {
   return { executor, sent, reads, settings };
 }
 
+function makePreflightHarness() {
+  const events = [];
+  const settings = new Map();
+  const calls = { simulations: 0, estimates: 0, populates: 0, signs: 0, chainIds: 0, broadcasts: [] };
+  const executor = Object.create(RebalanceExecutor.prototype);
+  executor.config = {
+    chainId: 8453,
+    maxGasGwei: 100,
+    walletAddress: WALLET,
+    confirmations: 1
+  };
+  executor.state = {
+    getSetting(key, fallback) { return settings.has(key) ? settings.get(key) : fallback; },
+    setSetting(key, value) { settings.set(key, value); }
+  };
+  executor.ledger = { append(type, data) { events.push({ type, data }); } };
+  executor.readProvider = {
+    async call() { calls.simulations++; return '0x'; }
+  };
+  executor.writeProvider = {
+    async getFeeData() {
+      return { maxFeePerGas: 1_000_000_000n, maxPriorityFeePerGas: 100_000_000n };
+    },
+    async getBlock() { return { baseFeePerGas: 900_000_000n }; },
+    async send(method) {
+      assert.equal(method, 'eth_chainId');
+      calls.chainIds++;
+      return '0x2105';
+    },
+    async broadcastTransaction(raw) {
+      calls.broadcasts.push(raw);
+      return { hash: keccak256(raw), async wait() {
+        return { status: 1, blockNumber: 1, gasUsed: 21_000n, gasPrice: 1_000_000_000n };
+      } };
+    }
+  };
+  executor.signer = {
+    async estimateGas() { calls.estimates++; return 21_000n; },
+    async populateTransaction(request) { calls.populates++; return { ...request, nonce: 3 }; },
+    async signTransaction() { calls.signs++; return '0x1234'; }
+  };
+  executor.getUsdPrice = () => 0;
+  return { executor, calls, events };
+}
+
 test('a finite funding cap is reused across smaller swap refits', async () => {
   const h = makeAllowanceHarness();
 
@@ -173,6 +218,87 @@ test('pause at an approval before-broadcast gate prevents the approval write', a
   assert.equal(h.sent.length, 1);
   assert.equal(typeof h.sent[0].beforeBroadcast, 'function');
   assert.equal(broadcasts, 0);
+});
+
+test('opaque transaction preflight proofs reject forgery, request changes, replay, and expiry', async () => {
+  const fees = { maxFeePerGas: 1_000_000_000n, maxPriorityFeePerGas: 100_000_000n };
+  const request = { to: TOKEN0, data: '0x1234', value: 0n, feeOverrides: fees };
+  const invalidProof = error => error.code === 'INVALID_PREFLIGHT' && error.preBroadcastFailure === true;
+
+  {
+    const h = makePreflightHarness();
+    const proof = await h.executor.preflightVerifiedTx(request);
+    await assert.rejects(h.executor.sendVerifiedTx({ label: 'forged-proof', ...request,
+      preflight: Object.freeze({ ...proof }) }), invalidProof);
+    assert.equal(h.calls.populates, 0);
+    assert.equal(h.calls.signs, 0);
+    assert.equal(h.calls.broadcasts.length, 0);
+    assert.equal(h.events.length, 0);
+  }
+
+  {
+    const h = makePreflightHarness();
+    const proof = await h.executor.preflightVerifiedTx(request);
+    await assert.rejects(h.executor.sendVerifiedTx({ label: 'changed-request', ...request,
+      data: '0x5678', preflight: proof }), invalidProof);
+    // A mismatched attempt consumes the one-shot proof too.
+    await assert.rejects(h.executor.sendVerifiedTx({ label: 'replayed-proof', ...request,
+      preflight: proof }), invalidProof);
+    assert.equal(h.calls.populates, 0);
+    assert.equal(h.calls.broadcasts.length, 0);
+    assert.equal(h.events.length, 0);
+  }
+
+  {
+    const h = makePreflightHarness();
+    const proof = await h.executor.preflightVerifiedTx(request);
+    await h.executor.sendVerifiedTx({ label: 'valid-proof', ...request, preflight: proof });
+    await assert.rejects(h.executor.sendVerifiedTx({ label: 'reused-proof', ...request,
+      preflight: proof }), invalidProof);
+    assert.equal(h.calls.broadcasts.length, 1, 'replay must not trigger a second broadcast');
+  }
+});
+
+test('transaction preflight expiry is checked after populate, sign, and chain ID waits', async () => {
+  const realNow = Date.now;
+  const fees = { maxFeePerGas: 1_000_000_000n, maxPriorityFeePerGas: 100_000_000n };
+  const request = { to: TOKEN0, data: '0x1234', value: 0n, feeOverrides: fees };
+
+  for (const boundary of ['populate', 'sign', 'chainId']) {
+    let fakeNow = 1_000_000;
+    Date.now = () => fakeNow;
+    try {
+      const h = makePreflightHarness();
+      const advanceClock = () => { if (boundary === 'populate') fakeNow += 20_001; };
+      h.executor.signer.populateTransaction = async tx => {
+        h.calls.populates++;
+        advanceClock();
+        return { ...tx, nonce: 3 };
+      };
+      h.executor.signer.signTransaction = async () => {
+        h.calls.signs++;
+        if (boundary === 'sign') fakeNow += 20_001;
+        return '0x1234';
+      };
+      h.executor.writeProvider.send = async method => {
+        assert.equal(method, 'eth_chainId');
+        h.calls.chainIds++;
+        if (boundary === 'chainId') fakeNow += 20_001;
+        return '0x2105';
+      };
+      const proof = await h.executor.preflightVerifiedTx(request);
+      let onSent = 0;
+      await assert.rejects(h.executor.sendVerifiedTx({ label: `expired-${boundary}`,
+        ...request, preflight: proof, onSent: () => { onSent++; } }), error =>
+        error.code === 'PREFLIGHT_EXPIRED' && error.preBroadcastFailure === true,
+      `expiry should be enforced after ${boundary}`);
+      assert.equal(onSent, 0, `${boundary} expiry must not persist a sent hash`);
+      assert.equal(h.calls.broadcasts.length, 0, `${boundary} expiry must not broadcast`);
+      assert.equal(h.events.length, 0, `${boundary} expiry must not write broadcast ledger events`);
+    } finally {
+      Date.now = realNow;
+    }
+  }
 });
 
 test('secant balancing reduces quote calls while keeping input and preferred output ratio bounded', async () => {
@@ -342,6 +468,43 @@ test('atomic preflight retry reuses one capped approval and does not refit twice
   assert.equal(typeof h.sendRequests[0].beforeBroadcast, 'function');
   assert.ok(h.journalHistory.some(entry =>
     entry.atomicRetryReason === 'preflight-price-changed'));
+});
+
+test('atomic broadcast-stage retry is limited to typed pre-broadcast failures', async () => {
+  const h = makeAtomicRetryHarness();
+  const preflights = [];
+  let sendAttempts = 0;
+  h.executor.preflightVerifiedTx = async request => {
+    preflights.push(request);
+    return Object.freeze({ gasEstimate: 100_000n, feeOverrides: { gasPrice: 1n } });
+  };
+  h.executor.sendVerifiedTx = async request => {
+    h.sendRequests.push(request);
+    sendAttempts++;
+    if (sendAttempts === 1) {
+      throw Object.assign(new Error('late pre-sign simulation reverted'), {
+        code: 'CALL_EXCEPTION', preBroadcastFailure: true
+      });
+    }
+    request.beforeBroadcast();
+    throw new Error('stop after late retry');
+  };
+  const journal = {
+    id: 'approval-loop-late-prebroadcast-test', kind: 'rebalance', phase: 'prepared',
+    startedAt: Date.now(), poolId: POOL_ID, pair: 'T0/T1', tx: {}
+  };
+
+  await assert.rejects(executeAtomicDeposit.call(h.executor, {
+    pool, target: h.target, funding: h.funding, balances: h.balances, journal
+  }), /stop after late retry/);
+
+  assert.equal(sendAttempts, 2, 'a typed pre-broadcast failure should trigger one bounded retry');
+  assert.equal(preflights.length, 2);
+  assert.equal(h.fits.length, 3, 'the retry refits once after the original approval');
+  assert.equal(h.approvals.length, 1, 'the retry should reuse its finite approval cap');
+  const retry = h.journalHistory.find(entry => entry.phase === 'atomic_retry');
+  assert.equal(retry.atomicRetryStage, 'broadcast');
+  assert.equal(retry.atomicRetryReason, 'preflight-price-changed');
 });
 
 test('atomic planning stops after five minutes before another approval or broadcast', async () => {

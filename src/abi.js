@@ -49,6 +49,13 @@ export const PERMIT2_ABI = [
 ];
 
 export const EIP7702_GUARD_ABI = [
+  'error LiquidityBelowMinimum()',
+  'error InvalidAtomicPlan()',
+  'error BalanceChanged()',
+  'error SwapDeltaMismatch()',
+  'error ExcessResidual(uint256 residual0,uint256 residual1)',
+  'error ApprovalFailed()',
+  'error PositionMintMismatch()',
   `function guardVersion() view returns(bytes32)`,
   `function IMPLEMENTATION() view returns(address)`,
   'function isValidSignature(bytes32 digest,bytes signature) view returns(bytes4)',

@@ -8,6 +8,16 @@ import { sanitize } from '../logger.js';
 const guard = new Interface(EIP7702_GUARD_ABI);
 const rawStrings = b => ({ raw0: String(b.raw0), raw1: String(b.raw1) });
 const RESIDUAL_BPS = 50; // at least 99.5% of each authorized post-swap token
+const errorSummary = error => {
+  const data = error.data || error.info?.error?.data;
+  const selector = error.revertSelector || (typeof data === 'string' ? data.slice(0, 10) : null);
+  let decoded;
+  try { decoded = typeof data === 'string' ? guard.parseError(data)?.name : null; } catch {}
+  return { error: sanitize(decoded === 'LiquidityBelowMinimum'
+    ? '價格變動使可存入流動性低於最低限制；尚未送出存入交易。'
+    : decoded || error.shortMessage || error.message).slice(0, 360), errorSelector: selector,
+    guardError: decoded || null };
+};
 
 export function buildAtomicDepositRequest({ pool, walletAddress, target, balances, funding,
   swapPlan, routerRequest, minLiquidity, deadline }) {
@@ -145,16 +155,18 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
         target, balances, funding, swapPlan: executable, routerRequest, minLiquidity, deadline });
       // This simulates the entire atomic call, including the residual bound.
       stage = 'preflight';
-      await this.readProvider.call({ from: this.config.walletAddress, to: request.to,
-        data: request.data, value: 0n });
+      const sharesBefore = position ? await this.readPositionShares(pool, position.id) : 0n;
       const fees = await this.getPinnedFeeOverrides();
-      const gas = await this.signer.estimateGas({ from: this.config.walletAddress,
+      const preflight = this.preflightVerifiedTx
+        ? await this.preflightVerifiedTx({ ...request, feeOverrides: fees }) : null;
+      if (!preflight) await this.readProvider.call({ from: this.config.walletAddress,
         to: request.to, data: request.data, value: 0n });
+      const gas = preflight?.gasEstimate ?? await this.signer.estimateGas({
+        from: this.config.walletAddress, to: request.to, data: request.data, value: 0n });
       await this.assertTopUpGasBudget({ reserveWei: this.config.topUpMinGasReserveWei,
         maxFeePerGas: fees.maxFeePerGas || fees.gasPrice,
         futureGasLimit: gas * 150n / 100n + 25_000n, phase: 'before-atomic-swap-deposit' });
       if (allocationScope) this.assertAllocationJobCurrent(pool, allocationScope);
-      const sharesBefore = position ? await this.readPositionShares(pool, position.id) : 0n;
       update({ phase: 'atomic_preflighted', finalTarget: target, atomicAttempt: attempt + 1,
         atomicFundingRaw: rawStrings(funding), atomicBalancesBeforeRaw: rawStrings(balances),
         atomicSwapRequired: executable.direction !== 'none',
@@ -163,7 +175,7 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
       try {
         stage = 'broadcast';
         receipt = await this.sendVerifiedTx({ label: 'atomicSwapAndDeposit', to: request.to,
-          data: request.data, value: 0n, feeOverrides: fees, beforeBroadcast: assertActive, onSent: hash => {
+          data: request.data, value: 0n, feeOverrides: fees, preflight, beforeBroadcast: assertActive, onSent: hash => {
             capitalHash = hash;
             update({ phase: 'atomic_sent', tx: { ...journal.tx, atomicSwapDeposit: hash } });
           } });
@@ -237,13 +249,14 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
       this.ledger.append(eventType, result);
       return result;
       } catch (error) {
-        // A semantic preflight revert before signing has moved no capital in
+        // A semantic preflight revert before broadcasting has moved no capital in
         // this call. Refit a stale market plan without sending a failed swap.
-        if (!capitalHash && !confirmed && ['planning', 'preflight'].includes(stage)
-          && ['CALL_EXCEPTION', 'SEQUENTIAL_SIMULATION_REVERT'].includes(error.code) && attempt < 2) {
+        if (!capitalHash && !confirmed && (['planning', 'preflight'].includes(stage)
+          || (stage === 'broadcast' && error.preBroadcastFailure === true))
+          && ['CALL_EXCEPTION', 'SEQUENTIAL_SIMULATION_REVERT', 'PREFLIGHT_EXPIRED'].includes(error.code) && attempt < 2) {
           update({ phase: 'atomic_retry', atomicAttempt: attempt + 1, atomicRetryReason: 'preflight-price-changed',
             atomicRetryStage: stage, atomicRetryError: sanitize(error.shortMessage || error.message).slice(0, 360),
-            atomicRetrySelector: error.revertSelector || error.data?.slice(0, 10) || null });
+            atomicRetrySelector: errorSummary(error).errorSelector });
           continue;
         }
         throw error;
@@ -254,8 +267,10 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
     // when this atomic call has not broadcast. Never clear moved capital.
     const moved = confirmed || capitalHash || journal.tx?.withdraw || journal.tx?.routeSwaps?.length
       || error.code === 'BROADCAST_OUTCOME_UNCERTAIN';
-    update({ phase: moved ? 'recovery_required' : 'failed', failedAt: Date.now(), error: error.message });
-    if (moved) this.ledger.append('rebalance.recovery_required', { ...journal, error: error.message });
+    const details = errorSummary(error);
+    update({ phase: moved ? 'recovery_required' : 'failed', failedAt: Date.now(), ...details,
+      errorStage: stage, preBroadcastFailure: error.preBroadcastFailure === true });
+    if (moved) this.ledger.append('rebalance.recovery_required', { ...journal, ...details });
     error.atomicHandled = true;
     throw error;
   }
