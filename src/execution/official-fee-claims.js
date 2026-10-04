@@ -46,10 +46,12 @@ export async function collectOfficialClaimRanges({
   }
 
   const ids = new Map();
+  const indexedIds = new Set();
   for (const item of owner.Position) {
     if (String(item?.pool_id || '').toLowerCase() !== context.poolIdHex) continue;
     const id = normalizeUint256(item.range_id);
     ids.set(id.toString(), id);
+    indexedIds.add(id.toString());
   }
   for (const rawId of knownRangeIds) {
     const id = normalizeUint256(rawId);
@@ -77,6 +79,22 @@ export async function collectOfficialClaimRanges({
       }
       const rowKey = normalizePoolKey(row.key);
       if (poolKeyHash(rowKey) !== context.poolIdHex || !samePoolKey(rowKey, context.key)) {
+        // Legacy positionCandidates are discovered per hook; one hook can
+        // serve many pools. A verified, known-only foreign candidate is not a
+        // claim target. Never forgive wrong indexed/current rows or malformed
+        // lens data, and never submit a claim for the foreign pool.
+        if (retiredOnly && !indexedIds.has(id.toString()) && id !== currentRangeId
+          && rowKey.hooks.toLowerCase() === context.key.hooks.toLowerCase()) {
+          const lower = safeTick(row.tickLower), upper = safeTick(row.tickUpper);
+          if (lower >= upper || lower < MIN_TICK || upper > MAX_TICK
+            || lower % rowKey.tickSpacing !== 0 || upper % rowKey.tickSpacing !== 0) {
+            throw new Error('official-claim-lens-ticks-invalid');
+          }
+          const derived = normalizeUint256(keccak256(coder.encode(
+            ['bytes32', 'int24', 'int24'], [poolKeyHash(rowKey), lower, upper])));
+          if (derived !== id) throw new Error('official-claim-lens-range-id-mismatch');
+          continue;
+        }
         throw new Error('official-claim-lens-pool-mismatch');
       }
 

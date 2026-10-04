@@ -140,6 +140,12 @@ $restartFailures = 0
 
 while ($true) {
   if (Test-Path -LiteralPath $stopFile) {
+    if (-not $child) {
+      # A restarted supervisor may encounter the stop marker before attaching
+      # to an app process that is still running. Attach first so the pending
+      # execution gate can protect it from an unsafe or orphaned stop.
+      $child = Get-AppProcess
+    }
     if ($child) {
       $pending = Get-PendingExecution
       if ($pending) {

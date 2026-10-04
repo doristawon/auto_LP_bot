@@ -38,6 +38,34 @@ test('retired sweep merges known ranges when owner indexer has not indexed the l
   assert.equal(f.ownerCalls.length, 0);
 });
 
+test('shared-hook foreign candidates are verified and skipped without hiding corrupt indexed ranges', async () => {
+  const retired = range(-240, -120, 3n, 10n, { shares: 0n });
+  const foreignKey = { ...key, currency0: otherToken };
+  const foreignPool = keccak256(coder.encode([poolKeyAbi], [[otherToken, key.currency1,
+    key.fee, key.tickSpacing, key.hooks]]));
+  const foreign = { ...range(-120, 0, 30n, 100n, { shares: 0n, key: foreignKey }),
+    id: keccak256(coder.encode(['bytes32', 'int24', 'int24'], [foreignPool, -120, 0])) };
+  const f = makeFixture([retired, foreign], [retired.id]);
+  const rows = await collectOfficialClaimRanges({ ...f, walletAddress: wallet,
+    retiredOnly: true, knownRangeIds: [retired.id, foreign.id] });
+  assert.deepEqual(rows.map(row => row.rangeId), [retired.id]);
+  assert.equal(f.lensCalls.length, 1, 'filter within the existing batched read');
+  const corrupt = makeFixture([foreign], [foreign.id]);
+  await assert.rejects(collectOfficialClaimRanges({ ...corrupt, walletAddress: wallet,
+    retiredOnly: true, knownRangeIds: [foreign.id] }), /lens-pool-mismatch/);
+});
+
+test('foreign known candidates with invalid lens identity still fail closed', async () => {
+  for (const overrides of [{ keyVerified: false }, { tickUpper: 1 },
+    { key: { ...key, currency0: otherToken } }]) {
+    const malformed = range(-240, -120, 3n, 10n, { shares: 0n, ...overrides });
+    const f = makeFixture([malformed], []);
+    await assert.rejects(collectOfficialClaimRanges({ ...f, walletAddress: wallet,
+      retiredOnly: true, ownerLedger: { Position: [] }, knownRangeIds: [malformed.id] }),
+    /lens-range-unverified|lens-ticks-invalid|lens-range-id-mismatch/);
+  }
+});
+
 function range(lower, upper, claimable0 = 0n, claimable1 = 0n, overrides = {}) {
   const id = keccak256(coder.encode(['bytes32', 'int24', 'int24'], [poolId, lower, upper]));
   return { id, lower, upper, claimable0, claimable1, overrides };
