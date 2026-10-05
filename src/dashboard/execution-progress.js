@@ -26,8 +26,10 @@ export function describeExecutionProgress(journal) {
   if (journal.kind === 'fee_claim') return describeFeeClaim(journal);
   const phase = String(journal.phase);
   const manualReconciled = phase === 'failed' && hashValue(journal.reconciliation?.replacementHash)
-    && hashValue(journal.reconciliation?.withdrawHash);
-  const status = phase === 'completed' ? 'completed' : phase === 'failed' ? 'failed'
+    && hashValue(journal.reconciliation?.withdrawHash)
+    && journal.reconciliation?.positionId != null
+    && String(journal.reconciliation.positionId).trim() !== '';
+  const status = manualReconciled || phase === 'completed' ? 'completed' : phase === 'failed' ? 'failed'
     : phase === 'recovery_required' ? 'recovery' : 'running';
   const observedPhase = ['failed', 'recovery_required', 'tx_broadcast_pending'].includes(phase)
     ? journal.pendingTx?.previousPhase || journal.lastKnownPhase || 'prepared' : phase;
@@ -46,8 +48,11 @@ export function describeExecutionProgress(journal) {
       : observedPhase === 'official_preflighted' && !journal.tx?.officialReposition ? 0
         : journal.tx?.officialReposition || observedPhase === 'official_sent' ? 1 : 0
     : null;
+  // A missing atomicSwapRequired flag is not evidence that the swap finished.
+  // Keep the swap as the current step until a deposit-only decision or a
+  // confirmed atomic receipt proves otherwise.
   const atomicStepIndex = ['atomic_preflighted', 'atomic_sent', 'atomic_retry'].includes(observedPhase)
-    ? journal.atomicSwapRequired === true ? 2 : 3
+    ? journal.atomicSwapRequired === false ? 3 : 2
     : observedPhase === 'atomic_confirmed' ? 4 : null;
   const stepIndex = officialStepIndex ?? (kind === 'stop'
     ? status === 'completed' ? 4 : stopStage
@@ -66,7 +71,11 @@ export function describeExecutionProgress(journal) {
     if (!skipped && index === stepIndex && status === 'recovery') state = 'attention';
     return state;
   };
-  const steps = officialFlow ? [
+  const steps = manualReconciled ? [
+    { key: 'preflight', label: '撤池與後續 LP 預檢', status: 'completed' },
+    { key: 'withdraw', label: '原 LP 撤池收據', status: 'completed' },
+    { key: 'verify', label: '後續 LP 收據與份額核對', status: 'completed' }
+  ] : officialFlow ? [
     { key: 'preflight', label: '預檢', status: stepStatus(0) },
     { key: 'officialReposition', label: OFFICIAL_REPOSITION_LABEL, status: stepStatus(1) },
     { key: 'verify', label: '核對', status: stepStatus(2) }
@@ -85,7 +94,10 @@ export function describeExecutionProgress(journal) {
   };
   const receiptState = confirmed => confirmed ? 'confirmed'
     : status === 'recovery' || status === 'failed' ? 'unknown' : 'pending';
-  if (officialFlow && kind !== 'stop') {
+  if (manualReconciled) {
+    addTransaction('withdraw', '原 LP 撤池收據', journal.reconciliation.withdrawHash, 'confirmed');
+    addTransaction('verify', '後續手動 LP 收據', journal.reconciliation.replacementHash, 'confirmed');
+  } else if (officialFlow && kind !== 'stop') {
     addTransaction('officialReposition', OFFICIAL_REPOSITION_LABEL, journal.tx?.officialReposition,
       receiptState(completed || observedPhase === 'official_confirmed'));
   } else if (kind === 'stop') {
@@ -102,8 +114,9 @@ export function describeExecutionProgress(journal) {
     routes.forEach((hash, index) => addTransaction('swap', '跨池換幣', hash,
       receiptState(completed || index < routes.length - 1 || observedPhase !== 'route_swap_sent' && stepIndex >= 2)));
     if (atomicFlow) {
-      const atomicStep = journal.atomicSwapRequired === true ? 'swap' : 'deposit';
-      const atomicLabel = journal.atomicSwapRequired === true ? '換幣＋一次存入 LP' : '一次存入 LP';
+      const atomicStep = journal.atomicSwapRequired === false ? 'deposit' : 'swap';
+      const atomicLabel = journal.atomicSwapRequired === true ? '換幣＋一次存入 LP'
+        : journal.atomicSwapRequired === false ? '一次存入 LP' : '原子換幣／存入 LP';
       for (const hash of Array.isArray(journal.tx?.atomicReverts) ? journal.tx.atomicReverts : []) {
         addTransaction(atomicStep, `${atomicLabel}（已回退）`, hash, 'reverted');
       }
@@ -116,10 +129,10 @@ export function describeExecutionProgress(journal) {
         receiptState(completed || stepIndex >= 4));
     }
   }
-  if (journal.lastApprovalTx) addTransaction('preflight', '代幣授權', journal.lastApprovalTx.hash,
+  if (journal.lastApprovalTx && !manualReconciled) addTransaction('preflight', '代幣授權', journal.lastApprovalTx.hash,
     journal.lastApprovalTx.status === 'reverted' ? 'reverted'
       : journal.lastApprovalTx.status === 'confirmed' ? 'confirmed' : 'unknown');
-  if (journal.pendingTx) {
+  if (journal.pendingTx && !manualReconciled) {
     const pendingHash = hashValue(journal.pendingTx.hash);
     if (pendingHash) {
       const existing = transactions.find(item => item.hash.toLowerCase() === pendingHash.toLowerCase());
@@ -130,7 +143,7 @@ export function describeExecutionProgress(journal) {
       else transactions.push(item);
     }
   }
-  if (journal.reconciliation?.status === 0) {
+  if (!manualReconciled && journal.reconciliation?.status === 0) {
     const revertedHash = hashValue(journal.reconciliation.hash);
     const reverted = transactions.find(item => item.hash.toLowerCase() === revertedHash?.toLowerCase());
     if (reverted) reverted.status = 'reverted';
@@ -175,15 +188,26 @@ export function describeExecutionProgress(journal) {
   const lastTransaction = pendingHash ? transactions.find(item => item.hash.toLowerCase() === pendingHash.toLowerCase())
     : transactions.filter(item => item.step !== 'preflight').at(-1) || transactions.at(-1) || null;
   return {
-    id: cleanText(journal.id, 240), kind, label: labels[kind], phase, status,
-    ...(manualReconciled ? { reconciliationStatus: 'verified-manual-lp-replacement' } : {}),
-    pair: cleanText(journal.pair || journal.destinationPair || journal.sourcePair, 80),
+    id: cleanText(journal.id, 240), kind, label: manualReconciled ? '已核對手動換倉' : labels[kind], phase, status,
+    ...(manualReconciled ? { reconciliationStatus: 'verified-manual-lp-replacement',
+      reconciliationProof: {
+        pair: cleanText(journal.reconciliation.pair, 80),
+        poolId: cleanText(journal.reconciliation.poolId, 180),
+        oldPoolId: cleanText(journal.reconciliation.oldPoolId, 180),
+        positionId: cleanText(String(journal.reconciliation.positionId), 180),
+        withdrawHash: hashValue(journal.reconciliation.withdrawHash),
+        replacementHash: hashValue(journal.reconciliation.replacementHash)
+      } } : {}),
+    pair: cleanText(journal.reconciliation?.pair || journal.pair || journal.destinationPair || journal.sourcePair, 80),
     startedAt: Number(journal.startedAt) || null,
     updatedAt: Number(journal.updatedAt || journal.startedAt) || null,
     finishedAt: Number(journal.completedAt || journal.failedAt) || null,
-    stepIndex, currentStepLabel: completed ? '已完成' : officialFlow
+    stepIndex, currentStepLabel: manualReconciled ? '手動 LP 已核對' : completed ? '已完成' : officialFlow
       ? ['預檢', OFFICIAL_REPOSITION_LABEL, '核對'][stepIndex] : STEP_LABELS[stepIndex],
-    message, error: cleanText(journal.error), steps, transactions,
+    message: manualReconciled
+      ? '原 Bot 換幣與存入未完成；已核對撤池收據、後續 LP 收據與目前份額。'
+      : message,
+    error: manualReconciled ? '' : cleanText(journal.error), steps, transactions,
     lastTransaction
   };
 }

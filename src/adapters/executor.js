@@ -69,6 +69,7 @@ const depositedTopic = id(DEPOSITED_EVENT).toLowerCase();
 const TOP_UP_DEPOSIT_GAS_LIMIT = 1_200_000n;
 const TOP_UP_APPROVAL_GAS_RESERVE = 300_000n;
 const TOP_UP_SWAP_GAS_LIMIT = 1_500_000n;
+const VERIFIED_RECEIPT_WAIT_MS = 180_000;
 // Opaque, request-bound, single-use proofs. Callers cannot manufacture one or
 // transfer a proof between wallets/executors. No signed transaction is cached.
 const verifiedPreflights = new WeakMap();
@@ -309,13 +310,20 @@ export class RebalanceExecutor {
       // rejects approve/Permit2, fail while the LP is still intact.
       const approval0 = approvalBounds.expected0 + BigInt(plan.position.owed0 || 0n) + scopedPreBalances.raw0;
       const approval1 = approvalBounds.expected1 + BigInt(plan.position.owed1 || 0n) + scopedPreBalances.raw1;
-      await this.ensureSwapAllowances(plan.pool.token0, approval0);
-      await this.ensureSwapAllowances(plan.pool.token1, approval1);
+      const previousApprovalCaps = this.config.atomicDepositEnabled === true ? {
+        // The guard's funded amounts are uint128. Keep any reusable
+        // pre-withdrawal allowance within that finite envelope.
+        raw0: approval0 > MAX_UINT128 ? MAX_UINT128 : approval0,
+        raw1: approval1 > MAX_UINT128 ? MAX_UINT128 : approval1
+      } : null;
+      await this.ensureSwapAllowances(plan.pool.token0, previousApprovalCaps?.raw0 ?? approval0);
+      await this.ensureSwapAllowances(plan.pool.token1, previousApprovalCaps?.raw1 ?? approval1);
       if (!this.config.atomicDepositEnabled) {
         await this.ensureHookAllowance(plan.pool.token0, plan.pool.key.hooks, approval0);
         await this.ensureHookAllowance(plan.pool.token1, plan.pool.key.hooks, approval1);
       }
-      journal = this.patchJournal(journal, { phase: 'approvals_ready' });
+      journal = this.patchJournal(journal, { phase: 'approvals_ready',
+        preWithdrawApprovalCapsRaw: previousApprovalCaps ? stringifyRawBalances(previousApprovalCaps) : null });
 
       // Approvals can consume blocks; re-check OOR only after all non-capital-moving
       // setup transactions are complete.
@@ -475,6 +483,7 @@ export class RebalanceExecutor {
         return await executeAtomicDeposit.call(this, { pool: plan.pool,
           target: targetAfterWithdraw, funding: fundingScope.funding, balances: postWithdrawBalances,
           journal, oldPosition: plan.position, allocationScope, retarget: true,
+          previousApprovalCaps: journal.preWithdrawApprovalCapsRaw,
           maxPriceImpactBps: rebalanceMaxImpactBps,
           onJournal: value => { journal = value; phase = value.phase; } });
       }
@@ -1499,6 +1508,7 @@ export class RebalanceExecutor {
       state, target, chooseTarget, maxPriceImpactBps, expectedOutput,
       maxRefinements: expectedOutput ? 4 : 2,
       slippageBps: this.config.swapSlippageBps,
+      pinnedBlockTag: this.planningBlockTag ?? null,
       preferRemainderTokenIndex: stableIndex,
       preferredRemainderBps: stableIndex === null ? 0 : Math.min(this.config.autoTopupDustBps ?? 25, 50),
       previewSwap: async swapPlan => {
@@ -2255,6 +2265,15 @@ export class RebalanceExecutor {
   }
 
   async preflightCrossPoolSequence(plan, destinationPool) {
+    if (this.config.atomicDepositEnabled && !this.planningBlockTag) {
+      // Withdrawal inventory, route quotes, balancing previews and the final
+      // simulated atomic call must see one state. This is only a rehearsal;
+      // the live executor still performs fresh checks before each broadcast.
+      const context = await createPinnedPlanningContext(this);
+      const pinnedPlan = { ...plan, pool: { ...plan.pool } };
+      const result = await context.preflightCrossPoolSequence(pinnedPlan, { ...destinationPool });
+      return { ...result, planningBlockTag: context.planningBlockTag };
+    }
     const sourcePool = plan.pool;
     const idleWallet = plan.manualIdle === true;
     const sourceState = idleWallet ? null : plan.manualImmediate === true
@@ -3410,13 +3429,20 @@ export class RebalanceExecutor {
     return BigInt(await hook.balanceOf(this.config.walletAddress, rangeId));
   }
 
-  async ensureSwapAllowances(token, rawAmountIn, { allowanceCap = null, beforeBroadcast = null } = {}) {
-    rawAmountIn = BigInt(rawAmountIn);
-    if (rawAmountIn <= 0n) return;
+  async ensureSwapAllowances(token, rawAmountIn, {
+    allowanceCap = null, reuseAllowanceCap = null, beforeBroadcast = null
+  } = {}) {
+    const requiredAmountIn = BigInt(rawAmountIn);
+    if (requiredAmountIn <= 0n) return { broadcasted: false, broadcastCount: 0 };
+    let approvalAmount = requiredAmountIn;
     if (allowanceCap !== null) {
       const cap = BigInt(allowanceCap);
-      if (cap < rawAmountIn || cap <= 0n || cap > MAX_UINT128) throw new Error('Swap input exceeds finite authorization cap');
-      rawAmountIn = cap;
+      if (cap < requiredAmountIn || cap <= 0n || cap > MAX_UINT128) throw new Error('Swap input exceeds finite authorization cap');
+      approvalAmount = cap;
+    }
+    const reusableCap = reuseAllowanceCap === null ? null : BigInt(reuseAllowanceCap);
+    if (reusableCap !== null && (reusableCap < 0n || reusableCap > MAX_UINT128)) {
+      throw new Error('Previous swap authorization cap is outside uint128 bounds');
     }
     const assertBroadcastAllowed = () => {
       if (this.state?.getSetting('executionPaused', false)) throw new Error('Execution is paused before swap approval');
@@ -3426,54 +3452,67 @@ export class RebalanceExecutor {
     if (token.address.toLowerCase() === ZERO_ADDRESS) throw new Error('Native input is not enabled');
     const tokenContract = new Contract(token.address, ERC20_ABI, this.readProvider);
     let erc20Allowance = BigInt(await tokenContract.allowance(this.config.walletAddress, PERMIT2));
-    if (erc20Allowance !== rawAmountIn
-      && !(await this.hasFixedInfinitePermit2Allowance(token, erc20Allowance))) {
-      if (erc20Allowance > 0n) {
-        await this.sendVerifiedTx({
-          label: `approve:${token.symbol}:permit2:reset`,
-          to: token.address,
-          data: erc20Interface.encodeFunctionData('approve', [PERMIT2, 0n]),
-          beforeBroadcast: assertBroadcastAllowed,
-          value: 0n
-        });
-      }
-      await this.sendVerifiedTx({
-        label: `approve:${token.symbol}:permit2`,
-        to: token.address,
-        data: erc20Interface.encodeFunctionData('approve', [PERMIT2, rawAmountIn]),
-        beforeBroadcast: assertBroadcastAllowed,
-        value: 0n
-      });
-      erc20Allowance = BigInt(await tokenContract.allowance(this.config.walletAddress, PERMIT2));
-      if (erc20Allowance !== rawAmountIn) throw new Error('ERC20 -> Permit2 allowance did not update to the exact requested amount');
-    }
-
     const permit2 = new Contract(PERMIT2, PERMIT2_ABI, this.readProvider);
-    const allowance = await permit2.allowance(
+    let allowance = await permit2.allowance(
       this.config.walletAddress,
       token.address,
       UNISWAP_UNIVERSAL_ROUTER_212
     );
     const now = Math.floor(Date.now() / 1000);
-    if (BigInt(allowance.amount) !== rawAmountIn || Number(allowance.expiration) <= now + this.config.txDeadlineSec) {
-      const expiration = now + this.config.permit2ExpirationSec;
-      if (BigInt(allowance.amount) > 0n) {
-        await this.sendVerifiedTx({
-          label: `permit2:${token.symbol}:router:reset`,
-          to: PERMIT2,
-          data: permit2Interface.encodeFunctionData('approve', [token.address, UNISWAP_UNIVERSAL_ROUTER_212, 0n, expiration]),
-          beforeBroadcast: assertBroadcastAllowed,
+    if (reusableCap !== null && requiredAmountIn <= reusableCap) {
+      const immutableInfinite = erc20Allowance > reusableCap
+        && await this.hasFixedInfinitePermit2Allowance(token, erc20Allowance);
+      const erc20WithinApprovedBound = erc20Allowance <= reusableCap || immutableInfinite;
+      const permit2Amount = BigInt(allowance.amount);
+      if (erc20Allowance >= requiredAmountIn && erc20WithinApprovedBound
+        && permit2Amount >= requiredAmountIn && permit2Amount <= reusableCap
+        && Number(allowance.expiration) > now + this.config.txDeadlineSec) {
+        return { broadcasted: false, broadcastCount: 0, reused: true };
+      }
+    }
+
+    let broadcastCount = 0;
+    const sendApproval = async request => {
+      broadcastCount += 1;
+      return this.sendVerifiedTx({ ...request, beforeBroadcast: assertBroadcastAllowed });
+    };
+    if (erc20Allowance !== approvalAmount
+      && !(await this.hasFixedInfinitePermit2Allowance(token, erc20Allowance))) {
+      if (erc20Allowance > 0n) {
+        await sendApproval({
+          label: `approve:${token.symbol}:permit2:reset`,
+          to: token.address,
+          data: erc20Interface.encodeFunctionData('approve', [PERMIT2, 0n]),
           value: 0n
         });
       }
-      await this.sendVerifiedTx({
+      await sendApproval({
+        label: `approve:${token.symbol}:permit2`,
+        to: token.address,
+        data: erc20Interface.encodeFunctionData('approve', [PERMIT2, approvalAmount]),
+        value: 0n
+      });
+      erc20Allowance = BigInt(await tokenContract.allowance(this.config.walletAddress, PERMIT2));
+      if (erc20Allowance !== approvalAmount) throw new Error('ERC20 -> Permit2 allowance did not update to the exact requested amount');
+    }
+
+    if (BigInt(allowance.amount) !== approvalAmount || Number(allowance.expiration) <= now + this.config.txDeadlineSec) {
+      const expiration = now + this.config.permit2ExpirationSec;
+      if (BigInt(allowance.amount) > 0n) {
+        await sendApproval({
+          label: `permit2:${token.symbol}:router:reset`,
+          to: PERMIT2,
+          data: permit2Interface.encodeFunctionData('approve', [token.address, UNISWAP_UNIVERSAL_ROUTER_212, 0n, expiration]),
+          value: 0n
+        });
+      }
+      await sendApproval({
         label: `permit2:${token.symbol}:router`,
-        beforeBroadcast: assertBroadcastAllowed,
         to: PERMIT2,
         data: permit2Interface.encodeFunctionData('approve', [
           token.address,
           UNISWAP_UNIVERSAL_ROUTER_212,
-          rawAmountIn,
+          approvalAmount,
           expiration
         ]),
         value: 0n
@@ -3483,10 +3522,12 @@ export class RebalanceExecutor {
         token.address,
         UNISWAP_UNIVERSAL_ROUTER_212
       );
-      if (BigInt(updated.amount) !== rawAmountIn || Number(updated.expiration) <= now + this.config.txDeadlineSec) {
+      allowance = updated;
+      if (BigInt(updated.amount) !== approvalAmount || Number(updated.expiration) <= now + this.config.txDeadlineSec) {
         throw new Error('Permit2 -> Universal Router allowance did not update to the exact requested amount');
       }
     }
+    return { broadcasted: broadcastCount > 0, broadcastCount, reused: false };
   }
 
   async hasFixedInfinitePermit2Allowance(token, allowance) {
@@ -3785,7 +3826,7 @@ export class RebalanceExecutor {
 
     let receipt;
     try {
-      receipt = await tx.wait(this.config.confirmations);
+      receipt = await tx.wait(this.config.confirmations, VERIFIED_RECEIPT_WAIT_MS);
     } catch (error) {
       const reverted = error.receipt;
       if (reverted?.status === 0 && String(reverted.hash).toLowerCase() === hash.toLowerCase()

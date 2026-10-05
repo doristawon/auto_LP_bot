@@ -90,7 +90,7 @@ function makeAllowanceHarness() {
     setSetting(key, value) { settings.set(key, value); }
   };
 
-  return { executor, sent, reads, settings };
+  return { executor, sent, reads, settings, tokenAllowances, permitAllowances };
 }
 
 function makePreflightHarness() {
@@ -154,6 +154,23 @@ test('a finite funding cap is reused across smaller swap refits', async () => {
   assert.equal(BigInt(erc20Approval.args[1]), 100n);
   assert.equal(BigInt(permit2Approval.args[2]), 100n);
   assert.ok(BigInt(permit2Approval.args[2]) <= MAX_UINT128);
+});
+
+test('a pre-withdrawal allowance within its saved gross cap is reused for smaller net funding', async () => {
+  const h = makeAllowanceHarness();
+  const expiration = Math.floor(Date.now() / 1000) + 3600;
+  h.tokenAllowances.set(allowanceKey(TOKEN0, WALLET, PERMIT2), 100n);
+  h.permitAllowances.set(allowanceKey(WALLET, TOKEN0, UNISWAP_UNIVERSAL_ROUTER_212), {
+    amount: 100n, expiration, nonce: 0n
+  });
+
+  const result = await h.executor.ensureSwapAllowances(token0, 50n, {
+    allowanceCap: 80n,
+    reuseAllowanceCap: 100n
+  });
+
+  assert.deepEqual(result, { broadcasted: false, broadcastCount: 0, reused: true });
+  assert.equal(h.sent.length, 0);
 });
 
 test('swap input and authorization cap must stay within the finite funding envelope', async () => {
@@ -525,6 +542,40 @@ test('atomic planning stops after five minutes before another approval or broadc
     assert.equal(h.approvals.length, 0);
     assert.equal(h.sendRequests.length, 0);
     assert.equal(h.journalHistory.some(entry => entry.atomicRetryReason), false);
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+test('approval receipt time is excluded from the bounded atomic planning budget', async () => {
+  const realNow = Date.now;
+  let fakeNow = 2_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const h = makeAtomicRetryHarness();
+    let poolStateReads = 0;
+    h.executor.fables.readPoolState = async () => {
+      poolStateReads++;
+      return { tick: 0, sqrtPriceX96: getSqrtPriceAtTick(0), paused: false };
+    };
+    h.executor.ensureSwapAllowances = async (token, amount, options) => {
+      h.approvals.push({ token, amount: BigInt(amount), options });
+      fakeNow += 360_001;
+      return { broadcasted: false, broadcastCount: 0, reused: true };
+    };
+    const journal = {
+      id: 'approval-loop-excluded-approval-time-test', kind: 'rebalance', phase: 'prepared',
+      startedAt: fakeNow, poolId: POOL_ID, pair: 'T0/T1', tx: {}
+    };
+
+    await assert.rejects(executeAtomicDeposit.call(h.executor, {
+      pool, target: h.target, funding: h.funding, balances: h.balances, journal
+    }), /stop after final gate/);
+
+    assert.equal(h.fits.length, 2, 'the second fit is only for the independent preflight retry');
+    assert.equal(h.approvals.length, 1);
+    assert.equal(poolStateReads, 2, 'reused allowance needs no extra fresh-state fit');
+    assert.equal(h.sendRequests.length, 1, 'planning resumes after the bounded approval wait');
   } finally {
     Date.now = realNow;
   }

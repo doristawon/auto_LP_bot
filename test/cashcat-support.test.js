@@ -39,7 +39,7 @@ test('CASHCAT/USDG PoolId is accepted by ID and by the CASHCAT/USDG symbol targe
 
   assert.equal(FablesAdapter.prototype.matchesTarget.call(allowlisted, cashcatPool), true);
   assert.equal(FablesAdapter.prototype.matchesTarget.call(symbolTarget, cashcatPool), true);
-  const bot = { cycleActive: false, market: { pools: [cashcatPool] },
+  const bot = { cycleActive: false, state: { setSetting() {} }, market: { pools: [cashcatPool] },
     persistInvestmentTarget: (mode, selected) => ({ mode, poolId: selected.id }) };
   assert.deepEqual(AutoLpBot.prototype.setInvestmentTarget.call(bot, 'specific-pool', CASHCAT_POOL_ID),
     { mode: 'specific-pool', poolId: CASHCAT_POOL_ID });

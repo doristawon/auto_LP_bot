@@ -224,6 +224,7 @@ export class AutoLpBot {
     if (next && source === 'dashboard') this.resumeExecutionAfterStartup = false;
     if (!next && source !== 'startup-restore') this.resumeExecutionAfterStartup = false;
     if (!next) {
+      if (this.rpcManagementActive) throw new Error('正在核對交易或管理 RPC，完成後才能啟動。');
       if (this.state.getSetting('stopLossLatched', false)) throw new Error('已停止清倉；請確認清倉結果後重新設定停損基準才能啟動。');
       const activeExecution = this.state.getSetting('activeRebalanceExecution', null);
       const terminal = new Set(['completed', 'failed']);
@@ -297,6 +298,7 @@ export class AutoLpBot {
     // moving funds, so a routine scan must not disable the start control.
     if (recoveryRequired) startBlockers.push('recovery-required');
     else if (executionBusy) startBlockers.push('execution-busy');
+    if (this.rpcManagementActive) startBlockers.push('recovery-review-active');
     if (allocationEnabled && (allocationSnapshot?.status !== 'ready'
       || allocationSnapshot?.priceStatus?.status !== 'fresh')) {
       startBlockers.push(allocationConfig.invalid ? 'allocation-config-invalid' : 'allocation-valuation-not-ready');
@@ -344,6 +346,7 @@ export class AutoLpBot {
       externalSwapRoutesEnabled: this.config.externalSwapRoutesEnabled,
       executionPaused: this.executionPaused,
       cycleActive: this.cycleActive,
+      rpcManagementActive: this.rpcManagementActive,
       nextMonitorAt: this.nextMonitorAt,
       signerConfigured,
       credentialPersistenceEnabled: Boolean(this.config.persistRuntimeCredentials),
@@ -453,13 +456,18 @@ export class AutoLpBot {
   }
 
   async resolveManualRecovery() {
-    if (this.cycleActive || !this.executionPaused) throw new Error('請先暫停並等目前掃描完成。');
+    if (!this.executionPaused || this.rpcManagementActive || this.initializing
+      || this.stopLiquidationPromise || this.executor?.hasPendingWrite) {
+      throw new Error('請先暫停並等待目前交易或設定更新完成。');
+    }
     const journal = this.state.getSetting('activeRebalanceExecution', null);
     const pool = this.market.pools.find(item => item.id.toLowerCase() === String(journal?.poolId).toLowerCase());
     if (!pool) throw new Error('尚未載入待復原池子。');
-    this.cycleActive = true;
-    try { return await reconcileManualReplacement(this.executor, pool); }
-    finally { this.cycleActive = false; }
+    // Paused scans cannot submit capital. Keep their own cycle flag intact;
+    // this control lock prevents resume/provider changes while proof is read.
+    this.rpcManagementActive = true;
+    try { return await reconcileManualReplacement(this.executor, pool, { replacementPools: this.market.pools }); }
+    finally { this.rpcManagementActive = false; }
   }
 
   setRuntimeIntervals(values = {}) {
@@ -1015,6 +1023,7 @@ export class AutoLpBot {
       tvlUsd: tvlStats?.tvlUsd ?? null,
       statsObservedAt: this.market.fablesStats?.aprObservedAt ?? null,
       minTvlUsd: this.config.aprPoolMinTvlUsd,
+      pending: this.state?.getSetting('pendingInvestmentTarget', null) || null,
       executionConstraint: settings.mode === 'apr-highest'
         ? 'cross-pool candidates require a complete live sequence preflight'
         : null
@@ -1120,7 +1129,6 @@ export class AutoLpBot {
   }
 
   setInvestmentTarget(mode, poolId = '') {
-    if (this.cycleActive) throw new Error('Wait for the current monitor cycle before changing the investment target');
     if (this.getInvestmentAllocationConfig?.()?.enabled === true) {
       throw new Error('Disable pool allocation before changing the legacy single investment target');
     }
@@ -1139,7 +1147,28 @@ export class AutoLpBot {
       }
       if (hasNativeCurrency(pool)) throw new Error('原生 ETH 池尚未支援自動跨池實盤');
     }
+    if (this.cycleActive && !this.executionPaused) {
+      const pending = { mode: normalizedMode, poolId: pool?.id.toLowerCase() || '',
+        pair: pool ? `${pool.token0.symbol}/${pool.token1.symbol}` : null, savedAt: Date.now() };
+      this.state.setSetting('pendingInvestmentTarget', pending);
+      this.ledger.append('investment.target_queued', pending);
+      return { ...this.getInvestmentTargetSnapshot(), queued: true, pending };
+    }
+    this.state.setSetting('pendingInvestmentTarget', null);
     return this.persistInvestmentTarget(normalizedMode, pool);
+  }
+
+  applyPendingInvestmentTarget() {
+    const pending = this.state.getSetting('pendingInvestmentTarget', null);
+    if (!pending) return;
+    try {
+      // Apply at a cycle boundary, including after restart; revalidate the pool.
+      this.setInvestmentTarget(pending.mode, pending.poolId);
+    } catch (error) {
+      const reason = sanitize(error.message);
+      this.state.setSetting('pendingInvestmentTarget', { ...pending, error: reason });
+      if (pending.error !== reason) this.ledger.append('investment.target_apply_failed', { ...pending, error: reason });
+    }
   }
 
   persistInvestmentTarget(mode, pool) {
@@ -1905,6 +1934,7 @@ export class AutoLpBot {
       return snapshot;
     } finally {
       this.cycleActive = false;
+      this.applyPendingInvestmentTarget();
       if (this.stopLiquidationReadbackPending || this.capitalReadbackPending) {
         const readbackSource = this.stopLiquidationReadbackPending ? 'auto-stop-readback' : 'capital-readback';
         this.stopLiquidationReadbackPending = false;

@@ -169,3 +169,69 @@ test('cross-pool funding is limited to source and destination pair tokens with w
   assert.equal(scope.find((entry) => entry.address === UBIK).maxSpendRaw, 26n);
   assert.equal(scope.find((entry) => entry.address === USDG).walletSource, 'source-and-destination-pair-wallet-balance');
 });
+
+function targetSettingsHarness() {
+  const oldId = '0x' + '11'.repeat(32), newId = '0x' + '22'.repeat(32);
+  const oldPool = pool(oldId, token(MOO, 'MOO'), token(USDG, 'USDG'));
+  const pons = pool(newId, token(UBIK, 'PONS'), token(USDG, 'USDG'));
+  const saved = { investmentTargetMode: 'specific-pool', investmentTargetPoolId: oldId };
+  const events = [];
+  const bot = {
+    cycleActive: true, executionPaused: false,
+    config: { marketRefreshMs: 300000, aprPoolMinTvlUsd: 30000 },
+    state: { getSetting: (key, fallback) => saved[key] ?? fallback, setSetting: (key, value) => { saved[key] = value; } },
+    ledger: { append: (type, data) => events.push({ type, ...data }) },
+    market: { pools: [oldPool, pons] },
+    getInvestmentAllocationConfig: () => ({ enabled: false }),
+    getInvestmentTargetSettings: () => ({ mode: saved.investmentTargetMode, poolId: saved.investmentTargetPoolId }),
+    applyStoredExecutionTarget: () => {},
+  };
+  for (const method of ['setInvestmentTarget', 'persistInvestmentTarget', 'getInvestmentTargetSnapshot', 'applyPendingInvestmentTarget']) {
+    bot[method] = AutoLpBot.prototype[method].bind(bot);
+  }
+  return { bot, saved, events, oldId, newId };
+}
+
+test('saving PONS during an active execution cycle queues the next target without changing this cycle', () => {
+  const h = targetSettingsHarness();
+  const result = h.bot.setInvestmentTarget('specific-pool', h.newId);
+  assert.equal(result.queued, true);
+  assert.equal(result.pending.pair, 'PONS/USDG');
+  assert.equal(h.saved.investmentTargetPoolId, h.oldId);
+  assert.equal(h.bot.getInvestmentTargetSnapshot().pending.poolId, h.newId);
+  h.bot.cycleActive = false;
+  h.bot.applyPendingInvestmentTarget();
+  assert.equal(h.saved.investmentTargetPoolId, h.newId);
+  assert.equal(h.saved.selectedExecutionTargetPoolId, h.newId);
+  assert.equal(h.saved.pendingInvestmentTarget, null);
+});
+
+test('a paused read-only monitor cycle can save PONS immediately without clearing recovery', () => {
+  const h = targetSettingsHarness(); h.bot.executionPaused = true;
+  h.saved.activeRebalanceExecution = { id: 'recovery', phase: 'recovery_required' };
+  const result = h.bot.setInvestmentTarget('specific-pool', h.newId);
+  assert.equal(result.poolId, h.newId);
+  assert.equal(h.saved.pendingInvestmentTarget, null);
+  assert.equal(h.saved.activeRebalanceExecution.phase, 'recovery_required');
+});
+
+test('latest queued selection survives restart and is revalidated before applying', () => {
+  const h = targetSettingsHarness();
+  h.bot.setInvestmentTarget('specific-pool', h.newId);
+  h.bot.setInvestmentTarget('specific-pool', h.oldId);
+  assert.equal(h.saved.pendingInvestmentTarget.poolId, h.oldId);
+  h.bot.cycleActive = false;
+  h.bot.applyPendingInvestmentTarget();
+  assert.equal(h.saved.pendingInvestmentTarget, null);
+  h.bot.cycleActive = true;
+  h.bot.setInvestmentTarget('specific-pool', h.newId);
+  h.bot.market.pools[1].state.paused = true;
+  h.bot.cycleActive = false;
+  h.bot.applyPendingInvestmentTarget();
+  assert.equal(h.saved.investmentTargetPoolId, h.oldId);
+  assert.equal(h.events.at(-1).type, 'investment.target_apply_failed');
+  assert.match(h.saved.pendingInvestmentTarget.error, /已暫停/);
+  const failures = h.events.filter(event => event.type === 'investment.target_apply_failed').length;
+  h.bot.applyPendingInvestmentTarget();
+  assert.equal(h.events.filter(event => event.type === 'investment.target_apply_failed').length, failures);
+});

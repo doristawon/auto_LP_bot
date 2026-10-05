@@ -20,6 +20,7 @@ export async function buildRangeBalancedSwapPlan({
   maxPriceImpactBps = 200,
   preferRemainderTokenIndex = null,
   preferredRemainderBps = 0,
+  pinnedBlockTag = null,
   maxRefinements = MAX_REFINEMENTS,
   expectedOutput = false
 } = {}) {
@@ -39,10 +40,38 @@ export async function buildRangeBalancedSwapPlan({
   }
 
   const spotSqrtPriceX96 = BigInt(state.sqrtPriceX96);
-  let pinnedTarget = validateTarget(target, state);
+  // The caller may have selected this target before obtaining its pinned
+  // state. Rebuild it at the state this planner will actually use.
+  let pinnedTarget = chooseTarget
+    ? validateTarget(await chooseTarget(Number(state.tick)), state)
+    : validateTarget(target, state);
+  const quoteCache = new Map();
+  const poolSelectionCache = new Map();
+  const previewCache = new Map();
+  const cachePinnedReads = pinnedBlockTag !== null && pinnedBlockTag !== undefined;
+  const plannerQuoter = {
+    quoteExactInputSingleRaw: (selectedPool, tokenIn, amountIn, slippage = slippageBps) => cachePinnedReads
+      ? memoizedCall(quoteCache, [String(pinnedBlockTag), poolIdentity(selectedPool), Number(tokenIn),
+        String(amountIn), Number(slippage)],
+      () => quoter.quoteExactInputSingleRaw(selectedPool, tokenIn, amountIn, slippage))
+      : quoter.quoteExactInputSingleRaw(selectedPool, tokenIn, amountIn, slippage)
+  };
+  if (typeof quoter.selectSamePairSwapPool === 'function') {
+    plannerQuoter.selectSamePairSwapPool = (selectedPool, tokenIn, amountIn, slippage = slippageBps, options = {}) =>
+      cachePinnedReads ? memoizedCall(poolSelectionCache, [String(pinnedBlockTag), poolIdentity(selectedPool),
+      Number(tokenIn), String(amountIn), Number(slippage), String(options.spotSqrtPriceX96 ?? ''),
+        Number(options.maxPriceImpactBps ?? ''), Boolean(options.atomicRoutesOnly)],
+      () => quoter.selectSamePairSwapPool(selectedPool, tokenIn, amountIn, slippage, options))
+      : quoter.selectSamePairSwapPool(selectedPool, tokenIn, amountIn, slippage, options);
+  }
+  const preview = swapPlan => cachePinnedReads ? memoizedCall(previewCache, [String(pinnedBlockTag),
+    swapPlan.direction, swapPlan.tokenIn, String(swapPlan.rawAmountIn),
+    String(swapPlan.quote?.rawAmountOut ?? ''), String(swapPlan.quote?.minRawAmountOut ?? ''),
+    poolIdentity(swapPlan.swapPool || pool)
+  ], () => previewSwap(swapPlan)) : previewSwap(swapPlan);
   const makePlan = (balanceSqrtPriceX96) => buildExactBalancedSwapPlan({
     pool,
-    quoter,
+    quoter: plannerQuoter,
     rawAmount0,
     rawAmount1,
     sqrtPriceX96: spotSqrtPriceX96,
@@ -68,7 +97,7 @@ export async function buildRangeBalancedSwapPlan({
     };
   }
 
-  let postState = validatePreview(await previewSwap(initialPlan), state, null);
+  let postState = validatePreview(await preview(initialPlan), state, null);
   if (chooseTarget) {
     pinnedTarget = validateTarget(await chooseTarget(postState.tick), postState);
   } else {
@@ -87,16 +116,22 @@ export async function buildRangeBalancedSwapPlan({
     if (refined.direction === 'none') {
       const unchangedState = { ...state, tick: Number(state.tick), sqrtPriceX96: spotSqrtPriceX96 };
       try {
-        validateTarget(pinnedTarget, unchangedState);
-        const candidate = evaluate(refined, pinnedTarget, unchangedState, rawAmount0, rawAmount1, expectedOutput);
+        const unchangedTarget = chooseTarget
+          ? validateTarget(await chooseTarget(unchangedState.tick), unchangedState)
+          : validateTarget(pinnedTarget, unchangedState);
+        const candidate = evaluate(refined, unchangedTarget, unchangedState, rawAmount0, rawAmount1, expectedOutput);
         if (candidate.capacityMismatchBps < best.capacityMismatchBps) best = candidate;
       } catch {}
       break;
     }
-    const refinedState = validatePreview(await previewSwap(refined), state, pinnedTarget);
-    const candidate = evaluate(refined, pinnedTarget, refinedState, rawAmount0, rawAmount1, expectedOutput);
+    const refinedState = validatePreview(await preview(refined), state, null);
+    const refinedTarget = chooseTarget
+      ? validateTarget(await chooseTarget(refinedState.tick), refinedState)
+      : validateTarget(pinnedTarget, refinedState);
+    const candidate = evaluate(refined, refinedTarget, refinedState, rawAmount0, rawAmount1, expectedOutput);
     if (candidate.capacityMismatchBps < best.capacityMismatchBps) best = candidate;
     if (expectedOutput && best.capacityMismatchBps <= 10) break;
+    pinnedTarget = refinedTarget;
     balancePrice = refinedState.sqrtPriceX96;
   }
 
@@ -107,6 +142,22 @@ export async function buildRangeBalancedSwapPlan({
     refinements,
     capacityMismatchBps: best.capacityMismatchBps
   };
+}
+
+function memoizedCall(cache, keyParts, create) {
+  const key = JSON.stringify(keyParts);
+  if (!cache.has(key)) {
+    const pending = Promise.resolve().then(create);
+    cache.set(key, pending);
+    pending.catch(() => { if (cache.get(key) === pending) cache.delete(key); });
+  }
+  return cache.get(key);
+}
+
+function poolIdentity(value) {
+  if (value?.id) return String(value.id).toLowerCase();
+  return [value?.token0?.address, value?.token1?.address, value?.key?.fee,
+    value?.key?.tickSpacing, value?.key?.hooks].map(item => String(item ?? '')).join(':').toLowerCase();
 }
 
 function validateTarget(target, state) {

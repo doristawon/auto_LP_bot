@@ -35,25 +35,62 @@ const base = {
   maxPriceImpactBps: 350
 };
 
-test('re-centers once from initial simulated swap tick and pins that target for refinements', async () => {
+test('retargets from the pinned tick and keeps each refinement paired with its preview', async () => {
   const seen = [];
+  const ticks = [21, 41, 61];
+  let previews = 0;
   const result = await buildRangeBalancedSwapPlan({
     ...base,
     chooseTarget(tick) {
       seen.push(tick);
-      return { tickLower: 10, tickUpper: 110 };
+      return { tickLower: tick - 5, tickUpper: tick + 15 };
     },
     async previewSwap(plan) {
-      return { tick: 11 + seen.length, sqrtPriceX96: getSqrtPriceAtTick(11 + seen.length),
-        balances: { raw0: '900000', raw1: '199000' }, callCount: seen.length + 3 };
+      const tick = ticks[previews++];
+      return { tick, sqrtPriceX96: getSqrtPriceAtTick(tick),
+        balances: { raw0: '900000', raw1: '199000' }, callCount: previews };
     }
   });
-  assert.deepEqual(seen, [11]);
-  assert.deepEqual(result.target, { tickLower: 10, tickUpper: 110 });
-  assert.equal(result.postState.callCount, 4);
+  assert.deepEqual(seen, [0, 21, 41, 61]);
+  assert.deepEqual(result.target, { tickLower: result.postState.tick - 5,
+    tickUpper: result.postState.tick + 15 });
+  assert.equal(result.postState.callCount, ticks.indexOf(result.postState.tick) + 1);
   assert.deepEqual(result.postState.balances, { raw0: '900000', raw1: '199000' });
   assert.equal(result.refinements, 2);
   assert.ok(result.capacityMismatchBps >= 0);
+});
+
+test('quote and preview memoization is limited to a single pinned planning block', async () => {
+  const run = async pinnedBlockTag => {
+    const quoteCounts = new Map();
+    let selections = 0;
+    let previews = 0;
+    const quoter = {
+      async selectSamePairSwapPool() { selections++; return { pool }; },
+      async quoteExactInputSingleRaw(_pool, tokenIn, rawAmountIn) {
+        const amount = BigInt(rawAmountIn);
+        const key = `${tokenIn}:${amount}`;
+        quoteCounts.set(key, (quoteCounts.get(key) || 0) + 1);
+        const rawAmountOut = amount * 999n / 1000n;
+        return { rawAmountIn: String(amount), rawAmountOut: String(rawAmountOut),
+          minRawAmountOut: String(rawAmountOut * 995n / 1000n),
+          tokenIn: tokenIn === 0 ? pool.token0.address : pool.token1.address,
+          tokenOut: tokenIn === 0 ? pool.token1.address : pool.token0.address };
+      }
+    };
+    await buildRangeBalancedSwapPlan({ ...base, quoter, pinnedBlockTag, maxRefinements: 1,
+      async previewSwap() { previews++; return { tick: 0, sqrtPriceX96: Q96 }; } });
+    return { quoteCounts, selections, previews };
+  };
+
+  const pinned = await run('0x1234');
+  const unpinned = await run(null);
+  assert.equal(pinned.previews, 1);
+  assert.equal(unpinned.previews, 2);
+  assert.equal(pinned.selections, 1);
+  assert.equal(unpinned.selections, 2);
+  assert.ok([...pinned.quoteCounts.values()].every(count => count === 1));
+  assert.ok([...unpinned.quoteCounts.values()].some(count => count > 1));
 });
 
 test('post-swap-price refinements cannot return a worse capacity mismatch than the initial plan', async () => {

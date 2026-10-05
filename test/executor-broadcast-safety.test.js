@@ -101,6 +101,32 @@ test('a mismatched failed receipt remains uncertain and freezes execution', asyn
   assert.equal(settings.get('activeRebalanceExecution').phase, 'recovery_required');
 });
 
+test('receipt wait timeout is bounded and retains the pending hash for recovery', async () => {
+  const hash = keccak256('0x1234');
+  let waitArgs;
+  let broadcasts = 0;
+  const { executor, settings, events } = makeExecutor({ broadcast: async () => {
+    broadcasts++;
+    return { hash, async wait(...args) {
+      waitArgs = args;
+      throw Object.assign(new Error('receipt wait timed out'), { code: 'TIMEOUT' });
+    } };
+  } });
+
+  await assert.rejects(executor.sendVerifiedTx({ label: 'approval-timeout', to: WALLET, data: '0x1234' }),
+    error => error.code === 'BROADCAST_OUTCOME_UNCERTAIN' && error.txHash === hash);
+
+  assert.deepEqual(waitArgs, [1, 180_000]);
+  assert.equal(broadcasts, 1, 'an uncertain receipt must never trigger an automatic rebroadcast');
+  const journal = settings.get('activeRebalanceExecution');
+  assert.equal(journal.phase, 'recovery_required');
+  assert.equal(journal.pendingTx.hash, hash);
+  assert.equal(journal.pendingTx.stage, 'receipt-wait');
+  assert.equal(journal.pendingTx.outcome, 'uncertain');
+  assert.ok(events.some(event => event.type === 'tx.broadcast_uncertain'
+    && event.data.hash === hash && event.data.stage === 'receipt-wait'));
+});
+
 test('ambiguous broadcast rejection locks the execution journal with the signed hash', async () => {
   const { executor, settings, events } = makeExecutor();
   let attemptedHash = null;

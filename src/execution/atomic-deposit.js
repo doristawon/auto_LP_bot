@@ -57,16 +57,37 @@ export function findAtomicDepositEvent(receipt, walletAddress, poolId) {
 // followed by a deposit. Every retry is a new plan after a proven no-op.
 export async function executeAtomicDeposit({ pool, target, funding, balances, journal,
   position = null, oldPosition = null, allocationScope = null, maxPriceImpactBps,
-  retarget = false, eventType = 'rebalance.completed', eventMetadata = {}, onJournal = () => {} }) {
+  previousApprovalCaps = null, retarget = false, eventType = 'rebalance.completed',
+  eventMetadata = {}, onJournal = () => {} }) {
   let capitalHash = null;
   let confirmed = false;
   let stage = 'validation';
   const approvalCaps = { raw0: BigInt(funding.raw0), raw1: BigInt(funding.raw1) };
+  const reusableApprovalCaps = previousApprovalCaps === null ? null : {
+    raw0: assertUint128(previousApprovalCaps.raw0),
+    raw1: assertUint128(previousApprovalCaps.raw1)
+  };
   const approvedInputs = new Set();
   const planningStartedAt = Date.now();
+  let excludedApprovalMs = 0;
+  let approvalPauseStartedAt = null;
+  const planningElapsedMs = () => {
+    const now = Date.now();
+    return now - planningStartedAt - excludedApprovalMs
+      - (approvalPauseStartedAt === null ? 0 : now - approvalPauseStartedAt);
+  };
+  const pausePlanningForApproval = () => {
+    if (approvalPauseStartedAt !== null) throw new Error('Atomic approval wait is already active');
+    approvalPauseStartedAt = Date.now();
+  };
+  const resumePlanningAfterApproval = () => {
+    if (approvalPauseStartedAt === null) return;
+    excludedApprovalMs += Date.now() - approvalPauseStartedAt;
+    approvalPauseStartedAt = null;
+  };
   const assertActive = () => {
     if (this.state?.getSetting('executionPaused', false)) throw new Error('Execution is paused');
-    if (Date.now() - planningStartedAt > 300_000) throw new Error('Atomic planning exceeded five minutes; stopped without another approval');
+    if (planningElapsedMs() > 300_000) throw new Error('Atomic planning exceeded five minutes; stopped without another approval');
     if (allocationScope) this.assertAllocationJobCurrent(pool, allocationScope);
   };
   const fitBeforeDeadline = async (prepareFit, options) => {
@@ -77,11 +98,18 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
       // fit and lock recovery rather than waiting indefinitely before a send.
       return await Promise.race([prepareFit.call(this, options), new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('Atomic planning exceeded five minutes; stopped without another approval')),
-          Math.max(1, 300_000 - (Date.now() - planningStartedAt)));
+          Math.max(1, 300_000 - planningElapsedMs()));
       })]);
     } finally { clearTimeout(timer); }
   };
-  const update = patch => { journal = this.patchJournal(journal, patch); onJournal(journal); };
+  const update = patch => {
+    // Allowance sends persist pendingTx/lastApprovalTx directly. Always patch
+    // the latest copy so an atomic-stage update cannot erase that evidence.
+    const active = this.state?.getSetting('activeRebalanceExecution', null);
+    const base = active?.id === journal.id ? active : journal;
+    journal = this.patchJournal(base, patch);
+    onJournal(journal);
+  };
   try {
     for (const key of ['raw0', 'raw1']) {
       assertUint128(approvalCaps[key]);
@@ -115,25 +143,36 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
       if (swapPlan.direction !== 'none' && !approvedInputs.has(swapPlan.tokenIn)) {
         stage = 'approval';
         const input = swapPlan.tokenIn === 0 ? pool.token0 : pool.token1;
-        await this.ensureSwapAllowances(input, swapPlan.rawAmountIn, {
-          allowanceCap: swapPlan.tokenIn === 0 ? approvalCaps.raw0 : approvalCaps.raw1,
-          beforeBroadcast: assertActive });
+        pausePlanningForApproval();
+        let approvalResult;
+        try {
+          approvalResult = await this.ensureSwapAllowances(input, swapPlan.rawAmountIn, {
+            allowanceCap: swapPlan.tokenIn === 0 ? approvalCaps.raw0 : approvalCaps.raw1,
+            reuseAllowanceCap: reusableApprovalCaps?.[`raw${swapPlan.tokenIn}`] ?? null,
+            beforeBroadcast: assertActive
+          });
+        } finally {
+          resumePlanningAfterApproval();
+        }
         approvedInputs.add(swapPlan.tokenIn);
-        // Allowance transactions happen before final fitting, never between
-        // the committed swap and deposit.
-        const fresh = await this.fables.readPoolState(pool);
         stage = 'planning';
-        fitted = await fitBeforeDeadline(prepareFit, { pool, funding, state: fresh,
-          target: fitted.target, stableIndex, maxPriceImpactBps, expectedOutput: true,
-          swapAllowanceCaps: approvalCaps,
-          ...(retarget ? { chooseTarget: tick => buildTargetRange(tick,
-            pool.key.tickSpacing, this.config.tightWidthBps, this.config.rangePreset) } : {}) });
-        if (fitted.swapPlan.direction !== 'none' && !approvedInputs.has(fitted.swapPlan.tokenIn)) {
-          // A changed input token needs its own bounded approval and a new
-          // plan after that approval, never a late approval on a fitted plan.
-          update({ phase: 'atomic_retry', atomicAttempt: attempt + 1, atomicRetryReason: 'swap-input-changed' });
-          if (attempt === 2) throw new Error('Atomic swap input kept changing');
-          continue;
+        // A reused pre-withdrawal cap makes no chain change, so keep the fit.
+        // A real approval broadcast can span blocks; only then refit from a
+        // fresh pool state before constructing the atomic call.
+        if (approvalResult?.broadcasted !== false) {
+          const fresh = await this.fables.readPoolState(pool);
+          fitted = await fitBeforeDeadline(prepareFit, { pool, funding, state: fresh,
+            target: fitted.target, stableIndex, maxPriceImpactBps, expectedOutput: true,
+            swapAllowanceCaps: approvalCaps,
+            ...(retarget ? { chooseTarget: tick => buildTargetRange(tick,
+              pool.key.tickSpacing, this.config.tightWidthBps, this.config.rangePreset) } : {}) });
+          if (fitted.swapPlan.direction !== 'none' && !approvedInputs.has(fitted.swapPlan.tokenIn)) {
+            // A changed input token needs its own bounded approval and a new
+            // plan after that approval, never a late approval on a fitted plan.
+            update({ phase: 'atomic_retry', atomicAttempt: attempt + 1, atomicRetryReason: 'swap-input-changed' });
+            if (attempt === 2) throw new Error('Atomic swap input kept changing');
+            continue;
+          }
         }
       }
       target = fitted.target;
@@ -148,6 +187,9 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
         if (executable.tokenIn === 0) { projected.raw0 -= executable.rawAmountIn; projected.raw1 += amountOut; }
         else { projected.raw1 -= executable.rawAmountIn; projected.raw0 += amountOut; }
       }
+      // Use the selected fit's simulated post-swap price and the router's
+      // guaranteed minOut inventory. The pool spot may move before broadcast;
+      // the full atomic preflight below must still pass this fixed threshold.
       const liquidity = getLiquidityForAmounts(fitted.postState.sqrtPriceX96,
         getSqrtPriceAtTick(target.tickLower), getSqrtPriceAtTick(target.tickUpper), projected.raw0, projected.raw1);
       const minLiquidity = liquidity * BigInt(10_000 - this.config.depositSlippageBps) / 10_000n;
@@ -177,7 +219,9 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
         receipt = await this.sendVerifiedTx({ label: 'atomicSwapAndDeposit', to: request.to,
           data: request.data, value: 0n, feeOverrides: fees, preflight, beforeBroadcast: assertActive, onSent: hash => {
             capitalHash = hash;
-            update({ phase: 'atomic_sent', tx: { ...journal.tx, atomicSwapDeposit: hash } });
+            update({ phase: 'atomic_sent', tx: { ...journal.tx, atomicSwapDeposit: hash },
+              pendingTx: { label: 'atomicSwapAndDeposit', hash, to: request.to,
+                previousPhase: 'atomic_preflighted' } });
           } });
       } catch (error) {
         if (error.code !== 'TRANSACTION_REVERTED' || error.receipt?.status !== 0
@@ -191,14 +235,14 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
         this.ledger.append('rebalance.atomic_revert_replanned', { hash: capitalHash,
           poolId: pool.id, attempt: attempt + 1, blockNumber: error.receipt.blockNumber });
         update({ phase: 'atomic_retry', tx: { ...journal.tx, atomicSwapDeposit: null,
-          atomicReverts: [...(journal.tx.atomicReverts || []), capitalHash] } });
+          atomicReverts: [...(journal.tx.atomicReverts || []), capitalHash] }, pendingTx: null });
         capitalHash = null;
         if (attempt === 2) throw error;
         continue;
       }
       confirmed = true;
       stage = 'verify';
-      update({ phase: 'atomic_confirmed' });
+      update({ phase: 'atomic_confirmed', pendingTx: null });
       const atomic = findAtomicDepositEvent(receipt, this.config.walletAddress, pool.id);
       const deposit = this.findWalletDepositEvent(pool, receipt);
       if (!deposit || deposit.liquidity !== atomic.liquidity
@@ -254,9 +298,11 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
         if (!capitalHash && !confirmed && (['planning', 'preflight'].includes(stage)
           || (stage === 'broadcast' && error.preBroadcastFailure === true))
           && ['CALL_EXCEPTION', 'SEQUENTIAL_SIMULATION_REVERT', 'PREFLIGHT_EXPIRED'].includes(error.code) && attempt < 2) {
+          const retryError = errorSummary(error);
           update({ phase: 'atomic_retry', atomicAttempt: attempt + 1, atomicRetryReason: 'preflight-price-changed',
-            atomicRetryStage: stage, atomicRetryError: sanitize(error.shortMessage || error.message).slice(0, 360),
-            atomicRetrySelector: errorSummary(error).errorSelector });
+            atomicRetryStage: stage, atomicRetryError: retryError.error,
+            atomicRetrySelector: retryError.errorSelector,
+            atomicRetryGuardError: retryError.guardError });
           continue;
         }
         throw error;
@@ -268,8 +314,14 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
     const moved = confirmed || capitalHash || journal.tx?.withdraw || journal.tx?.routeSwaps?.length
       || error.code === 'BROADCAST_OUTCOME_UNCERTAIN';
     const details = errorSummary(error);
+    const active = this.state?.getSetting('activeRebalanceExecution', null);
+    const pending = active?.id === journal.id ? active.pendingTx : journal.pendingTx;
+    const uncertainPending = error.code === 'BROADCAST_OUTCOME_UNCERTAIN' && capitalHash
+      ? { pendingTx: { ...(pending || {}), label: 'atomicSwapAndDeposit', hash: capitalHash,
+        to: this.config.walletAddress, outcome: 'uncertain' } }
+      : {};
     update({ phase: moved ? 'recovery_required' : 'failed', failedAt: Date.now(), ...details,
-      errorStage: stage, preBroadcastFailure: error.preBroadcastFailure === true });
+      errorStage: stage, preBroadcastFailure: error.preBroadcastFailure === true, ...uncertainPending });
     if (moved) this.ledger.append('rebalance.recovery_required', { ...journal, ...details });
     error.atomicHandled = true;
     throw error;

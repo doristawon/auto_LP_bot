@@ -9,7 +9,9 @@ const topicAddress = topic => `0x${String(topic).slice(-40)}`.toLowerCase();
 
 // Only reconcile the narrow no-redeposit failure when a later manual LP
 // replacement is proven by a receipt and live shares. Never submit capital.
-export async function reconcileManualReplacement(executor, pool, { fetchLedger = fetchOwnerLedger } = {}) {
+export async function reconcileManualReplacement(executor, pool, {
+  fetchLedger = fetchOwnerLedger, replacementPools = [pool]
+} = {}) {
   const journal = executor.state.getSetting('activeRebalanceExecution', null);
   if (journal?.phase !== 'recovery_required' || !journal.oldPosition?.id
     || String(journal.poolId).toLowerCase() !== pool.id.toLowerCase()
@@ -36,21 +38,27 @@ export async function reconcileManualReplacement(executor, pool, { fetchLedger =
       && topicAddress(log.topics[1]) === wallet && BigInt(log.topics[2]) === BigInt(journal.oldPosition.id))) {
     throw new Error('撤池收據、舊 LP 份額或交易 nonce 尚未一致。');
   }
+  // The user may have replaced the withdrawn LP in another registered pool.
+  // A selected pool name is not proof: verify its receipt, PoolKey and live shares.
+  const poolById = new Map(replacementPools.map(item => [item.id.toLowerCase(), item]));
+  poolById.set(pool.id.toLowerCase(), pool);
   const owner = await fetchLedger(wallet);
   const candidates = (owner.LiquidityEvent || []).filter(event => ['DEPOSIT','TRANSFER_IN'].includes(event.kind)
-    && String(event.pool_id).toLowerCase() === pool.id.toLowerCase()
+    && poolById.has(String(event.pool_id).toLowerCase())
     && BigInt(event.range_id) !== BigInt(journal.oldPosition.id) && Number(event.block) > receipt.blockNumber
     && /^0x[0-9a-f]{64}$/i.test(event.txHash)).reverse();
   for (const event of candidates.slice(0, 16)) {
-    const shares = await executor.readPositionShares(pool, event.range_id);
+    const replacementPool = poolById.get(String(event.pool_id).toLowerCase());
+    const shares = await executor.readPositionShares(replacementPool, event.range_id);
     if (shares <= 0n) continue;
     const replacement = await executor.readProvider.getTransactionReceipt(event.txHash);
     if (replacement?.status !== 1 || replacement.blockNumber <= receipt.blockNumber) continue;
-    const key = await executor.fables.readRangeKey(pool, event.range_id);
+    if (String(replacement.hash).toLowerCase() !== event.txHash.toLowerCase()) continue;
+    const key = await executor.fables.readRangeKey(replacementPool, event.range_id);
     if (!key.exists || !['currency0','currency1','fee','tickSpacing','hooks'].every(name =>
-      String(key.key[name]).toLowerCase() === String(pool.key[name]).toLowerCase())) continue;
+      String(key.key[name]).toLowerCase() === String(replacementPool.key[name]).toLowerCase())) continue;
     const matched = (replacement.logs || []).some(log => {
-      if (String(log.address).toLowerCase() !== pool.key.hooks.toLowerCase()) return false;
+      if (String(log.address).toLowerCase() !== replacementPool.key.hooks.toLowerCase()) return false;
       if (String(log.topics?.[0]).toLowerCase() === depositedTopic) return topicAddress(log.topics[1]) === wallet
         && BigInt(log.topics[2]) === BigInt(event.range_id) && BigInt(log.data) > 0n;
       try { const transfer = shareTransfer.parseLog(log);
@@ -58,10 +66,22 @@ export async function reconcileManualReplacement(executor, pool, { fetchLedger =
       } catch { return false; }
     });
     if (!matched) continue;
-    if (executor.state.getSetting('activeRebalanceExecution', null)?.id !== journal.id) throw new Error('復原紀錄已變更。');
+    const [finalLatest, finalPending, finalShares] = await Promise.all([
+      executor.writeProvider.getTransactionCount(wallet, 'latest'),
+      executor.writeProvider.getTransactionCount(wallet, 'pending'),
+      executor.readPositionShares(replacementPool, event.range_id)
+    ]);
+    const current = executor.state.getSetting('activeRebalanceExecution', null);
+    if (current?.id !== journal.id || current.phase !== 'recovery_required' || current.pendingTx
+      || finalLatest !== latest || finalPending !== latest || finalShares !== shares) {
+      throw new Error('復原紀錄或鏈上資產已變更，請重新核對。');
+    }
     const proof = { originalExecutionId: journal.id, withdrawHash: journal.tx.withdraw,
       replacementHash: event.txHash, replacementBlock: replacement.blockNumber,
-      poolId: pool.id, positionId: event.range_id, shares: String(shares),
+      oldPoolId: pool.id, poolId: replacementPool.id,
+      pair: replacementPool.token0 && replacementPool.token1
+        ? `${replacementPool.token0.symbol}/${replacementPool.token1.symbol}` : null,
+      positionId: event.range_id, shares: String(shares),
       tickLower: Number(key.tickLower), tickUpper: Number(key.tickUpper), nonce: latest };
     executor.ledger.append('rebalance.recovery_resolved', { ...proof, method: 'verified-manual-lp-replacement' });
     executor.patchJournal(journal, { phase: 'failed', failedAt: Date.now(),
@@ -69,5 +89,5 @@ export async function reconcileManualReplacement(executor, pool, { fetchLedger =
     executor.clearJournal();
     return { status: 'resolved', ...proof };
   }
-  throw new Error('尚未找到已確認且仍持有份額的手動替換 LP。');
+  throw new Error('尚未找到已確認且仍持有份額的手動替換 LP；請先核對撤池後的資產與交易。');
 }

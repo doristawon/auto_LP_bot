@@ -2,6 +2,37 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createPinnedPlanningContext } from '../src/execution/pinned-planning.js';
 import { pinnedSimulationProvider } from '../src/execution/pinned-simulation.js';
+import { RebalanceExecutor } from '../src/adapters/executor.js';
+
+test('complete atomic cross-pool rehearsal pins withdrawal inventory and final simulation together', async () => {
+  const requests = [];
+  const provider = { send: async (method, args) => {
+    requests.push({ method, args });
+    if (method === 'eth_blockNumber') return '0x123';
+    return '0x';
+  }, getRpcTransaction: value => value };
+  const pool = { id: 'pool', token0: { address: 'a' }, token1: { address: 'b' },
+    key: {}, state: { tick: 1 } };
+  const executor = Object.assign(Object.create(RebalanceExecutor.prototype), {
+    config: { atomicDepositEnabled: true }, readProvider: provider, writeProvider: provider,
+    signer: {}, fables: { provider }, quoter: { provider }, router: { provider },
+    async preflightCrossPoolSequence(plan, destination) {
+      if (!this.planningBlockTag) return RebalanceExecutor.prototype.preflightCrossPoolSequence.call(this, plan, destination);
+      assert.equal(this.signer, null);
+      plan.pool.state = { tick: 2 };
+      await this.readProvider.call({ to: 'withdraw-inventory' });
+      await this.writeProvider.send('eth_simulateV1', [{ sequence: 'withdraw-swap-deposit' }, 'latest']);
+      assert.throws(() => this.sendVerifiedTx(), /cannot submit/);
+      return { status: 'full-sequence-simulated' };
+    }
+  });
+  const result = await executor.preflightCrossPoolSequence({ pool }, pool);
+  assert.equal(result.planningBlockTag, '0x123');
+  assert.equal(pool.state.tick, 1, 'rehearsal cannot overwrite live source state');
+  assert.ok(requests.filter(r => ['eth_call', 'eth_simulateV1'].includes(r.method)).every(r => r.args[1] === '0x123'));
+  await executor.writeProvider.send('eth_simulateV1', [{ sequence: 'fresh-broadcast-check' }, 'latest']);
+  assert.equal(requests.at(-1).args[1], 'latest', 'live executor remains unpinned');
+});
 
 test('isolated planning pins adapter reads and nested comparisons without a signer', async () => {
   const requests = [];

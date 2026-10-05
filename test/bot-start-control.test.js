@@ -168,7 +168,13 @@ test('setting a specific pool clears target-required only for that wallet and ke
   assert.equal(secondWallet.getSelectedExecutionTargetPoolId(), '');
 
   firstWallet.cycleActive = true;
-  assert.throws(() => firstWallet.setInvestmentTarget('specific-pool', POOL_ID), /current monitor cycle/);
+  firstWallet.executionPaused = true;
+  assert.equal(firstWallet.setInvestmentTarget('specific-pool', POOL_ID).poolId, POOL_ID);
+  firstWallet.executionPaused = false;
+  const queued = firstWallet.setInvestmentTarget('specific-pool', POOL_ID);
+  assert.equal(queued.queued, true);
+  assert.equal(queued.pending.poolId, POOL_ID);
+  assert.equal(secondWallet.state.getSetting('pendingInvestmentTarget', null), null);
 });
 
 test('startup restores a previously running bot only after its first successful scan', async () => {

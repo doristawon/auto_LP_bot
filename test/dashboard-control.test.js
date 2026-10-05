@@ -293,10 +293,10 @@ test('dashboard suppresses empty position errors and resolves verified manual LP
   assert.doesNotMatch(html, /translateError\(x\.rebalanceReason\|\|''\)/);
   assert.match(html, /progress\.reconciliationStatus==='verified-manual-lp-replacement'/);
   assert.match(html, /progress\.error==='Original redeposit failed; later manual LP replacement verified'/);
-  assert.match(html, /手動復原已核對/);
+  assert.match(html, /已核對手動換倉/);
   assert.match(html, /已解除待復原/);
-  assert.match(html, /原 Bot 再投入失敗；後續手動 LP 已核對，目前已解除待復原狀態。/);
-  assert.match(html, /歷史 Bot 步驟僅供參考；原再投入未成功。/);
+  assert.match(html, /Bot 換幣／存入未完成/);
+  assert.match(html, /後續 LP 收據/);
 });
 
 test('dashboard manual rebalance is fail-closed until explicitly armed', async () => {

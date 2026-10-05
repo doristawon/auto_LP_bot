@@ -11,12 +11,26 @@ const journal = phase => ({ id: 'synthetic-job', phase, startedAt: 1000,
   updatedAt: 2000, pair: 'TOKEN/USDG', oldPosition: { id: 'range' },
   tx: { withdraw: hash('1'), swap: hash('2'), deposit: hash('3') } });
 
-test('verified manual recovery stays distinct from original bot deposit success', () => {
+test('verified manual LP reconciliation shows only verified manual receipts and proof', () => {
   const progress = describeExecutionProgress({ ...journal('failed'), lastKnownPhase: 'atomic_retry',
-    tx: { withdraw: hash('1') }, reconciliation: { withdrawHash: hash('1'), replacementHash: hash('4') } });
+    tx: { withdraw: hash('1'), swap: hash('2'), deposit: hash('3') },
+    pendingTx: { hash: hash('6'), label: 'pending old transaction' },
+    lastApprovalTx: { hash: hash('7'), status: 'confirmed' },
+    reconciliation: { withdrawHash: hash('1'), replacementHash: hash('4'), pair: 'PONS/USDG',
+      poolId: 'new-pool-id', oldPoolId: 'old-pool-id', positionId: '987654321' } });
   assert.equal(progress.reconciliationStatus, 'verified-manual-lp-replacement');
-  assert.equal(progress.status, 'failed');
-  assert.equal(progress.steps.find(s => s.key === 'deposit').status, 'failed');
+  assert.equal(progress.status, 'completed');
+  assert.equal(progress.label, '已核對手動換倉');
+  assert.equal(progress.pair, 'PONS/USDG');
+  assert.deepEqual(progress.steps.map(({ key, status }) => [key, status]), [
+    ['preflight', 'completed'], ['withdraw', 'completed'], ['verify', 'completed']
+  ]);
+  assert.deepEqual(progress.transactions.map(({ hash: txHash, status }) => [txHash, status]), [
+    [hash('1'), 'confirmed'], [hash('4'), 'confirmed']
+  ]);
+  assert.equal(progress.reconciliationProof.poolId, 'new-pool-id');
+  assert.equal(progress.reconciliationProof.oldPoolId, 'old-pool-id');
+  assert.match(progress.message, /Bot 換幣與存入未完成/);
   assert.equal(describeExecutionProgress(journal('failed')).reconciliationStatus, undefined);
 });
 
@@ -25,6 +39,18 @@ test('preflight retries do not imply a reverted live transaction', () => {
     atomicRetryReason: 'preflight-price-changed' });
   assert.match(progress.message, /尚未送出資金交易/);
   assert.equal(progress.transactions.length, 0);
+});
+
+test('atomic retry without a swap decision or atomic receipt leaves swap and deposit unfinished', () => {
+  const progress = describeExecutionProgress({ ...journal('atomic_retry'), tx: { withdraw: hash('1') },
+    atomicRetryReason: 'preflight-price-changed' });
+  assert.equal(progress.currentStepLabel, '換幣');
+  assert.equal(progress.steps[2].status, 'active');
+  assert.equal(progress.steps[3].status, 'pending');
+  assert.equal(progress.transactions.length, 1);
+  assert.equal(progress.transactions[0].hash, hash('1'));
+  assert.equal(progress.transactions[0].status, 'confirmed');
+  assert.doesNotMatch(progress.message, /已完成/);
 });
 
 test('stepper follows receipt phases rather than a guessed completion percentage', () => {

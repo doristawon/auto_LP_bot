@@ -6,7 +6,7 @@ import { DEPOSITED_EVENT, EIP7702_GUARD_ABI } from '../src/abi.js';
 import { UNISWAP_UNIVERSAL_ROUTER_212 } from '../src/constants.js';
 import { buildAtomicDepositRequest, executeAtomicDeposit, findAtomicDepositEvent }
   from '../src/execution/atomic-deposit.js';
-import { getSqrtPriceAtTick } from '../src/math/v4-fixed.js';
+import { getLiquidityForAmounts, getSqrtPriceAtTick } from '../src/math/v4-fixed.js';
 
 const WALLET = `0x${'99'.repeat(20)}`;
 const TOKEN0 = `0x${'11'.repeat(20)}`;
@@ -180,6 +180,35 @@ test('atomic request encodes a single swap-and-deposit call and enforces authori
     routerRequest: { router: TOKEN0, data: '0x12345678', value: 0n } }), /Unsupported atomic swap route/);
 });
 
+test('atomic minimum liquidity follows the fitted post-swap price and guaranteed minOut', async () => {
+  const h = makeHarness();
+  const postSwapPrice = getSqrtPriceAtTick(60);
+  h.executor.prepareRangeBalancedSwap = async () => ({ target: TARGET,
+    postState: { tick: 60, sqrtPriceX96: postSwapPrice },
+    swapPlan: { direction: 'zeroForOne', tokenIn: 0, rawAmountIn: 10n,
+      quote: { minRawAmountOut: 12n, rawAmountOut: 13n } } });
+  h.executor.ensureSwapAllowances = async () => ({ broadcasted: false });
+  let atomicRequest;
+  h.executor.preflightVerifiedTx = async request => {
+    atomicRequest = request;
+    return { gasEstimate: 100_000n, feeOverrides: { gasPrice: 1n } };
+  };
+
+  await executeAtomicDeposit.call(h.executor, { pool, target: TARGET, funding: FUNDING,
+    balances: BASELINE, journal: h.txJournal });
+
+  const encoded = guardInterface.parseTransaction({ data: atomicRequest.data });
+  const sqrtA = getSqrtPriceAtTick(TARGET.tickLower);
+  const sqrtB = getSqrtPriceAtTick(TARGET.tickUpper);
+  const guaranteedLiquidity = getLiquidityForAmounts(postSwapPrice, sqrtA, sqrtB, 90n, 92n);
+  const expectedMin = guaranteedLiquidity * 9950n / 10_000n;
+  const optimisticMin = getLiquidityForAmounts(postSwapPrice, sqrtA, sqrtB, 90n, 93n) * 9950n / 10_000n;
+  const staleSpotMin = getLiquidityForAmounts(getSqrtPriceAtTick(0), sqrtA, sqrtB, 90n, 92n) * 9950n / 10_000n;
+  assert.equal(encoded.args.plan.minLiquidity, expectedMin);
+  assert.notEqual(expectedMin, optimisticMin, 'raw quoted output must not replace router minOut');
+  assert.notEqual(expectedMin, staleSpotMin, 'pre-swap spot must not replace the fitted post-swap price');
+});
+
 test('one send produces one hash/receipt for swap plus deposit and preserves allocation reserves', async () => {
   const before = { raw0: 1000n, raw1: 800n };
   const funding = { raw0: 100n, raw1: 80n };
@@ -280,10 +309,12 @@ test('confirmed no-op revert is refitted and retried at most three total sends',
   assert.equal(h.calls.allowance, 1);
   assert.equal(h.calls.physicalReads, 6);
   assert.equal(h.calls.latestNonceReads, 2);
-  assert.equal(h.calls.pendingNonceReads, 2);
-  assert.equal(h.calls.lpShareReads, 6);
-  assert.equal(h.journalHistory.filter(journal => journal.phase === 'atomic_retry').length, 2);
-  const sentJournal = h.journalHistory.filter(journal => journal.phase === 'atomic_sent').at(-1);
+    assert.equal(h.calls.pendingNonceReads, 2);
+    assert.equal(h.calls.lpShareReads, 6);
+    assert.equal(h.journalHistory.filter(journal => journal.phase === 'atomic_retry').length, 2);
+    assert.equal(h.journalHistory.filter(journal => journal.phase === 'atomic_retry').at(-1).pendingTx, null,
+      'a confirmed revert clears the known-mined pending marker before replanning');
+    const sentJournal = h.journalHistory.filter(journal => journal.phase === 'atomic_sent').at(-1);
   assert.equal(sentJournal.tx.atomicSwapDeposit, txHash(3));
 });
 
@@ -334,11 +365,40 @@ test('uncertain atomic broadcast locks recovery and is never retried', async () 
     error.code = 'BROADCAST_OUTCOME_UNCERTAIN'; error.txHash = hash;
     throw error;
   } });
-  await assert.rejects(executeAtomicDeposit.call(h.executor, { pool: h.pool, target: TARGET,
-    funding: FUNDING, balances: BASELINE, journal: h.txJournal }), /broadcast outcome uncertain/);
-  assert.equal(h.calls.sends, 1);
-  assert.equal(h.settings.get('activeRebalanceExecution').phase, 'recovery_required');
-  assert.equal(h.settings.get('activeRebalanceExecution').tx.atomicSwapDeposit, txHash(1));
+    await assert.rejects(executeAtomicDeposit.call(h.executor, { pool: h.pool, target: TARGET,
+      funding: FUNDING, balances: BASELINE, journal: h.txJournal }), /broadcast outcome uncertain/);
+    assert.equal(h.calls.sends, 1);
+    const journal = h.settings.get('activeRebalanceExecution');
+    assert.equal(journal.phase, 'recovery_required');
+    assert.equal(journal.tx.atomicSwapDeposit, txHash(1));
+    assert.equal(journal.pendingTx.hash, txHash(1));
+    assert.equal(journal.pendingTx.outcome, 'uncertain');
+  });
+
+test('atomic failure patches preserve uncertain approval hash and last approval status', async () => {
+  const h = makeHarness();
+  const approvalHash = txHash(77);
+  h.settings.set('activeRebalanceExecution', h.txJournal);
+  h.executor.ensureSwapAllowances = async () => {
+    const active = h.settings.get('activeRebalanceExecution');
+    h.settings.set('activeRebalanceExecution', { ...active, phase: 'recovery_required',
+      pendingTx: { label: 'permit2:T0:router', hash: approvalHash, stage: 'receipt-wait', outcome: 'uncertain' },
+      lastApprovalTx: { label: 'approve:T0:permit2', hash: txHash(76), status: 'confirmed' } });
+    throw Object.assign(new Error('approval receipt outcome uncertain'), {
+      code: 'BROADCAST_OUTCOME_UNCERTAIN', txHash: approvalHash
+    });
+  };
+
+  await assert.rejects(executeAtomicDeposit.call(h.executor, { pool, target: TARGET,
+    funding: FUNDING, balances: BASELINE, journal: h.txJournal }), /approval receipt outcome uncertain/);
+
+  const journal = h.settings.get('activeRebalanceExecution');
+  assert.equal(journal.phase, 'recovery_required');
+  assert.equal(journal.errorStage, 'approval');
+  assert.equal(journal.pendingTx.hash, approvalHash);
+  assert.equal(journal.pendingTx.stage, 'receipt-wait');
+  assert.equal(journal.lastApprovalTx.hash, txHash(76));
+  assert.equal(journal.lastApprovalTx.status, 'confirmed');
 });
 
 test('confirmed atomic transaction followed by receipt verification failure requires recovery', async () => {
@@ -364,4 +424,32 @@ test('preflight failure after a withdrawal journaled cannot be cleared as safe f
   assert.equal(h.calls.sends, 0);
   assert.equal(h.settings.get('activeRebalanceExecution').phase, 'recovery_required');
   assert.equal(h.settings.get('activeRebalanceExecution').tx.withdraw, txHash(40));
+});
+
+test('a later planning timeout preserves the decoded preflight retry reason in the journal', async () => {
+  const h = makeHarness();
+  let fits = 0;
+  h.executor.prepareRangeBalancedSwap = async () => {
+    fits++;
+    if (fits > 1) throw new Error('Atomic planning exceeded five minutes; stopped without another approval');
+    return { target: TARGET, postState: { tick: 0, sqrtPriceX96: getSqrtPriceAtTick(0) },
+      swapPlan: { direction: 'zeroForOne', tokenIn: 0, rawAmountIn: 10n,
+        quote: { minRawAmountOut: 12n, rawAmountOut: 13n } } };
+  };
+  h.executor.ensureSwapAllowances = async () => ({ broadcasted: false });
+  h.executor.preflightVerifiedTx = async () => {
+    throw Object.assign(new Error('execution reverted'), {
+      code: 'CALL_EXCEPTION', data: guardInterface.encodeErrorResult('LiquidityBelowMinimum')
+    });
+  };
+
+  await assert.rejects(executeAtomicDeposit.call(h.executor, { pool, target: TARGET,
+    funding: FUNDING, balances: BASELINE, journal: h.txJournal }), /Atomic planning exceeded five minutes/);
+
+  const journal = h.settings.get('activeRebalanceExecution');
+  assert.equal(journal.phase, 'failed');
+  assert.equal(journal.atomicRetryReason, 'preflight-price-changed');
+  assert.equal(journal.atomicRetrySelector, guardInterface.getError('LiquidityBelowMinimum').selector);
+  assert.equal(journal.atomicRetryGuardError, 'LiquidityBelowMinimum');
+  assert.match(journal.atomicRetryError, /最低限制/);
 });
