@@ -1,5 +1,6 @@
 import { FallbackProvider, FetchRequest, JsonRpcProvider } from 'ethers';
 import { isRpcTimeoutError } from './errors.js';
+import { RateLimitedJsonRpcProvider } from './rate-limited-provider.js';
 
 function classifyRpcError(error) {
   const status = Number(error?.statusCode || error?.status || error?.info?.responseStatus || 0);
@@ -54,12 +55,12 @@ export function createProviders(config) {
     const request = new FetchRequest(url);
     request.timeout = requestTimeoutMs;
     request.retryFunc = async () => false;
-    return new JsonRpcProvider(request, network, { staticNetwork: true });
+    return new RateLimitedJsonRpcProvider(request, network, { staticNetwork: true });
   });
   const writeRequest = new FetchRequest(config.rpcUrls[0]);
   writeRequest.timeout = requestTimeoutMs;
   writeRequest.retryFunc = async () => false;
-  const writeProvider = new JsonRpcProvider(writeRequest, network, { staticNetwork: true });
+  const writeProvider = new RateLimitedJsonRpcProvider(writeRequest, network, { staticNetwork: true });
   const readProvider = rawProviders.length === 1
     ? rawProviders[0]
     : new FallbackProvider(
