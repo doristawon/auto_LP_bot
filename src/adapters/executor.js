@@ -2643,9 +2643,23 @@ export class RebalanceExecutor {
   samePoolRebalanceMaxImpactBps(pool) {
     const defaultLimit = this.config.maxSwapPriceImpactBps ?? 200;
     const scopedPoolId = String(this.config.oorRebalanceSwapPoolId || '').toLowerCase();
-    return scopedPoolId && scopedPoolId === String(pool.id).toLowerCase()
-      ? this.config.oorRebalanceMaxSwapPriceImpactBps ?? defaultLimit
-      : defaultLimit;
+    if (scopedPoolId && scopedPoolId === String(pool.id).toLowerCase()) {
+      return this.config.oorRebalanceMaxSwapPriceImpactBps ?? defaultLimit;
+    }
+    // A saved target must carry the same already-authorized finite cost cap
+    // through top-up and OOR rebuilding, rather than retaining the old pool's
+    // exception. Unselected pools retain the global ceiling.
+    const mode = this.state?.getSetting('investmentTargetMode', null);
+    const targetId = this.state?.getSetting('investmentTargetPoolId', '');
+    if (mode === 'specific-pool' && String(targetId).toLowerCase() === String(pool.id).toLowerCase()) {
+      return resolveTopUpSwapPolicy({ poolId: pool.id,
+        investmentTargetMode: mode, investmentTargetPoolId: targetId,
+        maxSwapPriceImpactBps: defaultLimit,
+        autoTopupMaxSwapPriceImpactBps: this.config.autoTopupMaxSwapPriceImpactBps,
+        crossPoolMaxSwapPriceImpactBps: this.config.crossPoolMaxSwapPriceImpactBps
+      }).maxPriceImpactBps;
+    }
+    return defaultLimit;
   }
 
   allocationSwapMaxImpactBps(pool) {

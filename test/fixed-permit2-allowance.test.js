@@ -47,3 +47,21 @@ test('OOR swap ceiling applies only to its configured pool', () => {
   assert.equal(executor.samePoolRebalanceMaxImpactBps({ id: '0x' + 'ab'.repeat(32) }), 350);
   assert.equal(executor.samePoolRebalanceMaxImpactBps({ id: '0x' + 'cd'.repeat(32) }), 200);
 });
+
+test('saved single pool OOR cap follows the existing authorized top-up cap without widening other pools', () => {
+  const executor = Object.create(RebalanceExecutor.prototype);
+  const poolId = '0x' + 'cd'.repeat(32);
+  const settings = new Map([['investmentTargetMode', 'specific-pool'], ['investmentTargetPoolId', poolId]]);
+  executor.state = { getSetting: (key, fallback) => settings.has(key) ? settings.get(key) : fallback };
+  executor.config = { maxSwapPriceImpactBps: 200, autoTopupMaxSwapPriceImpactBps: 350,
+    crossPoolMaxSwapPriceImpactBps: 350 };
+  assert.equal(executor.samePoolRebalanceMaxImpactBps({ id: poolId }), 350);
+  assert.equal(executor.samePoolRebalanceMaxImpactBps({ id: '0x' + 'ef'.repeat(32) }), 200);
+  executor.config.autoTopupMaxSwapPriceImpactBps = 250;
+  assert.equal(executor.samePoolRebalanceMaxImpactBps({ id: poolId }), 250);
+  executor.config.autoTopupMaxSwapPriceImpactBps = 500;
+  executor.config.crossPoolMaxSwapPriceImpactBps = 500;
+  assert.equal(executor.samePoolRebalanceMaxImpactBps({ id: poolId }), 350);
+  settings.set('investmentTargetMode', 'apr-highest');
+  assert.equal(executor.samePoolRebalanceMaxImpactBps({ id: poolId }), 200);
+});
