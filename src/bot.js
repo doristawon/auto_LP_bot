@@ -15,6 +15,7 @@ import { captureLpSessionReference, evaluateStopLoss, normalizeStopLoss } from '
 import { executeStopLiquidation, reconcileStopLiquidation } from './execution/stop-liquidation.js';
 import { sweepRetiredFees } from './execution/retired-fee-claims.js';
 import { reconcileManualReplacement } from './execution/manual-recovery.js';
+import { summarizeExecutionError } from './execution/execution-error.js';
 import { rebalanceTiming } from './dashboard/rebalance-timing.js';
 import { describeExecutionProgress } from './dashboard/execution-progress.js';
 import { PointsTracker } from './analytics/points-tracker.js';
@@ -1217,9 +1218,10 @@ export class AutoLpBot {
   getStopLossSnapshot() {
     const settings = this.state.getSetting('stopLossSettings', { enabled: false, lossPct: 15, basisMode: 'armed-equity', version: 1 });
     const reference = this.state.getSetting('stopLossReference', null);
+    let liquidation = this.state.getSetting('stopLiquidationStatus', null);
     let incident = this.state.getSetting('stopLossIncident', null);
     if (!incident && this.state.getSetting('stopLossLatched', false)
-      && this.state.getSetting('stopLiquidationStatus', null)?.source !== 'manual') {
+      && liquidation?.source !== 'manual') {
       const event = this.ledger.list?.({ type: 'stop_loss.triggered', limit: 1 })?.[0];
       if (event) {
         incident = { source: 'auto-stop-loss', at: event.ts, lossPct: event.lossPct,
@@ -1228,14 +1230,49 @@ export class AutoLpBot {
         this.state.setSetting('stopLossIncident', incident);
       }
     }
+    const history = this.state.getSetting('stopLiquidationHistory', []);
+    const liquidationAt = Number(liquidation?.at ?? liquidation?.requestedAt);
+    const resetAt = Number(incident?.resetAt);
+    if (['completed', 'partial', 'failed'].includes(liquidation?.status)
+      && Number.isFinite(liquidationAt) && liquidationAt > 0
+      && Number.isFinite(resetAt) && resetAt > liquidationAt) {
+      this.archiveStopLiquidationStatus(liquidation, { archivedAt: resetAt,
+        reason: 'legacy-reset-at', incident });
+      liquidation = null;
+    }
+    const savedHistory = this.state.getSetting('stopLiquidationHistory', history);
+    const liquidationHistory = Array.isArray(savedHistory) ? savedHistory : [];
     const restart = this.state.getSetting('stopLossRestartStatus', null);
     return { ...evaluateStopLoss(settings, reference, this.snapshot), settings, reference, incident,
       restart: restart && ['queued', 'resetting', 'depositing', 'starting'].includes(restart.status)
         && !this.stopLossRestartPromise && !this.initializing
         ? { ...restart, status: 'failed', error: '服務重新啟動，重跑請求已中止；請確認部位後重新操作。' } : restart,
       latched: this.state.getSetting('stopLossLatched', false),
-      liquidation: this.state.getSetting('stopLiquidationStatus', null),
+      liquidation,
+      previousLiquidation: liquidationHistory.at(-1) || null,
+      liquidationHistory,
       scanIntervalMs: this.config.pollIntervalMs };
+  }
+
+  archiveStopLiquidationStatus(status, { archivedAt = Date.now(), reason, incident = null } = {}) {
+    if (!['completed', 'partial', 'failed'].includes(status?.status)) return null;
+    const existing = this.state.getSetting('stopLiquidationHistory', []);
+    const history = Array.isArray(existing) ? existing : [];
+    const triggerEvent = status.source === 'manual' ? null
+      : this.ledger.list?.({ type: 'stop_loss.triggered', limit: 1 })?.[0] || null;
+    const archivedIncident = incident ? { ...incident } : triggerEvent ? {
+      source: 'auto-stop-loss', at: triggerEvent.ts, lossPct: triggerEvent.lossPct,
+      thresholdPct: triggerEvent.settings?.lossPct, principalUsd: triggerEvent.principalUsd,
+      equityUsd: triggerEvent.equityUsd, triggerBelowUsd: triggerEvent.triggerBelowUsd
+    } : null;
+    const record = { ...status, archivedAt: Number(archivedAt), archiveReason: reason,
+      ...(archivedIncident ? { incident: archivedIncident } : {}),
+      ...(triggerEvent ? { triggerEvent: { ...triggerEvent } } : {}) };
+    this.state.setSetting('stopLiquidationHistory', [...history, record]);
+    this.state.setSetting('stopLiquidationStatus', null);
+    this.ledger.append('stop_loss.liquidation_archived', { archiveReason: reason, archivedAt: Number(archivedAt),
+      liquidation: { ...status }, incident: archivedIncident, triggerEvent });
+    return record;
   }
 
   setStopLossSettings(value, { restarting = false } = {}) {
@@ -1267,7 +1304,14 @@ export class AutoLpBot {
       this.state.setSetting('stopLossReference', reference);
       this.state.setSetting('stopLossLatched', false);
       const incident = this.state.getSetting('stopLossIncident', null);
-      if (incident) this.state.setSetting('stopLossIncident', { ...incident, resetAt: Date.now() });
+      const resetAt = Date.now();
+      const resetIncident = incident ? { ...incident, resetAt } : null;
+      if (incident) this.state.setSetting('stopLossIncident', resetIncident);
+      if (value.rebase === true) {
+        this.archiveStopLiquidationStatus(this.state.getSetting('stopLiquidationStatus', null), {
+          archivedAt: resetAt, reason: 'explicit-rebase', incident: resetIncident
+        });
+      }
     }
     this.state.setSetting('stopLossSettings', settings);
     this.ledger.append('stop_loss.settings', { ...settings, rebased: capture });
@@ -2069,13 +2113,16 @@ export class AutoLpBot {
     } catch (error) {
       const count = Number(backoffs[key]?.count || 0) + 1;
       const nextRetryAt = Date.now() + Math.min(30 * 60_000, 5 * 60_000 * 2 ** Math.min(count - 1, 6));
+      const details = summarizeExecutionError(error, {
+        fallbackJournal: this.state.getSetting('activeRebalanceExecution', null)
+      });
       this.state.setSetting('allocationJobBackoffs', { ...backoffs, [key]: { count, nextRetryAt } });
-      this.ledger.append('allocation.job_failed', { poolId: pool.id, kind, error: sanitize(error.message), nextRetryAt });
+      this.ledger.append('allocation.job_failed', { poolId: pool.id, kind, ...details, nextRetryAt });
       if (this.state.getSetting('activeRebalanceExecution', null)?.phase === 'recovery_required') {
         this.setExecutionPaused(true, 'allocation_recovery_required');
         this.ledger.append('rebalance.auto_paused', { poolId: pool.id, reason: 'allocation_recovery_required' });
       }
-      return { status: 'failed', reason: sanitize(error.message), nextRetryAt };
+      return { status: 'failed', reason: details.error, ...details, nextRetryAt };
     }
   }
 
@@ -2615,13 +2662,15 @@ export class AutoLpBot {
       }
       return result;
     } catch (error) {
-      const message = sanitize(error.message);
-      this.ledger.append('lp.topup_failed', { poolId: pool.id, positionId: position.id, idleUsd, error: message });
+      const details = summarizeExecutionError(error, {
+        fallbackJournal: this.state.getSetting('activeRebalanceExecution', null)
+      });
+      this.ledger.append('lp.topup_failed', { poolId: pool.id, positionId: position.id, idleUsd, ...details });
       if (this.state.getSetting('activeRebalanceExecution', null)?.phase === 'recovery_required') {
         this.setExecutionPaused(true, 'topup_recovery_required');
       }
-      log('error', 'lp.topup_failed', { poolId: pool.id, positionId: position.id, error: message });
-      return { status: 'failed', error: message };
+      log('error', 'lp.topup_failed', { poolId: pool.id, positionId: position.id, ...details });
+      return { status: 'failed', ...details };
     }
   }
 
@@ -2725,16 +2774,17 @@ export class AutoLpBot {
         });
       }
     } catch (error) {
-      const backoff = recordRebalanceFailure(this.state, this.ledger, pool, position, error.message);
+      const details = summarizeExecutionError(error);
+      const backoff = recordRebalanceFailure(this.state, this.ledger, pool, position, details.error);
       this.ledger.append('rebalance.blocked', {
         positionId: position.id,
         poolId: pool.id,
         reason: 'investment target unavailable',
-        error: sanitize(error.message),
+        ...details,
         nextRetryAt: backoff.nextRetryAt
       });
       return { status: 'blocked', reason: 'investment-target-unavailable',
-        error: sanitize(error.message), nextRetryAt: backoff.nextRetryAt };
+        ...details, nextRetryAt: backoff.nextRetryAt };
     }
     const plan = {
       pool,
@@ -2809,10 +2859,11 @@ export class AutoLpBot {
       );
       return result;
     } catch (error) {
-      const backoff = recordRebalanceFailure(this.state, this.ledger, pool, position, error.message);
-      this.ledger.append('rebalance.failed', { positionId: position.id, poolId: pool.id,
-        error: sanitize(error.message), nextRetryAt: backoff.nextRetryAt });
       const activeExecution = this.state.getSetting('activeRebalanceExecution', null);
+      const details = summarizeExecutionError(error, { fallbackJournal: activeExecution });
+      const backoff = recordRebalanceFailure(this.state, this.ledger, pool, position, details.error);
+      this.ledger.append('rebalance.failed', { positionId: position.id, poolId: pool.id,
+        ...details, nextRetryAt: backoff.nextRetryAt });
       if (activeExecution?.phase === 'recovery_required') {
         this.setExecutionPaused(true, 'rebalance_recovery_required');
         this.ledger.append('rebalance.auto_paused', {
@@ -2822,9 +2873,9 @@ export class AutoLpBot {
           reason: 'capital moved but execution did not complete'
         });
       }
-      log('error', 'rebalance.failed', { positionId: position.id, error: error.message, source });
+      log('error', 'rebalance.failed', { positionId: position.id, ...details, source });
       if (throwOnFailure) throw error;
-      return { status: 'failed', error: sanitize(error.message), nextRetryAt: backoff.nextRetryAt };
+      return { status: 'failed', ...details, nextRetryAt: backoff.nextRetryAt };
     }
   }
 

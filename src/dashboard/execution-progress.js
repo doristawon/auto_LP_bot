@@ -191,6 +191,8 @@ export function describeExecutionProgress(journal) {
     : transactions.filter(item => item.step !== 'preflight').at(-1) || transactions.at(-1) || null;
   return {
     id: cleanText(journal.id, 240), kind, label: manualReconciled ? '已核對手動換倉' : labels[kind], phase, status,
+    poolId: cleanText(journal.poolId, 180),
+    positionId: cleanText(String(journal.oldPosition?.id || journal.positionId || ''), 180),
     ...(manualReconciled ? { reconciliationStatus: 'verified-manual-lp-replacement',
       reconciliationProof: {
         pair: cleanText(journal.reconciliation.pair, 80),

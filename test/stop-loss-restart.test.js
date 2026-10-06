@@ -8,7 +8,8 @@ import { ERC20_ABI, PERMIT2_ABI } from '../src/abi.js';
 import { PERMIT2 } from '../src/constants.js';
 const wallet='0x0000000000000000000000000000000000000001',poolId='0x'+'ab'.repeat(32);
 function harness(active=true){
- const values=new Map([['executionPaused',true],['stopLossLatched',true],['stopLossSettings',{enabled:true,lossPct:15,basisMode:'lp-session'}],['stopLossReference',{equityUsd:1500,at:Date.now()-10000,basisMode:'lp-session',wallet}],['activeRebalanceExecution',{kind:'stop_liquidation',phase:'failed'}],['stopLossIncident',{source:'auto-stop-loss',lossPct:16,at:Date.now()}]]),events=[],calls=[];
+ const previousAt=Date.now()-5000;
+ const values=new Map([['executionPaused',true],['stopLossLatched',true],['stopLossSettings',{enabled:true,lossPct:15,basisMode:'lp-session'}],['stopLossReference',{equityUsd:1500,at:Date.now()-10000,basisMode:'lp-session',wallet}],['activeRebalanceExecution',{kind:'stop_liquidation',phase:'failed'}],['stopLossIncident',{source:'auto-stop-loss',lossPct:16,at:previousAt,thresholdPct:15,equityUsd:840,principalUsd:1000}],['stopLiquidationStatus',{status:'failed',source:'auto-stop-loss',error:'prior liquidation failure',at:previousAt}]]),events=[],calls=[];
  const b=Object.create(AutoLpBot.prototype);b.config={walletAddress:wallet,dashboardManualControlEnabled:true,dryRun:false,enableLiveWrites:true,enableAutoRedeploy:true,pollIntervalMs:300000};b.state={getSetting:(k,d)=>values.has(k)?values.get(k):d,setSetting:(k,v)=>values.set(k,v)};b.ledger={append:(type,data)=>events.push({type,...data})};b.executor={hasPendingWrite:false};b.executionPaused=true;
  b.snapshot={generatedAt:Date.now(),bot:{wallet},portfolio:{currentValueUsd:1000,netCashflowUsd:0,positions:active?[{id:'position',poolId,shares:'100',principalUsd:900}]:[]}};
  b.getInvestmentTargetSettings=()=>({mode:'specific-pool',poolId});b.getInvestmentAllocationConfig=()=>({enabled:false});b.controlStatus=async()=>({startReadiness:{blockers:values.get('stopLossLatched')?['stop-loss-latched']:[]}});
@@ -20,6 +21,7 @@ test('stop-loss reset restarts existing LP only after explicit request and keeps
  const{b,values,calls}=harness();assert.throws(()=>b.requestStopLossRestart({}),/確認/);assert.equal(values.get('stopLossLatched'),true);
  b.requestStopLossRestart({confirm:'RESET_AND_RESTART'});await b.stopLossRestartPromise;
  assert.deepEqual(calls,['stop-loss-restart-scan','start']);assert.equal(values.get('stopLossLatched'),false);assert.equal(b.executionPaused,false);assert.equal(values.get('stopLossSettings').lossPct,15);assert.equal(values.get('stopLossReference').equityUsd,1000);assert.ok(values.get('stopLossIncident').resetAt);assert.equal(values.get('stopLossRestartStatus').status,'completed');
+ const snapshot=b.getStopLossSnapshot();assert.equal(values.get('stopLiquidationStatus'),null);assert.equal(snapshot.liquidation,null);assert.equal(snapshot.previousLiquidation.status,'failed');assert.equal(snapshot.previousLiquidation.error,'prior liquidation failure');assert.equal(snapshot.previousLiquidation.incident.lossPct,16);assert.equal(snapshot.liquidationHistory.length,1);assert.equal(snapshot.liquidationHistory[0].archiveReason,'explicit-rebase');
 });
 test('reset with no LP uses guarded direct idle deposit before starting',async()=>{
  const{b,values,calls}=harness(false);b.requestStopLossRestart({confirm:'RESET_AND_RESTART'});await b.stopLossRestartPromise;
@@ -42,6 +44,23 @@ test('restart interruption never restores automatic execution intent',()=>{
 });
 test('legacy triggered incident is recovered from ledger once and never overwritten by latest equity',()=>{
  const{b,values}=harness();values.delete('stopLossIncident');let reads=0;b.ledger.list=()=>{reads++;return[{ts:123,lossPct:16,settings:{lossPct:15},principalUsd:1000,equityUsd:840}]};assert.equal(b.getStopLossSnapshot().incident.lossPct,16);b.snapshot.portfolio.currentValueUsd=900;assert.equal(b.getStopLossSnapshot().incident.equityUsd,840);assert.equal(reads,1);
+});
+test('legacy terminal liquidation is historical only when resetAt is strictly later than its event time',()=>{
+ const{b,values}=harness();const reference=values.get('stopLossReference');values.set('stopLossIncident',{source:'auto-stop-loss',at:100,lossPct:16,resetAt:300});values.set('stopLiquidationStatus',{status:'failed',source:'auto-stop-loss',error:'old failure',at:200});
+ const snapshot=b.getStopLossSnapshot();assert.equal(snapshot.liquidation,null);assert.equal(snapshot.previousLiquidation.error,'old failure');assert.equal(snapshot.previousLiquidation.archivedAt,300);assert.equal(snapshot.previousLiquidation.archiveReason,'legacy-reset-at');assert.equal(values.get('stopLossLatched'),true);assert.equal(values.get('stopLossReference'),reference);
+});
+test('reset timestamp does not hide later terminal or live liquidation statuses',()=>{
+ for(const status of ['failed','pending','queued','running']){
+  const{b,values}=harness();const resetAt=Date.now()-10000;const current={status,source:'manual',at:resetAt+1000};values.set('stopLossIncident',{source:'manual',at:resetAt-1000,resetAt});values.set('stopLiquidationStatus',current);
+  const snapshot=b.getStopLossSnapshot();assert.deepEqual(snapshot.liquidation,current);assert.equal(snapshot.liquidationHistory.length,0);
+ }
+});
+test('explicit rebase archives terminal status but preserves pending, queued and running status',()=>{
+ for(const status of ['pending','queued','running']){
+  const{b,values}=harness();const current={status,source:'manual',requestedAt:Date.now()-1000};values.set('stopLiquidationStatus',current);
+  b.setStopLossSettings({enabled:true,lossPct:15,rebase:true});
+  assert.deepEqual(values.get('stopLiquidationStatus'),current);assert.equal(values.get('stopLiquidationHistory'),undefined);assert.equal(b.getStopLossSnapshot().liquidation.status,status);
+ }
 });
 function approvalHarness(){
  const values=new Map([['executionPaused',true],['stopLossLatched',true],['activeRebalanceExecution',{id:'exit-1',kind:'stop_liquidation',phase:'stop_confirmed'}]]);

@@ -3,21 +3,11 @@ import { EIP7702_GUARD_ABI } from '../abi.js';
 import { UNISWAP_UNIVERSAL_ROUTER_212 } from '../constants.js';
 import { assertUint128, getLiquidityForAmounts, getSqrtPriceAtTick } from '../math/v4-fixed.js';
 import { buildTargetRange } from '../math/ticks.js';
-import { sanitize } from '../logger.js';
+import { summarizeExecutionError } from './execution-error.js';
 
 const guard = new Interface(EIP7702_GUARD_ABI);
 const rawStrings = b => ({ raw0: String(b.raw0), raw1: String(b.raw1) });
 const RESIDUAL_BPS = 50; // at least 99.5% of each authorized post-swap token
-const errorSummary = error => {
-  const data = error.data || error.info?.error?.data;
-  const selector = error.revertSelector || (typeof data === 'string' ? data.slice(0, 10) : null);
-  let decoded;
-  try { decoded = typeof data === 'string' ? guard.parseError(data)?.name : null; } catch {}
-  return { error: sanitize(decoded === 'LiquidityBelowMinimum'
-    ? '價格變動使可存入流動性低於最低限制；尚未送出存入交易。'
-    : decoded || error.shortMessage || error.message).slice(0, 360), errorSelector: selector,
-    guardError: decoded || null };
-};
 
 export function buildAtomicDepositRequest({ pool, walletAddress, target, balances, funding,
   swapPlan, routerRequest, minLiquidity, deadline }) {
@@ -298,7 +288,7 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
         if (!capitalHash && !confirmed && (['planning', 'preflight'].includes(stage)
           || (stage === 'broadcast' && error.preBroadcastFailure === true))
           && ['CALL_EXCEPTION', 'SEQUENTIAL_SIMULATION_REVERT', 'PREFLIGHT_EXPIRED'].includes(error.code) && attempt < 2) {
-          const retryError = errorSummary(error);
+          const retryError = summarizeExecutionError(error);
           update({ phase: 'atomic_retry', atomicAttempt: attempt + 1, atomicRetryReason: 'preflight-price-changed',
             atomicRetryStage: stage, atomicRetryError: retryError.error,
             atomicRetrySelector: retryError.errorSelector,
@@ -313,7 +303,12 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
     // when this atomic call has not broadcast. Never clear moved capital.
     const moved = confirmed || capitalHash || journal.tx?.withdraw || journal.tx?.routeSwaps?.length
       || error.code === 'BROADCAST_OUTCOME_UNCERTAIN';
-    const details = errorSummary(error);
+    try {
+      if (error && typeof error === 'object' && !error.executionJournalId) {
+        error.executionJournalId = journal.id;
+      }
+    } catch {}
+    const details = summarizeExecutionError(error, { fallbackJournal: journal });
     const active = this.state?.getSetting('activeRebalanceExecution', null);
     const pending = active?.id === journal.id ? active.pendingTx : journal.pendingTx;
     const uncertainPending = error.code === 'BROADCAST_OUTCOME_UNCERTAIN' && capitalHash
