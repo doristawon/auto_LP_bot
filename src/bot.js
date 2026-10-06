@@ -138,6 +138,7 @@ export class AutoLpBot {
     this.points = new PointsTracker(config, this.ledger, this.state);
     this.market = { refreshedAt: 0, stateRefreshedAt: 0, pools: [], prices: new Map(), latestBlock: 0, fablesStats: null };
     this.rpcHealth = [];
+    this.reconcileStopLossRestartOnBoot();
     this.resumeExecutionAfterStartup = this.state.getSetting('executionPaused', true) === false
       && !this.state.getSetting('stopLossLatched', false);
     this.executionPaused = true;
@@ -1216,19 +1217,35 @@ export class AutoLpBot {
   getStopLossSnapshot() {
     const settings = this.state.getSetting('stopLossSettings', { enabled: false, lossPct: 15, basisMode: 'armed-equity', version: 1 });
     const reference = this.state.getSetting('stopLossReference', null);
-    return { ...evaluateStopLoss(settings, reference, this.snapshot), settings, reference,
+    let incident = this.state.getSetting('stopLossIncident', null);
+    if (!incident && this.state.getSetting('stopLossLatched', false)
+      && this.state.getSetting('stopLiquidationStatus', null)?.source !== 'manual') {
+      const event = this.ledger.list?.({ type: 'stop_loss.triggered', limit: 1 })?.[0];
+      if (event) {
+        incident = { source: 'auto-stop-loss', at: event.ts, lossPct: event.lossPct,
+          thresholdPct: event.settings?.lossPct, principalUsd: event.principalUsd,
+          equityUsd: event.equityUsd, triggerBelowUsd: event.triggerBelowUsd };
+        this.state.setSetting('stopLossIncident', incident);
+      }
+    }
+    const restart = this.state.getSetting('stopLossRestartStatus', null);
+    return { ...evaluateStopLoss(settings, reference, this.snapshot), settings, reference, incident,
+      restart: restart && ['queued', 'resetting', 'depositing', 'starting'].includes(restart.status)
+        && !this.stopLossRestartPromise && !this.initializing
+        ? { ...restart, status: 'failed', error: '服務重新啟動，重跑請求已中止；請確認部位後重新操作。' } : restart,
       latched: this.state.getSetting('stopLossLatched', false),
       liquidation: this.state.getSetting('stopLiquidationStatus', null),
       scanIntervalMs: this.config.pollIntervalMs };
   }
 
-  setStopLossSettings(value) {
+  setStopLossSettings(value, { restarting = false } = {}) {
+    if (this.stopLossRestartPromise && !restarting) throw new Error('重設重跑正在執行，請稍後修改停損設定。');
     const settings = normalizeStopLoss({ ...value, basisMode: value?.basisMode
       ?? this.state.getSetting('stopLossSettings', null)?.basisMode ?? 'armed-equity' });
     if (this.stopLiquidationPromise || this.initializing || this.rpcManagementActive
       || (this.cycleActive && this.state.getSetting('stopLossLatched', false))) throw new Error('停止清倉或初始化正在執行，請稍後修改。');
     const journal = this.state.getSetting('activeRebalanceExecution', null);
-    if (journal?.phase && !['completed', 'failed'].includes(journal.phase)) throw new Error('有待確認交易，無法重設停損。');
+    if (journal?.pendingTx || journal?.phase && !['completed', 'failed'].includes(journal.phase)) throw new Error('有待確認交易，無法重設停損。');
     const previous = this.state.getSetting('stopLossSettings', { enabled: false });
     const capture = settings.enabled && (!previous.enabled || value.rebase === true
       || settings.basisMode !== (previous.basisMode || 'armed-equity')
@@ -1249,6 +1266,8 @@ export class AutoLpBot {
           wallet: this.config.walletAddress.toLowerCase() };
       this.state.setSetting('stopLossReference', reference);
       this.state.setSetting('stopLossLatched', false);
+      const incident = this.state.getSetting('stopLossIncident', null);
+      if (incident) this.state.setSetting('stopLossIncident', { ...incident, resetAt: Date.now() });
     }
     this.state.setSetting('stopLossSettings', settings);
     this.ledger.append('stop_loss.settings', { ...settings, rebased: capture });
@@ -1269,12 +1288,14 @@ export class AutoLpBot {
   }
 
   requestStopLiquidation({ confirm, maxCostBps = 500 } = {}) {
+    if (this.stopLossRestartPromise) throw new Error('重設重跑正在執行；請先暫停並等待流程結束。');
     if (!this.config.dashboardManualControlEnabled) throw new Error('人工交易控制尚未啟用。');
     if (confirm !== 'STOP_AND_LIQUIDATE') throw new Error('請確認撤出全部 LP 並換回 USDG。');
     if (!Number.isInteger(maxCostBps) || maxCostBps < 1 || maxCostBps > 500) throw new Error('換幣成本上限須介於 1 與 500 bps。');
     if (this.stopLiquidationPromise || (this.cycleActive
       && this.state.getSetting('stopLiquidationStatus', null)?.status === 'running')) return this.getStopLossSnapshot();
     this.state.setSetting('stopLossLatched', true);
+    this.state.setSetting('stopLossIncident', { source: 'manual', at: Date.now() });
     this.resumeExecutionAfterStartup = false;
     this.setExecutionPaused(true, 'stop-liquidate-request');
     this.state.setSetting('stopLiquidationStatus', { status: 'queued', requestedAt: Date.now(), source: 'manual' });
@@ -1293,7 +1314,7 @@ export class AutoLpBot {
       catch (error) { this.ledger.append('stop_loss.readback_deferred', { error: sanitize(error.message) }); }
       return liquidation;
     })().catch(error => {
-      this.state.setSetting('stopLiquidationStatus', { status: 'failed', error: sanitize(error.message), at: Date.now() });
+      this.state.setSetting('stopLiquidationStatus', { status: 'failed', source: 'manual', error: sanitize(error.message), at: Date.now() });
       this.ledger.append('stop_loss.request_failed', { error: sanitize(error.message) });
     }).finally(() => { this.stopLiquidationPromise = null; });
     return this.getStopLossSnapshot();
@@ -1329,9 +1350,85 @@ export class AutoLpBot {
       if (this.snapshot?.bot) this.snapshot.bot.executionPaused = true;
       return liquidation;
     } catch (error) {
-      this.state.setSetting('stopLiquidationStatus', { status: 'failed', error: sanitize(error.message), at: Date.now() });
+      this.state.setSetting('stopLiquidationStatus', { status: 'failed', source, error: sanitize(error.message), at: Date.now() });
+      if (source === 'auto-stop-loss') this.stopLiquidationReadbackPending = true;
       throw error;
     }
+  }
+
+  reconcileStopLossRestartOnBoot() {
+    const job = this.state.getSetting('stopLossRestartStatus', null);
+    if (!['queued', 'resetting', 'depositing', 'starting'].includes(job?.status)) return false;
+    this.state.setSetting('executionPaused', true);
+    this.state.setSetting('stopLossRestartStatus', { ...job, status: 'failed', at: Date.now(),
+      error: '服務重新啟動，重跑請求已中止；請確認部位與交易後重新操作。' });
+    this.ledger.append('stop_loss.restart_interrupted', { previousStatus: job.status });
+    return true;
+  }
+
+  requestStopLossRestart({ confirm } = {}) {
+    if (confirm !== 'RESET_AND_RESTART') throw new Error('請確認重設停損基準並重新啟動實盤。');
+    if (!this.config.dashboardManualControlEnabled || this.config.dryRun
+      || !this.config.enableLiveWrites || !this.config.enableAutoRedeploy) throw new Error('重跑需要已啟用的人工實盤設定。');
+    if (this.stopLossRestartPromise) return this.getStopLossSnapshot();
+    if (!this.executionPaused || this.stopLiquidationPromise || this.executor?.hasPendingWrite) throw new Error('請先暫停並等候既有交易確認。');
+    const journal = this.state.getSetting('activeRebalanceExecution', null);
+    if (journal?.pendingTx || journal?.phase && !['completed', 'failed'].includes(journal.phase)) throw new Error('有待確認交易，無法重設重跑。');
+    const settings = this.state.getSetting('stopLossSettings', null);
+    if (!settings?.enabled) throw new Error('請先啟用停損保護。');
+    const wallet = this.config.walletAddress.toLowerCase();
+    const target = this.getInvestmentTargetSettings();
+    const update = (status, extra = {}) => this.state.setSetting('stopLossRestartStatus', { status, wallet, at: Date.now(), ...extra });
+    update('queued');
+    this.stopLossRestartCancelled = false;
+    const check = () => {
+      if (this.stopLossRestartCancelled || this.config.walletAddress.toLowerCase() !== wallet) throw new Error('重跑已取消或錢包已切換。');
+      const current = this.getInvestmentTargetSettings();
+      if (current.mode !== target.mode || current.poolId !== target.poolId) throw new Error('投入目標已變更，請重新確認重跑。');
+    };
+    this.stopLossRestartPromise = (async () => {
+      // Yield so the request is registered before any asynchronous work starts.
+      await sleep(0);
+      const deadline = Date.now() + 15 * 60_000;
+      while (this.cycleActive || this.initializing || this.rpcManagementActive) {
+        check();
+        if (Date.now() > deadline) throw new Error('等待掃描逾時，請稍後重試。');
+        await sleep(250);
+      }
+      await this.runOnce({ executeRebalances: false, source: 'stop-loss-restart-scan' });
+      check();
+      if (this.executor?.hasPendingWrite) throw new Error('仍有錢包寫入作業，請稍後重試。');
+      const active = (this.snapshot?.portfolio?.positions || []).some(p => BigInt(p.shares || 0) > 0n);
+      if (!active && (target.mode !== 'specific-pool' || !target.poolId || this.getInvestmentAllocationConfig?.()?.enabled)) {
+        throw new Error('沒有 LP 時請先儲存單池指定目標，再重設重跑。');
+      }
+      const ready = await this.controlStatus();
+      const blockers = ready.startReadiness.blockers.filter(b => !['stop-loss-latched', 'active-lp-required', 'stop-loss-valuation-unavailable'].includes(b));
+      if (blockers.length) throw new Error(blockers.join('；'));
+      check();
+      update('resetting');
+      this.setStopLossSettings({ ...settings, rebase: true }, { restarting: true });
+      this.ledger.append('stop_loss.reset_requested', { wallet, target, previousIncident: this.state.getSetting('stopLossIncident', null) });
+      if (!active) {
+        update('depositing');
+        this.setExecutionPaused(false, 'stop-loss-manual-restart');
+        const result = await this.manualImmediateRotation({ destinationPoolId: target.poolId, directExecute: true });
+        if (result.status !== 'completed') throw new Error('投入尚未完成，已暫停；請檢查執行紀錄。');
+        this.setExecutionPaused(true, 'stop-loss-restart-readback');
+        await this.runOnce({ executeRebalances: false, source: 'stop-loss-restart-readback' });
+      }
+      check();
+      update('starting');
+      const result = await this.startExecution('stop-loss-manual-restart');
+      if (!result.ok) throw new Error(result.blockers.join('；'));
+      update('completed');
+      this.ledger.append('stop_loss.restart_completed', { wallet });
+    })().catch(error => {
+      this.setExecutionPaused(true, 'stop-loss-restart-failed');
+      update('failed', { error: sanitize(error.message) });
+      this.ledger.append('stop_loss.restart_failed', { error: sanitize(error.message) });
+    }).finally(() => { this.stopLossRestartPromise = null; });
+    return this.getStopLossSnapshot();
   }
 
   async startExecution(source = 'dashboard') {
@@ -1750,6 +1847,10 @@ export class AutoLpBot {
 
   async runOnce(options = {}) {
     const executeRebalances = options.executeRebalances !== false;
+    // The manually confirmed restart owns its fresh valuation until start/deposit
+    // finishes. Scheduled scans must not race the rebase or idle deposit preflight.
+    if (this.stopLossRestartPromise && !['stop-loss-restart-scan', 'stop-loss-restart-readback',
+      'manual-rotation-preflight'].includes(options.source)) return this.snapshot;
     if (this.rpcManagementActive || this.initializing) {
       if (options.source) throw new Error('busy');
       log('warn', 'cycle.skipped', { reason: 'rpc management is active' });
@@ -1895,7 +1996,7 @@ export class AutoLpBot {
           .filter((position) => position.outside === true && position.shouldRebalance === true)
           .map((position) => ({ pool, position }))
       );
-      if (!executeRebalances || this.allocationUpdatePending) return snapshot;
+      if (!executeRebalances || this.allocationUpdatePending || this.stopLossRestartPromise) return snapshot;
       if (this.state.getSetting('stopLossLatched', false) || this.stopLiquidationPromise) return snapshot;
       const risk = this.getStopLossSnapshot();
       if (!this.executionPaused && risk.settings.enabled) {
@@ -1904,6 +2005,9 @@ export class AutoLpBot {
           return snapshot;
         }
         if (risk.triggered) {
+          this.state.setSetting('stopLossIncident', { source: 'auto-stop-loss', at: Date.now(),
+            lossPct: risk.lossPct, thresholdPct: risk.settings.lossPct, equityUsd: risk.equityUsd,
+            principalUsd: risk.principalUsd, triggerBelowUsd: risk.triggerBelowUsd });
           this.ledger.append('stop_loss.triggered', risk);
           try { await this.performStopLiquidation(); }
           catch (error) { log('error', 'stop_loss.liquidation_failed', { error: error.message }); }

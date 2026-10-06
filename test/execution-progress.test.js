@@ -238,3 +238,8 @@ test('lightweight HTTP status is wallet scoped and continues while the wallet is
     assert.equal(body.executionProgress.currentStepLabel, '換幣');
   } finally { await server.stop(); }
 });
+
+test('confirmed stop-loss withdrawal is complete even when the following swap approval fails',()=>{
+ const progress=describeExecutionProgress({kind:'stop_liquidation',id:'exit',phase:'failed',lastKnownPhase:'stop_confirmed',step:'withdraw:pool:range',tx:{'withdraw:pool:range':hash('1')},completedSteps:[{step:'withdraw:pool:range',hash:hash('1')}],error:'Execution is paused before swap approval'});
+ assert.equal(progress.steps.find(s=>s.key==='withdraw').status,'completed');assert.equal(progress.steps.find(s=>s.key==='swap').status,'failed');assert.equal(progress.transactions[0].status,'confirmed');
+});

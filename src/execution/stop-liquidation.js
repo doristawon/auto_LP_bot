@@ -92,7 +92,7 @@ export async function executeStopLiquidation(executor, { pools, extraTokens = []
         if (!route) { residual.push({ address, raw: amount.toString(), reason: '沒有可驗證的 USDG 路徑' }); continue; }
         try { await executor.quoteCrossPoolRoute(route, token, amount, maxCostBps); }
         catch (error) { residual.push({ address, raw: amount.toString(), reason: sanitize(error.message) }); continue; }
-        await executor.ensureSwapAllowances(token, amount);
+        await executor.ensureSwapAllowances(token, amount, { stopLiquidationId: id });
         let fresh;
         try { fresh = await executor.quoteCrossPoolRoute(route, token, amount, maxCostBps); }
         catch (error) { residual.push({ address, raw: amount.toString(), reason: sanitize(error.message) }); continue; }

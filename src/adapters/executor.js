@@ -3444,7 +3444,7 @@ export class RebalanceExecutor {
   }
 
   async ensureSwapAllowances(token, rawAmountIn, {
-    allowanceCap = null, reuseAllowanceCap = null, beforeBroadcast = null
+    allowanceCap = null, reuseAllowanceCap = null, beforeBroadcast = null, stopLiquidationId = null
   } = {}) {
     const requiredAmountIn = BigInt(rawAmountIn);
     if (requiredAmountIn <= 0n) return { broadcasted: false, broadcastCount: 0 };
@@ -3459,7 +3459,14 @@ export class RebalanceExecutor {
       throw new Error('Previous swap authorization cap is outside uint128 bounds');
     }
     const assertBroadcastAllowed = () => {
-      if (this.state?.getSetting('executionPaused', false)) throw new Error('Execution is paused before swap approval');
+      if (this.state?.getSetting('executionPaused', false)) {
+        const exit = this.state.getSetting('activeRebalanceExecution', null);
+        if (!stopLiquidationId || exit?.id !== stopLiquidationId || exit.kind !== 'stop_liquidation'
+          || !['prepared', 'stop_preflight', 'stop_confirmed'].includes(exit.phase)
+          || !this.state.getSetting('stopLossLatched', false) || exit.pendingTx) {
+          throw new Error('Execution is paused before swap approval');
+        }
+      }
       beforeBroadcast?.();
     };
     assertBroadcastAllowed();

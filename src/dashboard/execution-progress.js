@@ -41,7 +41,9 @@ export function describeExecutionProgress(journal) {
     : journal.kind === 'liquidity_top_up' ? 'topup'
     : Object.hasOwn(journal, 'oldPosition') && !journal.oldPosition ? 'bootstrap'
     : journal.destinationPoolId ? 'rotation' : 'rebalance';
-  const stopStage = String(journal.step || '').startsWith('withdraw:') ? 1
+  const withdrawalConfirmed = String(journal.step || '').startsWith('withdraw:')
+    && (journal.completedSteps || []).some(item => item.step === journal.step);
+  const stopStage = withdrawalConfirmed ? 2 : String(journal.step || '').startsWith('withdraw:') ? 1
     : String(journal.step || '').startsWith('swap:') ? 2 : 0;
   const officialStepIndex = officialFlow
     ? status === 'completed' || observedPhase === 'official_confirmed' ? 2

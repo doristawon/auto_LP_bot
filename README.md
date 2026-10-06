@@ -598,6 +598,12 @@ npm test
 
 The dashboard can store a per-wallet allocation across up to two supported USDG-denominated Fables ERC20 pools. Weights are integer basis points totaling 10,000. Saving a configuration changes strategy settings only; it does not submit a transaction. Fresh capital estimates come from the existing scan cycle and may remain pending until the next valuation refresh. Allocation mode handles OOR reconstruction within each pool and does not withdraw healthy LP solely to restore target weights. The single-pool APR and immediate-rotation controls are disabled while allocation mode is active.
 
+## 停損後手動重跑
+
+中控台保留停損觸發時間、當時回撤、門檻與估值，並分別顯示清倉完成或未完成。達到門檻後保持暫停，不會自動重設本金或重新投入。清倉的有限授權只允許目前鎖定的停機清倉作業使用；一般換幣仍遵守暫停狀態。
+
+在「總覽 → 停損與停止清倉」按「重設停損並重新啟動（實盤）」，確認後取得最新估值、保留原有停損門檻，開啟新的停損週期。有 LP 時保留部位並恢復監控；沒有 LP 時，先透過既有完整模擬投入已儲存的單池目標，再確認部位後恢復執行。兩池模式沒有 LP 時，請先設定單池目標。未確認交易、過期估值或模擬失敗會阻止重跑；重跑途中服務重啟會保持暫停並要求人工核對。歷史損益與交易紀錄不會清除。
+
 ## 官方同池 Reposition 與自動 Claim
 
 啟用 v3 guard 的錢包，可在既有 OOR 確認完成後比較原流程、官方 Fables 原生路徑及 Kyber 路徑。完整模擬以同區塊狀態核對新 LP、錢包餘額與 Gas，扣除額外領取的歷史費用後，只有淨結果較好才採用官方方法；否則沿用既有流程。

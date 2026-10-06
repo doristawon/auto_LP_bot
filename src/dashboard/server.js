@@ -140,7 +140,13 @@ export class DashboardServer {
       try { return sendJson(res, 202, { ok: true, stopLoss: bot.requestStopLiquidation(body) }); }
       catch (error) { return sendJson(res, 409, { error: sanitize(error.message) }); }
     }
+    if (req.method === 'POST' && url.pathname === '/api/risk/stop-loss/restart') {
+      const body = await readJsonBody(req);
+      try { return sendJson(res, 202, { ok: true, stopLoss: bot.requestStopLossRestart(body) }); }
+      catch (error) { return sendJson(res, 409, { error: sanitize(error.message) }); }
+    }
     if (req.method === 'POST' && url.pathname === '/api/control/pause') {
+      bot.stopLossRestartCancelled = true;
       bot.setExecutionPaused(true, 'dashboard');
       return sendJson(res, 200, { ok: true, executionPaused: true });
     }
