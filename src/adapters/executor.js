@@ -1,3 +1,4 @@
+import { buildExecutionTargetRange, executionRangePolicy, assertAdaptiveRangeReady, prepareAdaptiveExecution, isAdaptivePool, assertAdaptiveMinimumHold } from '../execution/pool-target-range.js';
 import {
   Contract,
   Interface,
@@ -43,7 +44,7 @@ import {
   getAmountsForLiquidity,
   getSqrtPriceAtTick
 } from '../math/v4-fixed.js';
-import { buildTargetRange, isLpInRange, isLpOutOfRange } from '../math/ticks.js';
+import { isLpInRange, isLpOutOfRange } from '../math/ticks.js';
 import {
   buildCrossPoolFundingScope,
   buildV4PathKeys,
@@ -146,8 +147,11 @@ export class RebalanceExecutor {
     return previous.then(async () => {
       this.queuedWrites--;
       this.activeWrites++;
-      try { return await operation(); }
-      finally { this.activeWrites--; release(); }
+      try {
+        const policy = executionRangePolicy(this);
+        this.adaptiveRangeContext = { settings: { ...policy?.settings }, stats: { ...policy?.stats }, decision: { ...policy?.decision }, asOf: Date.now() };
+        return await operation();
+      } finally { this.adaptiveRangeContext = null; this.activeWrites--; release(); }
     });
   }
 
@@ -196,6 +200,8 @@ export class RebalanceExecutor {
 
   async executeUnlocked(plan) {
     const destinationPool = plan.destinationPool || plan.pool;
+    await prepareAdaptiveExecution(this, plan, destinationPool);
+    assertAdaptiveRangeReady(this, destinationPool);
     const allocationEnabled = this.isAllocationModeEnabled();
     if (allocationEnabled) {
       this.assertAllocationFundingScope(plan.pool, plan.allocationFundingScope, { requireFresh: true });
@@ -473,12 +479,7 @@ export class RebalanceExecutor {
       });
 
       const postWithdrawState = await this.fables.readPoolState(plan.pool);
-      const targetAfterWithdraw = buildTargetRange(
-        postWithdrawState.tick,
-        plan.pool.key.tickSpacing,
-        this.config.tightWidthBps,
-        this.config.rangePreset
-      );
+      const targetAfterWithdraw = buildExecutionTargetRange(this, plan.pool, postWithdrawState.tick);
       if (this.config.atomicDepositEnabled) {
         return await executeAtomicDeposit.call(this, { pool: plan.pool,
           target: targetAfterWithdraw, funding: fundingScope.funding, balances: postWithdrawBalances,
@@ -491,8 +492,7 @@ export class RebalanceExecutor {
         pool: plan.pool, funding: fundingScope.funding, state: postWithdrawState,
         target: targetAfterWithdraw, stableIndex: fundingScope.stableIndex,
         maxPriceImpactBps: rebalanceMaxImpactBps,
-        chooseTarget: tick => buildTargetRange(tick, plan.pool.key.tickSpacing,
-          this.config.tightWidthBps, this.config.rangePreset)
+        chooseTarget: tick => buildExecutionTargetRange(this, plan.pool, tick)
       });
       const swapPlan = fitted.swapPlan;
       journal = this.patchJournal(journal, {
@@ -1627,6 +1627,7 @@ export class RebalanceExecutor {
   }
 
   async preflightSamePoolSequence(options) {
+    await prepareAdaptiveExecution(this, options, options.pool);
     const context = await createPinnedPlanningContext(this);
     const poolState = await context.fables.readPoolState(options.pool);
     const balances = await context.readRawPairBalances(options.pool);
@@ -1677,15 +1678,13 @@ export class RebalanceExecutor {
       pool, scopedPostWithdraw, this.config.usdgAddress, this.config.autoTopupDustBps ?? 25
     );
 
-    const target = buildTargetRange(poolState.tick, pool.key.tickSpacing,
-      this.config.tightWidthBps, this.config.rangePreset);
+    const target = buildExecutionTargetRange(this, pool, poolState.tick);
     const fitted = await this.prepareRangeBalancedSwap({
       pool, funding: fundingScope.funding, state: poolState, target,
       stableIndex: fundingScope.stableIndex, maxPriceImpactBps,
       expectedOutput: this.config.atomicDepositEnabled === true,
       prefixCalls: [withdrawCall],
-      chooseTarget: tick => buildTargetRange(tick, pool.key.tickSpacing,
-        this.config.tightWidthBps, this.config.rangePreset)
+      chooseTarget: tick => buildExecutionTargetRange(this, pool, tick)
     });
     const swapPlan = fitted.swapPlan;
     if (swapPlan.blockedReason) throw new Error('Sequential preflight cannot swap within price-impact limit: '+swapPlan.blockedReason);
@@ -1954,12 +1953,7 @@ export class RebalanceExecutor {
         raw0: projectedInventory.get(destinationPool.token0.address.toLowerCase()) || 0n,
         raw1: projectedInventory.get(destinationPool.token1.address.toLowerCase()) || 0n
       };
-      const targetRange = buildTargetRange(
-        destinationState.tick,
-        destinationPool.key.tickSpacing,
-        this.config.tightWidthBps,
-        this.config.rangePreset
-      );
+      const targetRange = buildExecutionTargetRange(this, destinationPool, destinationState.tick);
       let balancePlan = await buildExactBalancedSwapPlan({
         pool: destinationPool,
         quoter: this.quoter,
@@ -2216,9 +2210,9 @@ export class RebalanceExecutor {
     const stableIndex = pool.token0.address.toLowerCase() === this.config.usdgAddress.toLowerCase() ? 0
       : pool.token1.address.toLowerCase() === this.config.usdgAddress.toLowerCase() ? 1 : null;
     const fitted = await this.prepareRangeBalancedSwap({ pool, funding: inventory, state: initialState,
-      target: buildTargetRange(initialState.tick, pool.key.tickSpacing, this.config.tightWidthBps, this.config.rangePreset),
+      target: buildExecutionTargetRange(this, pool, initialState.tick),
       stableIndex, maxPriceImpactBps: maxImpactBps, prefixCalls: prefix, expectedOutput: true,
-      chooseTarget: tick => buildTargetRange(tick, pool.key.tickSpacing, this.config.tightWidthBps, this.config.rangePreset) });
+      chooseTarget: tick => buildExecutionTargetRange(this, pool, tick) });
     const swap = fitted.swapPlan;
     const usdValue = (token, raw) => {
       if (BigInt(raw) === 0n) return 0;
@@ -2265,6 +2259,7 @@ export class RebalanceExecutor {
   }
 
   async preflightCrossPoolSequence(plan, destinationPool) {
+    await prepareAdaptiveExecution(this, plan, destinationPool);
     if (this.config.atomicDepositEnabled && !this.planningBlockTag) {
       // Withdrawal inventory, route quotes, balancing previews and the final
       // simulated atomic call must see one state. This is only a rehearsal;
@@ -2385,8 +2380,7 @@ export class RebalanceExecutor {
         routeSwaps, destinationState, deadline, maxImpactBps, recoverExistingPair: false
       });
     }
-    const initialTarget = buildTargetRange(destinationState.tick, destinationPool.key.tickSpacing,
-      this.config.tightWidthBps, this.config.rangePreset);
+    const initialTarget = buildExecutionTargetRange(this, destinationPool, destinationState.tick);
     const recoverExistingPair = allocationBootstrap
       && this.shouldRecoverAllocationWithExistingPair({ ...destinationPool, state: destinationState }, destinationInventory);
     const balancePlan = recoverExistingPair
@@ -2482,8 +2476,7 @@ export class RebalanceExecutor {
         }
       } catch {}
     }
-    const finalTarget = buildTargetRange(finalPrice.tick, destinationPool.key.tickSpacing,
-      this.config.tightWidthBps, this.config.rangePreset);
+    const finalTarget = buildExecutionTargetRange(this, destinationPool, finalPrice.tick);
     let depositPlan = buildExactDepositPlan({
       rawAmount0: projectedAfterSwaps.raw0, rawAmount1: projectedAfterSwaps.raw1,
       sqrtPriceX96: finalPrice.sqrtPriceX96,
@@ -2785,6 +2778,8 @@ export class RebalanceExecutor {
   }
 
   async executeCrossPoolUnlocked(plan, destinationPool) {
+    await prepareAdaptiveExecution(this, plan, destinationPool);
+    assertAdaptiveRangeReady(this, destinationPool);
     const allocationEnabled = this.isAllocationModeEnabled();
     if (plan.allocationBootstrap === true) {
       if (!allocationEnabled) throw new Error('Allocation bootstrap requires enabled saved allocation mode');
@@ -2979,8 +2974,7 @@ export class RebalanceExecutor {
             ? BigInt(allocationInventory[destinationPool.token1.address.toLowerCase()] || 0n)
             : physical.raw1 - (dust.get(destinationPool.token1.address.toLowerCase()) || 0n) };
         const state = await this.fables.readPoolState(destinationPool);
-        const target = buildTargetRange(state.tick, destinationPool.key.tickSpacing,
-          this.config.tightWidthBps, this.config.rangePreset);
+        const target = buildExecutionTargetRange(this, destinationPool, state.tick);
         return await executeAtomicDeposit.call(this, { pool: destinationPool, target, funding,
           balances: physical, journal, retarget: true,
           allocationScope: plan.allocationBootstrap === true ? plan.allocationFundingScope : null,
@@ -3061,8 +3055,7 @@ export class RebalanceExecutor {
       }
       let destinationState = await this.fables.readPoolState(destinationPool);
       if (destinationState.paused !== false) throw new Error('Destination pool paused before deposit');
-      let target = buildTargetRange(destinationState.tick, destinationPool.key.tickSpacing,
-        this.config.tightWidthBps, this.config.rangePreset);
+      let target = buildExecutionTargetRange(this, destinationPool, destinationState.tick);
       let depositPlan = buildExactDepositPlan({
         rawAmount0: inventory.raw0, rawAmount1: inventory.raw1,
         sqrtPriceX96: destinationState.sqrtPriceX96,
@@ -3081,8 +3074,7 @@ export class RebalanceExecutor {
       }
       destinationState = await this.fables.readPoolState(destinationPool);
       if (destinationState.paused !== false) throw new Error('Destination pool paused after deposit approvals');
-      target = buildTargetRange(destinationState.tick, destinationPool.key.tickSpacing,
-        this.config.tightWidthBps, this.config.rangePreset);
+      target = buildExecutionTargetRange(this, destinationPool, destinationState.tick);
       depositPlan = buildExactDepositPlan({
         rawAmount0: minBigIntLocal(inventory.raw0, approvedCaps.amount0Max),
         rawAmount1: minBigIntLocal(inventory.raw1, approvedCaps.amount1Max),
@@ -3383,7 +3375,8 @@ export class RebalanceExecutor {
     plan.pool.state = latestState;
 
     if (outside) {
-      const minExcursionPct = this.config.oorMinExcursionPct ?? 0;
+      assertAdaptiveMinimumHold(this, plan.pool, plan.position);
+      const minExcursionPct = isAdaptivePool(this, plan.pool) ? 0 : this.config.oorMinExcursionPct ?? 0;
       if (outOfRangeExcursionPct(latestState.tick, plan.position.tickLower, plan.position.tickUpper) < minExcursionPct) {
         throw new Error(`OOR excursion is below ${minExcursionPct}% before withdrawal`);
       }

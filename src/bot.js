@@ -1,3 +1,6 @@
+import { PONS_POOL_ID, ADAPTIVE_REFRESH_MS, normalizeAdaptiveRangeSettings, analyzeAdaptiveRange, statsReady, ADAPTIVE_MODEL } from './analytics/adaptive-range.js';
+import { readAdaptiveRangeSamples } from './adapters/adaptive-range-feed.js';
+import { buildExecutionTargetRange, isAdaptivePool, adaptiveHoldingSince } from './execution/pool-target-range.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -131,6 +134,7 @@ export class AutoLpBot {
     this.baseRangePolicy = { confirmDelayMin: config.oorConfirmDelayMin ?? 5,
       minExcursionPct: config.oorMinExcursionPct ?? 0.25 };
     this.applyStoredRangePolicy();
+    this.applyStoredAdaptiveRange();
     this.applyStoredExecutionTarget();
     this.ledger = new LedgerStore(config.dataDir);
     this.fables = new FablesAdapter(this.providers.readProvider, config);
@@ -306,7 +310,10 @@ export class AutoLpBot {
       startBlockers.push(allocationConfig.invalid ? 'allocation-config-invalid' : 'allocation-valuation-not-ready');
     }
     if (!this.config.dryRun) {
-      if (!allocationEnabled && !activeLp) startBlockers.push('active-lp-required');
+      const adaptiveBootstrapReady = this.config.adaptiveRange?.settings?.enabled
+        && selectedTargetPoolId === PONS_POOL_ID && investmentMode === 'specific-pool'
+        && statsReady(this.config.adaptiveRange.stats);
+      if (!allocationEnabled && !activeLp && !adaptiveBootstrapReady) startBlockers.push('active-lp-required');
       const snapshotAge = Date.now() - Number(this.snapshot?.generatedAt || 0);
       if (snapshotAge > Math.max(120_000, this.config.pollIntervalMs * 3)) startBlockers.push('wallet-snapshot-stale');
       if (!this.config.enableLiveWrites) startBlockers.push('live-writes-disabled');
@@ -392,6 +399,7 @@ export class AutoLpBot {
         dustBps: this.config.autoTopupDustBps,
         minIntervalSec: this.config.autoTopupMinIntervalSec
       },
+      adaptiveRange: this.getAdaptiveRangeSnapshot(),
       strategy: {
         absoluteInRangeHold: true,
         tightWidthBps: this.config.tightWidthBps,
@@ -449,6 +457,60 @@ export class AutoLpBot {
       oorConfirmDelayMs: policy.confirmDelayMin * 60_000, oorMinExcursionPct: policy.minExcursionPct });
     this.ledger.append('execution.range_policy_updated', policy);
     return policy;
+  }
+
+
+  applyStoredAdaptiveRange() {
+    const settings = normalizeAdaptiveRangeSettings(this.state.getSetting('adaptiveRangeSettings', { enabled: false }));
+    this.config.adaptiveRange = { settings, stats: this.state.getSetting('adaptiveRangeStats', null), decision: this.state.getSetting('adaptiveRangeDecision', null) };
+  }
+
+  getAdaptiveRangeSnapshot() {
+    const policy = this.config.adaptiveRange || { settings: { enabled: false }, decision: null };
+    const lastAttempt = Number(this.state.getSetting('adaptiveRangeLastAttemptAt', 0));
+    const stats = policy.stats;
+    return { settings: policy.settings, decision: policy.decision, stats: stats?.status === 'ready' && !statsReady(stats)
+      ? { ...stats, status: 'stale', reason: 'stale-data' } : stats,
+      nextEvaluationAt: lastAttempt ? lastAttempt + ADAPTIVE_REFRESH_MS : null };
+  }
+
+  setAdaptiveRangeSettings(values) {
+    const journal = this.state.getSetting('activeRebalanceExecution', null);
+    if (this.cycleActive || this.initializing || this.rpcManagementActive || this.executor?.hasPendingWrite
+      || this.stopLossRestartPromise || this.stopLiquidationPromise
+      || (journal?.phase && !['completed', 'failed'].includes(journal.phase))) {
+      throw new Error('目前掃描或交易尚未完成，請稍後儲存動態帶寬設定。');
+    }
+    const settings = normalizeAdaptiveRangeSettings(values);
+    this.state.setSetting('adaptiveRangeSettings', settings);
+    // Preserve the hourly budget even when the operator toggles the switch.
+    this.applyStoredAdaptiveRange();
+    this.ledger.append('execution.adaptive_range_settings', settings);
+    return this.getAdaptiveRangeSnapshot();
+  }
+
+  async refreshAdaptiveRange() {
+    if (!this.config.adaptiveRange?.settings?.enabled) return;
+    const now = Date.now(), lastAttempt = Number(this.state.getSetting('adaptiveRangeLastAttemptAt', 0));
+    if (lastAttempt && now - lastAttempt < ADAPTIVE_REFRESH_MS) return;
+    this.state.setSetting('adaptiveRangeLastAttemptAt', now);
+    let decision;
+    try {
+      const pool = this.market.pools.find(p => p.id.toLowerCase() === PONS_POOL_ID);
+      if (!pool || pool.key.tickSpacing !== 60) throw new Error('PONS pool unavailable');
+      const state = pool.state?.poolManager ? pool.state : await this.fables.readPoolState(pool);
+      const feed = await readAdaptiveRangeSamples(this.providers.readProvider, { poolId: PONS_POOL_ID, poolManager: state.poolManager });
+      decision = { ...analyzeAdaptiveRange({ swaps: feed.samples,
+        startTimestampSeconds: feed.firstSwapTimestampSeconds, endTimestampSeconds: feed.lastSwapTimestampSeconds,
+        asOfTimestampSeconds: feed.asOfTimestampSeconds, windowStartTimestampSeconds: feed.windowStartTimestampSeconds,
+        pool, usdgAddress: this.config.usdgAddress }), fromBlock: feed.fromBlock, toBlock: feed.toBlock, requests: feed.requests };
+    } catch (error) {
+      decision = { status: 'unavailable', widthTicks: null, observedAt: now, reason: 'feed-unavailable' };
+      log('warn', 'adaptive_range.feed_failed', { error: sanitize(error.message) });
+    }
+    this.state.setSetting('adaptiveRangeStats', decision);
+    this.config.adaptiveRange.stats = decision;
+    this.ledger.append('execution.adaptive_range_evaluated', decision);
   }
 
   applyStoredRangePolicy() {
@@ -1513,6 +1575,7 @@ export class AutoLpBot {
     }
     this.state = new StateStore(this.config.stateFile);
     this.applyStoredRangePolicy();
+    this.applyStoredAdaptiveRange();
     this.applyStoredExecutionTarget();
     this.ledger = new LedgerStore(this.config.dataDir);
     this.analytics = new PortfolioAnalytics(this.config, this.ledger, this.state);
@@ -1918,6 +1981,7 @@ export class AutoLpBot {
       this.market.latestBlock = latestBlock;
       const selection = await this.resolveTargetPools(latestBlock);
       const targetPools = selection.pools;
+      await this.refreshAdaptiveRange();
       const accountingPools = selection.accountingPools || targetPools;
       if (!targetPools.length) {
         // No active LP is an execution state, not a reason to freeze accounting.
@@ -2077,7 +2141,10 @@ export class AutoLpBot {
       for (const { pool, position } of pendingRebalances) {
         await this.maybeRebalance(pool, position);
       }
-      if (!pendingRebalances.length) await this.maybeTopUpIdleBalance(targetPools, walletBalances);
+      if (!pendingRebalances.length) {
+        await this.maybeBootstrapAdaptive(snapshot);
+        if (!this.capitalReadbackPending) await this.maybeTopUpIdleBalance(targetPools, walletBalances);
+      }
       await sweepRetiredFees.call(this, accountingPools, { force: this.capitalReadbackPending === true });
       return snapshot;
     } finally {
@@ -2522,6 +2589,19 @@ export class AutoLpBot {
       cooldownUntil: stored.cooldownUntil || 0,
       nowMs
     });
+    let adaptiveBlocked = null;
+    if (isAdaptivePool(this.executor, pool)) {
+      const heldSince = adaptiveHoldingSince(this.executor, pool, position, nowMs);
+      position.adaptiveHoldUntil = heldSince + ADAPTIVE_MODEL.minHoldMs;
+      position.adaptiveEnabled = true;
+      // This model replaces the older excursion/delay rule only for PONS.
+      evaluation.shouldRebalance = evaluation.outside && nowMs >= position.adaptiveHoldUntil && !evaluation.cooldownActive;
+      evaluation.rebalanceReason = evaluation.shouldRebalance ? 'adaptive_oor_min_hold' : null;
+      evaluation.target = null; // Chosen once using fresh capital/tick at entry, never during an in-range scan.
+      if (!statsReady(this.config.adaptiveRange.stats)) {
+        evaluation.shouldRebalance = false; adaptiveBlocked = 'PONS 等待完整 24 小時 Swap 資料';
+      } else if (nowMs < position.adaptiveHoldUntil) adaptiveBlocked = 'PONS 尚未持有滿 1 小時';
+    }
     Object.assign(position, {
       outside: evaluation.outside,
       nearEdge: Boolean(evaluation.nearEdge),
@@ -2534,7 +2614,7 @@ export class AutoLpBot {
       cooldownActive: evaluation.cooldownActive,
       shouldRebalance: pool.state?.paused === false && evaluation.shouldRebalance,
       rebalanceReason: pool.state?.paused === false ? evaluation.rebalanceReason : null,
-      executionBlockedReason: pool.state?.paused === false ? null : 'fables pool paused or status unknown',
+      executionBlockedReason: adaptiveBlocked || (pool.state?.paused === false ? null : 'fables pool paused or status unknown'),
       target: evaluation.target
     });
     this.state.setPosition(stateKey, {
@@ -2558,7 +2638,7 @@ export class AutoLpBot {
       evaluationDue: evaluation.evaluationDue,
       shouldRebalance: pool.state?.paused === false && evaluation.shouldRebalance,
       rebalanceReason: pool.state?.paused === false ? evaluation.rebalanceReason : null,
-      executionBlockedReason: pool.state?.paused === false ? null : 'fables pool paused or status unknown',
+      executionBlockedReason: adaptiveBlocked || (pool.state?.paused === false ? null : 'fables pool paused or status unknown'),
       target: evaluation.target
     });
   }
@@ -2609,6 +2689,38 @@ export class AutoLpBot {
     }
   }
 
+  async maybeBootstrapAdaptive(snapshot) {
+    if (!this.config.adaptiveRange?.settings?.enabled || this.executionPaused
+      || this.state.getSetting('stopLossLatched', false) || this.stopLiquidationPromise
+      || this.getInvestmentAllocationConfig()?.enabled) return null;
+    if ((snapshot?.portfolio?.positions || []).some(p => BigInt(p.shares || 0) > 0n)) return null;
+    const target = this.getInvestmentTargetSettings();
+    if (target.mode !== 'specific-pool' || target.poolId !== PONS_POOL_ID) return null;
+    const journal = this.state.getSetting('activeRebalanceExecution', null);
+    if (journal?.phase && !['completed','failed'].includes(journal.phase)) return null;
+    if (!statsReady(this.config.adaptiveRange.stats)) return null;
+    if (Date.now() < Number(this.state.getSetting('adaptiveBootstrapRetryAt', 0))) return null;
+    const pool = this.market.pools.find(p => p.id.toLowerCase() === PONS_POOL_ID);
+    if (!pool || pool.state?.paused !== false) return null;
+    if (!(await this.revalidateTopologyBeforeExecution(snapshot.blockNumber))) return null;
+    this.state.setSetting('adaptiveBootstrapRetryAt', Date.now() + 10 * 60_000);
+    try {
+      const result = await this.executor.executeCrossPool({ pool, destinationPool: pool, position: null,
+        manualIdle: true, routingPools: this.market.pools, minGasReserveWei: this.config.topUpMinGasReserveWei }, pool);
+      if (result.status === 'completed') {
+        this.capitalReadbackPending = true;
+        this.state.setSetting(`adaptiveHolding:${pool.id}:${result.newPositionId.toLowerCase()}`, Date.now());
+        this.state.setSetting('lastAction', 'PONS 自適應建倉完成');
+      }
+      return result;
+    } catch (error) {
+      const details = summarizeExecutionError(error);
+      this.ledger.append('rebalance.adaptive_bootstrap_failed', details);
+      if (this.state.getSetting('activeRebalanceExecution', null)?.phase === 'recovery_required') this.setExecutionPaused(true, 'adaptive_bootstrap_recovery');
+      return { status: 'failed', ...details };
+    }
+  }
+
   async maybeTopUpIdleBalance(targetPools, walletBalances) {
     if (!this.config.autoTopupEnabled || this.executionPaused) return null;
     if (!this.config.dryRun && (!this.config.enableLiveWrites || !this.config.enableAutoRedeploy
@@ -2622,6 +2734,7 @@ export class AutoLpBot {
     // Never guess which range should receive funds when this wallet owns several.
     if (active.length !== 1) return null;
     const { pool, position } = active[0];
+    if (isAdaptivePool(this.executor, pool)) return null; // In-range adaptive LP is held unchanged.
     if (pool.state?.paused !== false || position.outside !== false
       || pool.state.tick < position.tickLower || pool.state.tick >= position.tickUpper) return null;
     // APR rotation happens only after an OOR withdrawal. While this LP remains
@@ -2838,6 +2951,8 @@ export class AutoLpBot {
       }
 
       clearRebalanceFailure(this.state, pool, position);
+      if (isAdaptivePool(this.executor, destinationPool) && result.newPositionId) this.state.setSetting(
+        `adaptiveHolding:${destinationPool.id.toLowerCase()}:${result.newPositionId.toLowerCase()}`, Date.now());
       this.capitalReadbackPending = true;
       const cooldownUntil = Date.now() + this.config.minRebalanceIntervalSec * 1000;
       this.state.setPosition(positionStateKey(pool, position), {
@@ -3553,7 +3668,8 @@ export class AutoLpBot {
           await sleep(backoffMs);
         }
       }
-      const wait = Math.max(1000, this.config.pollIntervalMs - (Date.now() - started));
+      const pollInterval = this.config.adaptiveRange?.settings?.enabled ? 60_000 : this.config.pollIntervalMs;
+      const wait = Math.max(1000, pollInterval - (Date.now() - started));
       this.nextMonitorAt = Date.now() + wait;
       await sleep(wait);
     }
@@ -3646,7 +3762,7 @@ function rangePolicySnapshot(config) {
     evaluationIntervalMs: config.rangeCheckIntervalMs,
     confirmDelayMin: config.oorConfirmDelayMin,
     minExcursionPct: config.oorMinExcursionPct,
-    monitorPollIntervalMs: config.pollIntervalMs
+    monitorPollIntervalMs: config.adaptiveRange?.settings?.enabled ? 60_000 : config.pollIntervalMs
   };
 }
 

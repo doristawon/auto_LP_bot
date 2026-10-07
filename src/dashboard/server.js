@@ -118,6 +118,11 @@ export class DashboardServer {
         return sendJson(res, 400, { error: sanitize(error.message || '更新週期設定失敗') });
       }
     }
+    if (req.method === 'POST' && url.pathname === '/api/settings/adaptive-range') {
+      const body = await readJsonBody(req);
+      try { return sendJson(res, 200, { ok: true, adaptiveRange: bot.setAdaptiveRangeSettings(body) }); }
+      catch (error) { return sendJson(res, 400, { error: sanitize(error.message) }); }
+    }
     if (req.method === 'POST' && url.pathname === '/api/settings/range-policy') {
       const body = await readJsonBody(req);
       try { return sendJson(res, 200, { ok: true, policy: bot.setRangePolicy(body) }); }

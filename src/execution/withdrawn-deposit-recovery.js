@@ -1,7 +1,7 @@
+import { buildExecutionTargetRange } from './pool-target-range.js';
 import { id } from 'ethers';
 import { WITHDRAWN_EVENT } from '../abi.js';
 import { buildPairFundingScope } from './pair-funding.js';
-import { buildTargetRange } from '../math/ticks.js';
 import { executeAtomicDeposit } from './atomic-deposit.js';
 import { evaluateStopLoss } from '../analytics/stop-loss.js';
 
@@ -83,7 +83,7 @@ export async function resumeWithdrawnDeposit(executor, pool) {
   return executeAtomicDeposit.call(executor, { pool, balances:final.balances, funding:scope.funding,
     journal, oldPosition:journal.oldPosition, retarget:true,
     previousApprovalCaps:journal.preWithdrawApprovalCapsRaw,
-    target:buildTargetRange(state.tick,pool.key.tickSpacing,executor.config.tightWidthBps,executor.config.rangePreset),
+    target:buildExecutionTargetRange(executor, pool, state.tick),
     maxPriceImpactBps:executor.samePoolRebalanceMaxImpactBps(pool),
     eventMetadata:{recovery:true,originalExecutionId:journal.id} });
 }

@@ -1,8 +1,8 @@
+import { buildExecutionTargetRange } from './pool-target-range.js';
 import { Interface } from 'ethers';
 import { EIP7702_GUARD_ABI } from '../abi.js';
 import { UNISWAP_UNIVERSAL_ROUTER_212 } from '../constants.js';
 import { assertUint128, getLiquidityForAmounts, getSqrtPriceAtTick } from '../math/v4-fixed.js';
-import { buildTargetRange } from '../math/ticks.js';
 import { summarizeExecutionError } from './execution-error.js';
 
 const guard = new Interface(EIP7702_GUARD_ABI);
@@ -118,16 +118,14 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
       if (position) await this.validateTopUpPosition(pool, position, 'atomic-deposit');
       const state = await this.fables.readPoolState(pool);
       if (state.paused !== false) throw new Error('Atomic deposit pool is paused');
-      if (retarget) target = buildTargetRange(state.tick, pool.key.tickSpacing,
-        this.config.tightWidthBps, this.config.rangePreset);
+      if (retarget) target = buildExecutionTargetRange(this, pool, state.tick);
       const stableIndex = pool.token0.address.toLowerCase() === this.config.usdgAddress.toLowerCase() ? 0
         : pool.token1.address.toLowerCase() === this.config.usdgAddress.toLowerCase() ? 1 : null;
       const prepareFit = this.preparePinnedRangeBalancedSwap || this.prepareRangeBalancedSwap;
       stage = 'planning';
       let fitted = await fitBeforeDeadline(prepareFit, { pool, funding, state, target, stableIndex,
         maxPriceImpactBps, expectedOutput: true, swapAllowanceCaps: approvalCaps,
-        ...(retarget ? { chooseTarget: tick => buildTargetRange(tick,
-          pool.key.tickSpacing, this.config.tightWidthBps, this.config.rangePreset) } : {}) });
+        ...(retarget ? { chooseTarget: tick => buildExecutionTargetRange(this, pool, tick) } : {}) });
       const swapPlan = fitted.swapPlan;
       assertActive();
       if (swapPlan.direction !== 'none' && !approvedInputs.has(swapPlan.tokenIn)) {
@@ -154,8 +152,7 @@ export async function executeAtomicDeposit({ pool, target, funding, balances, jo
           fitted = await fitBeforeDeadline(prepareFit, { pool, funding, state: fresh,
             target: fitted.target, stableIndex, maxPriceImpactBps, expectedOutput: true,
             swapAllowanceCaps: approvalCaps,
-            ...(retarget ? { chooseTarget: tick => buildTargetRange(tick,
-              pool.key.tickSpacing, this.config.tightWidthBps, this.config.rangePreset) } : {}) });
+            ...(retarget ? { chooseTarget: tick => buildExecutionTargetRange(this, pool, tick) } : {}) });
           if (fitted.swapPlan.direction !== 'none' && !approvedInputs.has(fitted.swapPlan.tokenIn)) {
             // A changed input token needs its own bounded approval and a new
             // plan after that approval, never a late approval on a fitted plan.
