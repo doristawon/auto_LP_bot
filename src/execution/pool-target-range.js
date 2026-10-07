@@ -31,12 +31,23 @@ export function isAdaptivePool(executor, pool) {
 export function adaptiveHoldingSince(executor, pool, position, nowMs = Date.now()) {
   const key = `adaptiveHolding:${pool.id.toLowerCase()}:${position.id.toLowerCase()}`;
   const saved = Number(executor.state?.getSetting(key, 0));
-  // The existing accounting basis tracks the beginning of the current LP episode,
-  // without resetting for same-range top-ups. Unknown age starts conservatively now.
-  const baseline = executor.state?.getSetting(`positionBaseline:${pool.id.toLowerCase()}:${position.id.toLowerCase()}`, null);
-  const start = Math.max(saved || 0, Number(baseline?.createdAt || 0)) || nowMs;
-  if (!saved) executor.state?.setSetting(key, start);
+  // Accounting baselines can survive full exit and later reuse of the same ticks.
+  // Only the holding clock belongs to this episode; unknown age starts now.
+  const start = Number.isFinite(saved) && saved > 0 && saved <= nowMs ? saved : nowMs;
+  if (start !== saved) executor.state?.setSetting(key, start);
   return start;
+}
+
+export function syncAdaptiveHoldingTopology(state, pools, previousRanges, currentRanges, nowMs = Date.now()) {
+  const pool = pools.find(p => String(p.id).toLowerCase() === PONS_POOL_ID);
+  if (!pool) return;
+  const prefix = `${String(pool.key?.hooks ?? pool.hook).toLowerCase()}|`;
+  const before = new Set(previousRanges.map(x => String(x).toLowerCase()));
+  const after = new Set(currentRanges.map(x => String(x).toLowerCase()));
+  for (const range of new Set([...before, ...after])) {
+    if (!range.startsWith(prefix) || before.has(range) === after.has(range)) continue;
+    state.setSetting(`adaptiveHolding:${PONS_POOL_ID}:${range.slice(prefix.length)}`, after.has(range) ? nowMs : 0);
+  }
 }
 
 export async function prepareAdaptiveExecution(executor, plan, pool) {

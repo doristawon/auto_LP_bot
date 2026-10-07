@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { Interface } from 'ethers';
 import { chooseOptimalWidth, liquidityForUsd, analyzeAdaptiveRange, normalizeAdaptiveRangeSettings, PONS_POOL_ID } from '../src/analytics/adaptive-range.js';
-import { buildFixedTickRange, buildExecutionTargetRange, prepareAdaptiveExecution, assertAdaptiveMinimumHold } from '../src/execution/pool-target-range.js';
+import { buildFixedTickRange, buildExecutionTargetRange, prepareAdaptiveExecution, assertAdaptiveMinimumHold, adaptiveHoldingSince, syncAdaptiveHoldingTopology } from '../src/execution/pool-target-range.js';
 import { readAdaptiveRangeSamples } from '../src/adapters/adaptive-range-feed.js';
 import { RebalanceExecutor } from '../src/adapters/executor.js';
 import { AutoLpBot } from '../src/bot.js';
@@ -156,6 +156,19 @@ test('adaptive minimum holding period persists and is only enforced for PONS',()
  data.set('adaptiveHolding:'+PONS_POOL_ID+':position',Date.now()-3600001);
  assert.doesNotThrow(()=>assertAdaptiveMinimumHold(executor,pool,position));
  assert.doesNotThrow(()=>assertAdaptiveMinimumHold(executor,{id:'other'},position));
+});
+
+test('reused historical range starts a new holding episode while unchanged ranges retain their clock',()=>{
+ const data=new Map(),state={getSetting:(k,v)=>data.get(k)??v,setSetting:(k,v)=>data.set(k,v)};
+ const pool={id:PONS_POOL_ID,key:{hooks:'0xhook'}},position={id:'range'},executor={state};
+ const key=`adaptiveHolding:${PONS_POOL_ID}:range`,range='0xhook|range';
+ data.set(`positionBaseline:${PONS_POOL_ID}:range`,{createdAt:1});
+ assert.equal(adaptiveHoldingSince(executor,pool,position,10000),10000);
+ syncAdaptiveHoldingTopology(state,[pool],[range],[range],20000);
+ assert.equal(data.get(key),10000);
+ syncAdaptiveHoldingTopology(state,[pool],[range],[],30000);assert.equal(data.get(key),0);
+ syncAdaptiveHoldingTopology(state,[pool],[],[range],40000);
+ assert.equal(adaptiveHoldingSince(executor,pool,position,50000),40000);
 });
 
 test('adaptive countdown uses position age instead of old OOR delay/excursion settings',()=>{

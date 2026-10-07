@@ -1,6 +1,6 @@
 import { PONS_POOL_ID, ADAPTIVE_REFRESH_MS, normalizeAdaptiveRangeSettings, analyzeAdaptiveRange, statsReady, ADAPTIVE_MODEL } from './analytics/adaptive-range.js';
 import { readAdaptiveRangeSamples } from './adapters/adaptive-range-feed.js';
-import { buildExecutionTargetRange, isAdaptivePool, adaptiveHoldingSince } from './execution/pool-target-range.js';
+import { buildExecutionTargetRange, isAdaptivePool, adaptiveHoldingSince, syncAdaptiveHoldingTopology } from './execution/pool-target-range.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -2408,6 +2408,7 @@ export class AutoLpBot {
     const currentIds = result.activePoolIds.map((x) => String(x).toLowerCase()).sort();
     const previousRanges = (this.state.getSetting('activeWalletRangeKeys', []) || []).map((x) => String(x).toLowerCase()).sort();
     const currentRanges = result.activeRangeKeys.map((x) => String(x).toLowerCase()).sort();
+    syncAdaptiveHoldingTopology(this.state, this.market.pools, previousRanges, currentRanges);
     const poolsChanged = !sameStringArray(previousIds, currentIds);
     const rangesChanged = !sameStringArray(previousRanges, currentRanges);
     if (poolsChanged || rangesChanged) {
